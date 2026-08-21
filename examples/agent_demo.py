@@ -154,8 +154,9 @@ def main():
         time.sleep(0.08)
         replacement = agent("ghost")             # same agent id, new process
         replacement.remember("written by the replacement process")
+        replacement_epoch = replacement.epoch    # before hibernate resets it
         replacement.hibernate()
-        print(f"  takeover of lane 'ghost': e{ghost_epoch} -> e{replacement.epoch}")
+        print(f"  takeover of lane 'ghost': e{ghost_epoch} -> e{replacement_epoch}")
         ghost.space.ownership.record = replace(
             ghost.space.ownership.record, expires_at=time.time() + 60)
         try:

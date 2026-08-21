@@ -50,7 +50,7 @@ from .fragments import (
 from .objectstore import ObjectStore, PreconditionFailed
 from .ownership import DEFAULT_TTL, Fenced, Ownership
 from .quantizer import SUPPORTED_BIT_WIDTHS, TurboQuantizer, payload_bit_width
-from .segments import Record, pack_segment, read_segment
+from .segments import Record, SegmentError, pack_segment, read_segment
 
 # celld folds L0 segments into an L1 object so a takeover reads a handful of
 # objects instead of thousands; this is the same knob as CELLD_LTX_COMPACTION.
@@ -60,6 +60,18 @@ DEFAULT_COMPACTION_THRESHOLD = 32
 
 class ChainBroken(RuntimeError):
     """A lane's epoch prefix has data but no contiguous chain from zero."""
+
+
+def spans_cover(spans, lo: int, hi: int) -> bool:
+    """True when sorted (lo, hi) spans jointly cover every seq in [lo, hi]."""
+    need = lo
+    for s_lo, s_hi in spans:
+        if s_lo > need:
+            break
+        need = max(need, s_hi + 1)
+        if need > hi:
+            return True
+    return need > hi
 
 
 def records_bit_width(records, default: int) -> int:
@@ -118,8 +130,14 @@ class Cut:
         for part in text.split(","):
             if not part.strip():
                 continue
-            agent, epoch, seq = part.rsplit(":", 2)
-            entries[agent] = (int(epoch.lstrip("e")), int(seq))
+            try:
+                agent, epoch, seq = part.rsplit(":", 2)
+                entries[agent] = (int(epoch.lstrip("e")), int(seq))
+            except ValueError as exc:
+                raise ValueError(
+                    f"not a cut: {part.strip()!r} "
+                    "(expected agent:e<epoch>:<seq>, comma-separated)"
+                ) from exc
         return Cut.of(entries)
 
     def to_json(self) -> dict:
@@ -321,7 +339,7 @@ class PeerLane:
     agent: str
     epoch: int | None = None
     applied: set = field(default_factory=set)   # keys already replayed
-    last_seq: int = -1
+    broken: set = field(default_factory=set)    # keys that failed to parse
 
 
 class Space:
@@ -365,6 +383,11 @@ class Space:
         self.own_tombstones: set[str] = set()
         self.peers: dict[str, PeerLane] = {}
         self._staged: list[Record] = []
+        # Ids currently staged, by op -- kept beside the list so a batch's
+        # write path can answer "did this batch already put/forget id X?"
+        # in O(1) instead of scanning the staged records per call.
+        self.staged_puts: set[str] = set()
+        self.staged_forgets: set[str] = set()
         self._next_seq = 0
         self._base_written = False
         self._restored_from: int | None = None
@@ -395,9 +418,21 @@ class Space:
         self.own, self.own_tombstones, self.peers = {}, set(), {}
         self._next_seq = 0
         self._base_written = False
-        self._restore_own_lane()
-        own_reads = self.state.objects_read
-        self.refresh(force=True)
+        try:
+            self._restore_own_lane()
+            own_reads = self.state.objects_read
+            self.refresh(force=True)
+        except BaseException:
+            # A failed wake must not look like an empty memory: leave the
+            # space inactive so the next call replays from scratch, and hand
+            # the lane back so a healthy process can take it in the meantime.
+            self.state = None
+            self.own, self.own_tombstones, self.peers = {}, set(), {}
+            try:
+                self.ownership.release()
+            except Exception:
+                pass  # the original failure is the one worth reporting
+            raise
         self.wake_objects_read = own_reads + self.refresh_objects_read
         self.wake_seconds = time.time() - started
         self.last_used = time.time()
@@ -423,6 +458,8 @@ class Space:
         self.own_tombstones = set()
         self.peers = {}
         self._staged = []
+        self.staged_puts = set()
+        self.staged_forgets = set()
 
     # -- replay -----------------------------------------------------------
 
@@ -490,8 +527,21 @@ class Space:
             if epoch != peer.epoch:
                 # The peer restarted under a fresh epoch and re-serialized its
                 # state there.  Replaying it again is a no-op by construction.
-                peer.epoch, peer.applied = epoch, set()
-            wanted += [(agent, key) for key in chain if key not in peer.applied]
+                peer.epoch, peer.applied, peer.broken = epoch, set(), set()
+            applied_spans = sorted(
+                s for s in (parse_segment(k) for k in peer.applied)
+                if s is not None)
+            for key in chain:
+                if key in peer.applied or key in peer.broken:
+                    continue
+                span = parse_segment(key)
+                if span is not None and spans_cover(applied_spans, *span):
+                    # Nothing new inside: an L1 whose L0s we already replayed
+                    # (the lane's owner compacted).  Fetching it would re-pay
+                    # the whole lane's bytes and duplicate its log entries.
+                    peer.applied.add(key)
+                    continue
+                wanted.append((agent, key))
 
         fetched = 0
         if wanted:
@@ -500,13 +550,20 @@ class Space:
                 blob = blobs.get(key)
                 if blob is None:
                     continue
-                segment = read_segment(blob)
+                try:
+                    segment = read_segment(blob)
+                except SegmentError:
+                    # One agent's corrupt object must not break everyone
+                    # else's catch-up -- and must not be refetched on every
+                    # refresh either.  Remember it as broken for this epoch;
+                    # the lane heals through its owner compacting (the L1 is
+                    # not covered, so it is fetched) or restarting fresh.
+                    self.peers[agent].broken.add(key)
+                    continue
                 for record in segment.records:
                     self.state.apply(record, segment.author or agent)
                 self._note(segment, agent)
-                peer = self.peers[agent]
-                peer.applied.add(key)
-                peer.last_seq = max(peer.last_seq, segment.hi)
+                self.peers[agent].applied.add(key)
                 fetched += 1
         self.refresh_objects_read = fetched
         self.last_refresh = time.time()
@@ -527,6 +584,8 @@ class Space:
         if not self.active:
             self.activate()
         self._staged.append(record)
+        (self.staged_puts if record.op == "put"
+         else self.staged_forgets).add(record.fragment_id)
         self.last_used = time.time()
 
     @property
@@ -600,6 +659,8 @@ class Space:
             sum(1 for r in records if r.op == "forget"),
         ))
         self._staged = []
+        self.staged_puts = set()
+        self.staged_forgets = set()
         self._next_seq += 1
         self._base_written = True
         self.last_used = time.time()
