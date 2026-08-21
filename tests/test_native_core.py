@@ -16,7 +16,7 @@ def test_native_matches_numpy(bit_width, dim, monkeypatch):
     q = TurboQuantizer(dim=dim, bit_width=bit_width)
     rows, scales = [], []
     for v in rng.standard_normal((50, dim)):
-        packed, norm, corr, dnorm = q.decode_payload(q.encode(v))
+        packed, _bw, norm, corr, dnorm = q.decode_payload(q.encode(v))
         rows.append(packed)
         scales.append(q.scale(norm, corr, dnorm))
     matrix = np.stack(rows)
@@ -32,3 +32,26 @@ def test_native_matches_numpy(bit_width, dim, monkeypatch):
 def test_native_rejects_bad_sizes():
     with pytest.raises(ValueError):
         native.score_packed(b"\x00" * 10, 2, 5, 8, 4, [0.0] * 16, [1.0], [0.0] * 8)
+
+
+@pytest.mark.parametrize("old_width,new_width", [(8, 4), (4, 2), (4, 1), (2, 1)])
+@pytest.mark.parametrize("dim", [33, 128])
+def test_native_requantize_matches_numpy(old_width, new_width, dim, monkeypatch):
+    if not hasattr(native, "requantize_codes"):
+        pytest.skip("installed celluloid3_core predates requantize_codes")
+    rng = np.random.default_rng(7)
+    q = TurboQuantizer(dim=dim, bit_width=old_width)
+    for v in rng.standard_normal((20, dim)):
+        blob = q.encode(v)
+        native_out = q.requantize(blob, new_width)
+        monkeypatch.setattr(qmod, "_native_requantize_codes", None)
+        numpy_out = q.requantize(blob, new_width)
+        monkeypatch.undo()
+        assert native_out == numpy_out
+
+
+def test_native_requantize_rejects_widening():
+    if not hasattr(native, "requantize_codes"):
+        pytest.skip("installed celluloid3_core predates requantize_codes")
+    with pytest.raises(ValueError):
+        native.requantize_codes(b"\x00" * 8, 8, 2, 4, [0.0] * 4, [0.0] * 16)

@@ -102,7 +102,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("owner", help="read this lane's ownership record")
     sub.add_parser("agents", help="every agent that has written to this space")
     sub.add_parser("spaces", help="list spaces in the store")
-    sub.add_parser("compact", help="fold this agent's lane into one L1 object")
+    p_compact = sub.add_parser(
+        "compact", help="fold this agent's lane into one L1 object")
+    p_compact.add_argument(
+        "--bits", type=int, default=None, choices=(1, 2, 4, 8),
+        help="requantize the folded vectors down to this bit width")
 
     p_gc = sub.add_parser("gc", help="delete this lane's superseded objects")
     p_gc.add_argument("--keep-epochs", type=int, default=1, dest="keep_epochs")
@@ -212,7 +216,7 @@ def _run(args, mem: MemoryLayer) -> int:
         print(json.dumps(record.__dict__ if record else None, indent=2, default=str))
 
     elif args.command == "compact":
-        key = mem.compact()
+        key = mem.compact(bit_width=args.bits)
         segments = mem.space._next_seq
         print(key if key else
               f"lane is already one object ({segments} segment"

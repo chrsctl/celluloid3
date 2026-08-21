@@ -136,23 +136,27 @@ class QuantIndex:
     expanded through a codebook lookup at scoring time, so the 8x (4-bit) or
     16x (2-bit) compression survives into the resident footprint -- which is
     what decides how much shared memory a node can hold at once.
+
+    Rows self-describe their bit width, and widths may be mixed: fresh L0
+    segments arrive at the store's write width while requantizing compaction
+    (``compact_bit_width``) folds history down to a narrower one.  Scoring
+    batches rows per width -- same brute-force scan, one matrix per codebook.
     """
 
     def __init__(self, quantizer: TurboQuantizer):
         self.q = quantizer
-        self.ids: list[str] = []
-        self.rows: dict[str, tuple[np.ndarray, float]] = {}
-        self._matrix: np.ndarray | None = None
-        self._scales: np.ndarray | None = None
+        self.rows: dict[str, tuple[np.ndarray, float, int]] = {}
+        self._buckets: list[tuple[int, list, np.ndarray, np.ndarray]] | None = None
 
     def upsert(self, fragment_id: str, payload: bytes) -> None:
-        packed, norm, corr, dnorm = self.q.decode_payload(payload)
-        self.rows[fragment_id] = (packed, self.q.scale(norm, corr, dnorm))
-        self._matrix = None
+        packed, bit_width, norm, corr, dnorm = self.q.decode_payload(payload)
+        self.rows[fragment_id] = (packed, self.q.scale(norm, corr, dnorm),
+                                  bit_width)
+        self._buckets = None
 
     def remove(self, fragment_id: str) -> None:
         if self.rows.pop(fragment_id, None) is not None:
-            self._matrix = None
+            self._buckets = None
 
     def __contains__(self, fragment_id: str) -> bool:
         return fragment_id in self.rows
@@ -165,26 +169,34 @@ class QuantIndex:
         return sum(row[0].nbytes for row in self.rows.values())
 
     def _materialize(self) -> None:
-        self.ids = list(self.rows)
-        if self.ids:
-            self._matrix = np.stack([self.rows[i][0] for i in self.ids])
-            self._scales = np.array([self.rows[i][1] for i in self.ids],
-                                    dtype=np.float32)
-        else:
-            self._matrix = np.zeros((0, 0), dtype=np.uint8)
-            self._scales = np.zeros(0, dtype=np.float32)
+        by_width: dict[int, list[str]] = defaultdict(list)
+        for fid, (_packed, _scale, bit_width) in self.rows.items():
+            by_width[bit_width].append(fid)
+        self._buckets = [
+            (bit_width,
+             ids,
+             np.stack([self.rows[i][0] for i in ids]),
+             np.array([self.rows[i][1] for i in ids], dtype=np.float32))
+            for bit_width, ids in sorted(by_width.items())
+        ]
 
     def search(self, query: np.ndarray, k: int) -> list[tuple[str, float]]:
-        if self._matrix is None:
+        if self._buckets is None:
             self._materialize()
-        if not self.ids:
+        if not self.rows:
             return []
-        scores = self.q.score_matrix(self._matrix, self._scales,
-                                     self.q.rotate_query(query))
-        k = max(1, min(k, len(self.ids)))
+        rotated = self.q.rotate_query(query)
+        ids: list[str] = []
+        chunks: list[np.ndarray] = []
+        for bit_width, bucket_ids, matrix, scales in self._buckets:
+            ids += bucket_ids
+            chunks.append(self.q.score_matrix(matrix, scales, rotated,
+                                              bit_width))
+        scores = np.concatenate(chunks)
+        k = max(1, min(k, len(ids)))
         top = np.argpartition(-scores, k - 1)[:k]
         top = top[np.argsort(-scores[top])]
-        return [(self.ids[i], float(scores[i])) for i in top]
+        return [(ids[i], float(scores[i])) for i in top]
 
 
 @dataclass
@@ -313,6 +325,7 @@ class Space:
         ack_verify: bool = True,
         compaction: bool = True,
         compaction_threshold: int = DEFAULT_COMPACTION_THRESHOLD,
+        compact_bit_width: int | None = None,
     ):
         self.objects = objects
         self.space = check_name(space, "space")
@@ -326,6 +339,7 @@ class Space:
         self.ack_verify = ack_verify
         self.compaction = compaction
         self.compaction_threshold = compaction_threshold
+        self.compact_bit_width = compact_bit_width
 
         self.state: SharedState | None = None
         # What *this* lane is responsible for re-serializing into its base.
@@ -580,23 +594,46 @@ class Space:
 
     # -- compaction -------------------------------------------------------
 
-    def compact(self) -> str | None:
+    def compact(self, bit_width: int | None = None) -> str | None:
         """Fold this lane's chain into one additive L1 object.
 
         celld: L1 objects let "takeovers read fewer objects instead of
         thousands".  In a shared space the saving is shared too -- every other
         agent lists and replays this lane, so compacting it makes everyone's
         catch-up cheaper.
+
+        ``bit_width`` (or the space's ``compact_bit_width`` default) makes
+        compaction lossy the same way the write path already is: the folded
+        records' vectors are requantized down to the narrower codebook, so
+        history pays fewer bits than the working set.  Fresh L0 segments keep
+        the store's write width; only what survives long enough to be folded
+        gets the cheaper encoding -- and every reader knows which is which
+        because payloads carry their own width.  Requantization happens in
+        the rotated domain from the stored codes (see
+        ``TurboQuantizer.requantize``), so nothing is re-embedded.  Note the
+        loss compounds across repeated compactions exactly once: an already
+        narrow payload is left alone rather than round-tripped.
         """
         if not self.active or not self._base_written:
             return None
         hi = self._next_seq - 1
         if hi < 1:
             return None
+        bit_width = self.compact_bit_width if bit_width is None else bit_width
+        records = self._base_records()
+        seg_width = self.quantizer.bit_width
+        if bit_width is not None:
+            records = [
+                Record.put(r.fragment,
+                           self.quantizer.requantize(r.vector, bit_width))
+                if r.op == "put" else r
+                for r in records
+            ]
+            seg_width = bit_width
         blob = pack_segment(
-            self._base_records(), lo=0, hi=hi, epoch=self.epoch,
+            records, lo=0, hi=hi, epoch=self.epoch,
             created_at=time.time(), dim=self.quantizer.dim,
-            bit_width=self.quantizer.bit_width, author=self.agent,
+            bit_width=seg_width, author=self.agent,
             note=f"L1 compaction of 0..{hi}",
         )
         key = l1_key(self.space, self.agent, self.epoch, 0, hi)

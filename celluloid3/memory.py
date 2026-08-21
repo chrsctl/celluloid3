@@ -144,6 +144,7 @@ class MemoryLayer:
         ack_verify: bool = True,
         compaction: bool = True,
         compaction_threshold: int = DEFAULT_COMPACTION_THRESHOLD,
+        compact_bit_width: int | None = None,
         **backend_kwargs,
     ):
         if backend_kwargs and isinstance(uri, ObjectStore):
@@ -163,6 +164,7 @@ class MemoryLayer:
             self.objects, space, agent, self.quantizer,
             session=session or new_session(), ttl=ttl, ack_verify=ack_verify,
             compaction=compaction, compaction_threshold=compaction_threshold,
+            compact_bit_width=compact_bit_width,
         )
         # celld: "Two requests to the same cell never run at the same instant."
         # One lane is single-threaded, which is why none of the state below
@@ -472,18 +474,22 @@ class MemoryLayer:
 
     # -- maintenance ------------------------------------------------------
 
-    def compact(self) -> str | None:
+    def compact(self, bit_width: int | None = None) -> str | None:
         """Fold this agent's lane into one additive L1 object.
 
-        Returns the L1 key, or None when the lane is already a single object
-        -- the common case right after a wake, because the base written at
-        sequence zero is itself a compaction.
+        ``bit_width`` (or ``compact_bit_width`` from the constructor)
+        additionally requantizes the folded vectors down to a narrower
+        codebook -- TurboQuant's compression applied a second time, by age:
+        the working set keeps the store's write width, compacted history
+        drops to 2 or 1 bits.  Returns the L1 key, or None when the lane is
+        already a single object -- the common case right after a wake,
+        because the base written at sequence zero is itself a compaction.
         """
         with self._lock:
             self._state()
             if self.space.pending or not self.space._base_written:
                 self.space.flush(note="compact")
-            return self.space.compact()
+            return self.space.compact(bit_width=bit_width)
 
     def gc(self, keep_epochs: int = 1) -> int:
         """Delete this agent's superseded objects.  Destructive -- it ends the

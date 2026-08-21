@@ -222,6 +222,19 @@ compaction *adds* a wider covering range rather than rewriting history — and
 chain assembly prefers it automatically. In a shared space the saving
 multiplies: every other agent lists and replays that lane too.
 
+**Requantizing compaction** applies TurboQuant a second time, by age. Pass
+`compact_bit_width=2` (or `python -m celluloid3 compact --bits 2`) and the
+folded vectors are re-encoded into a narrower codebook, so history pays fewer
+bits than the working set — fresh L0 segments stay at the store's write width,
+what survives long enough to be compacted drops to 2 or 1 bits. This is
+possible without re-embedding anything: the rotation and codebooks are
+deterministic functions of the shared config, so stored codes can be
+down-quantized entirely in the rotated domain (decode to level values,
+renormalize, re-quantize; the debias factors compose). Payloads carry their
+own bit width, so readers score mixed-width state per codebook and never need
+to be told. The loss is paid exactly once — an already-narrow payload is left
+alone rather than round-tripped through its own codebook.
+
 ### 7. Hibernation and LRU shedding
 
 > Under pressure, celld durably replicates and fences the least-recently used
@@ -322,7 +335,9 @@ exercise.
 
 Like turbovec, the hot path — bit-unpacking plus lookup-table scoring — has a
 Rust implementation with PyO3 bindings in [`rust/`](rust/). It is the one place
-CPU time can matter, because recall does no I/O at all:
+CPU time can matter, because recall does no I/O at all. The kernel also
+implements the requantization step behind requantizing compaction, kept
+bit-identical with the numpy fallback so both paths write the same bytes:
 
 ```bash
 pip install maturin

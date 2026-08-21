@@ -77,8 +77,96 @@ fn score_packed(
     Ok(out)
 }
 
+/// Requantize one packed row down to a narrower codebook, in the rotated
+/// domain (turbovec's compression applied a second time, at compaction).
+///
+/// * `packed`     — the row's packed codes at `old_width`
+/// * `old_levels` — codebook the codes were written with, `2^old_width` entries
+/// * `new_levels` — narrower codebook to re-encode into, `2^new_width` entries
+///
+/// Decodes the codes to level values (the best available estimate of the
+/// rotated unit direction, up to the stored `dnorm`), renormalizes, and
+/// quantizes that estimate against the new codebook's Lloyd-Max edges.
+/// Returns `(new_packed, step_corr, new_dnorm)`; the caller composes
+/// `step_corr` into the payload's debias factor.  Mirrors the numpy
+/// fallback in `quantizer.requantize` — all arithmetic in f64, searchsorted
+/// semantics `edges[i-1] < x <= edges[i]` — so both paths pick the same
+/// codes away from exact bucket boundaries.
+#[pyfunction]
+fn requantize_codes(
+    packed: &[u8],
+    dim: usize,
+    old_width: u8,
+    new_width: u8,
+    old_levels: Vec<f64>,
+    new_levels: Vec<f64>,
+) -> PyResult<(Vec<u8>, f64, f64)> {
+    if !matches!(old_width, 1 | 2 | 4 | 8) || !matches!(new_width, 1 | 2 | 4 | 8) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "bit widths must be 1, 2, 4, or 8",
+        ));
+    }
+    if new_width >= old_width {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "requantization only narrows: new_width must be < old_width",
+        ));
+    }
+    let old_per_byte = 8 / old_width as usize;
+    if old_levels.len() != 1 << old_width
+        || new_levels.len() != 1 << new_width
+        || packed.len() * old_per_byte < dim
+    {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "inconsistent buffer sizes",
+        ));
+    }
+    let old_mask = ((1u16 << old_width) - 1) as u16;
+
+    // Decode: codes -> level values; the stored row is `decoded / dnorm`
+    // scaled, so renormalizing recovers the unit-direction estimate.
+    let mut decoded = vec![0f64; dim];
+    for j in 0..dim {
+        let byte = packed[j / old_per_byte] as u16;
+        let code = (byte >> (old_width as usize * (j % old_per_byte))) & old_mask;
+        decoded[j] = old_levels[code as usize];
+    }
+    let dnorm = decoded.iter().map(|x| x * x).sum::<f64>().sqrt();
+    if dnorm <= 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "degenerate payload: zero decoded norm",
+        ));
+    }
+
+    let edges: Vec<f64> = new_levels
+        .windows(2)
+        .map(|w| 0.5 * (w[0] + w[1]))
+        .collect();
+    let new_per_byte = 8 / new_width as usize;
+    let mut out = vec![0u8; (dim + new_per_byte - 1) / new_per_byte];
+    let mut redecoded = vec![0f64; dim];
+    for j in 0..dim {
+        let x = decoded[j] / dnorm;
+        let code = edges.partition_point(|&e| e < x);
+        redecoded[j] = new_levels[code];
+        out[j / new_per_byte] |= (code as u8) << (new_width as usize * (j % new_per_byte));
+    }
+    let rnorm = redecoded.iter().map(|x| x * x).sum::<f64>().sqrt();
+    let step = if rnorm > 0.0 {
+        decoded
+            .iter()
+            .zip(&redecoded)
+            .map(|(a, b)| (a / dnorm) * b)
+            .sum::<f64>()
+            / rnorm
+    } else {
+        0.0
+    };
+    Ok((out, step, rnorm))
+}
+
 #[pymodule]
 fn celluloid3_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(score_packed, m)?)?;
+    m.add_function(wrap_pyfunction!(requantize_codes, m)?)?;
     Ok(())
 }
