@@ -1,0 +1,17 @@
+[package]
+name = "celloid3-core"
+version = "0.1.0"
+edition = "2021"
+description = "Native scoring kernel for celloid3 (bit-unpack + LUT dot product)"
+license = "MIT"
+
+[lib]
+name = "celloid3_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py310"] }
+
+[profile.release]
+lto = true
+codegen-units = 1

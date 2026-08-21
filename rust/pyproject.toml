@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "celloid3-core"
+version = "0.1.0"
+description = "Native scoring kernel for celloid3"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+[tool.maturin]
+module-name = "celloid3_core"
