@@ -150,6 +150,59 @@ def test_replaying_a_narrow_l1_still_recalls(bucket, embedder):
     reader.close()
 
 
+def test_compact_bit_width_is_validated_at_construction(bucket, embedder):
+    with pytest.raises(ValueError):
+        MemoryLayer(bucket, space="team", agent="bad", embedder=embedder,
+                    dim=256, ttl=60, compact_bit_width=3)
+
+
+def test_narrowing_a_single_object_lane_still_compacts(bucket, embedder):
+    """Right after a wake the lane is one base object; an explicit narrowing
+    must still take effect rather than hitting the nothing-to-fold early-out,
+    and the resulting L1 must win chain assembly over the wide base."""
+    writer = MemoryLayer(bucket, space="team", agent="w", embedder=embedder,
+                         dim=256, ttl=60)
+    writer.remember("only fact, wide")
+    key = writer.compact(bit_width=2)
+    assert key is not None and "L1-" in key
+    segment = read_segment(bucket.get(key))
+    assert segment.bit_width == 2
+    # Same narrowing again: every payload is already narrow, nothing to do.
+    assert writer.compact(bit_width=2) is None
+    writer.close()
+
+    reader = MemoryLayer(bucket, space="team", agent="r", embedder=embedder,
+                         dim=256, ttl=60)
+    hits = reader.recall("only fact", k=1)
+    assert hits and hits[0].fragment.text == "only fact, wide"
+    # The reader replayed the narrow L1, not the wide base it shadows.
+    assert reader.space.state.index.rows[hits[0].fragment.id][2] == 2
+    reader.close()
+
+
+def test_segment_header_reports_the_actual_payload_width(bucket, embedder):
+    """A base rebuilt from a replayed narrow L1 must not stamp the store's
+    write width over 2-bit payloads."""
+    first = MemoryLayer(bucket, space="team", agent="w", embedder=embedder,
+                        dim=256, ttl=60)
+    first.remember("a fact that will be narrowed")
+    first.compact(bit_width=2)
+    first.close()
+
+    reborn = MemoryLayer(bucket, space="team", agent="w", embedder=embedder,
+                         dim=256, ttl=60)
+    reborn.remember("a fresh wide fact")  # forces the base write
+    keys = [k for k in bucket.list("spaces/team/lanes/w/")
+            if "e0000000002" in k]
+    assert keys
+    segment = read_segment(bucket.get(sorted(keys)[0]))
+    widths = {_payload_width(r.vector) for r in segment.records
+              if r.op == "put"}
+    assert widths == {2, 4}          # narrow replayed + wide fresh, mixed
+    assert segment.bit_width == 4    # header reports the widest present
+    reborn.close()
+
+
 def test_automatic_compaction_uses_the_configured_width(bucket, embedder):
     mem = MemoryLayer(bucket, space="team", agent="auto", embedder=embedder,
                       dim=256, ttl=60, compaction_threshold=4,

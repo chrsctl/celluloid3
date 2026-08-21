@@ -89,6 +89,14 @@ def random_rotation(dim: int, seed: int) -> np.ndarray:
     return q
 
 
+def payload_bit_width(blob: bytes) -> int:
+    """The bit width a .tqv payload was packed at, from its header."""
+    magic, bit_width, _dim, _norm, _corr, _dnorm = HEADER.unpack_from(blob)
+    if magic != MAGIC:
+        raise ValueError("not a TQV1 payload")
+    return bit_width
+
+
 def pack_codes(codes: np.ndarray, bit_width: int) -> np.ndarray:
     """Pack an array of small integer codes into bytes, little-end first."""
     per_byte = 8 // bit_width
@@ -131,7 +139,19 @@ class TurboQuantizer:
         # deterministic function of (bit_width, dim), so every reader can
         # decode any payload regardless of the width it writes at.
         self._codebooks: dict[int, tuple] = {}
-        self.levels, self.edges, self.levels_f32 = self.codebook(bit_width)
+        self.codebook(bit_width)  # build the write-width codebook eagerly
+
+    @property
+    def levels(self) -> np.ndarray:
+        return self.codebook(self.bit_width)[0]
+
+    @property
+    def edges(self) -> np.ndarray:
+        return self.codebook(self.bit_width)[1]
+
+    @property
+    def levels_f32(self) -> np.ndarray:
+        return self.codebook(self.bit_width)[2]
 
     def codebook(self, bit_width: int) -> tuple:
         """(levels, edges, levels_f32) for a supported bit width."""
@@ -219,8 +239,11 @@ class TurboQuantizer:
             return HEADER.pack(MAGIC, bit_width, self.dim, norm, corr * step,
                                rnorm) + bytes(payload)
         decoded = old_levels[unpack_codes(packed, old_width, self.dim)]
-        # Recompute the decoded norm in f64 (the header stores it as f32);
-        # keeps this path bit-identical with the native kernel.
+        # Recompute the decoded norm in f64 (the header stores it as f32),
+        # mirroring the native kernel.  The two paths agree except when a
+        # renormalized coordinate lands within a rounding error of a codebook
+        # edge -- nothing depends on byte equality; a lane's payloads are
+        # written by one process at a time and readers accept either result.
         d1_hat = decoded / np.linalg.norm(decoded)
         codes = np.searchsorted(edges, d1_hat).astype(np.uint8)
         redecoded = levels[codes]

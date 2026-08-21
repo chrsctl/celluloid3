@@ -336,8 +336,10 @@ exercise.
 Like turbovec, the hot path — bit-unpacking plus lookup-table scoring — has a
 Rust implementation with PyO3 bindings in [`rust/`](rust/). It is the one place
 CPU time can matter, because recall does no I/O at all. The kernel also
-implements the requantization step behind requantizing compaction, kept
-bit-identical with the numpy fallback so both paths write the same bytes:
+implements the requantization step behind requantizing compaction, mirroring
+the numpy fallback operation for operation — the paths can differ only when a
+coordinate lands within a rounding error of a codebook edge, and nothing
+depends on byte equality:
 
 ```bash
 pip install maturin
@@ -348,6 +350,16 @@ pip install target/wheels/celluloid3_core-*.whl
 `celluloid3` detects it automatically and falls back to a vectorized numpy path
 when absent. Pure Python stays a first-class citizen; orchestration — the
 ownership protocol, the lanes, the merge — stays in Python on purpose.
+
+**Why not depend on [turbovec](https://pypi.org/project/turbovec/) directly?**
+It ships as a self-contained vector *index* — float32 vectors in, its own
+persisted `.tv` format out. celluloid3 needs the layer below that: a payload
+codec whose rotation and codebooks are deterministic functions of the shared
+store config, so that every agent can decode any other agent's packed vectors
+straight out of replayed log segments, and requantize stored codes without the
+originals. That surface isn't exposed, and pinning cross-agent byte formats to
+an external library's internals would let a version bump strand stored data.
+So the idea is taken (see the lineage table) and the ~200 lines are owned.
 
 ## Large attachments
 

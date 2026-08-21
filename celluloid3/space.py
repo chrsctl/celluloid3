@@ -49,7 +49,7 @@ from .fragments import (
 )
 from .objectstore import ObjectStore, PreconditionFailed
 from .ownership import DEFAULT_TTL, Fenced, Ownership
-from .quantizer import TurboQuantizer
+from .quantizer import SUPPORTED_BIT_WIDTHS, TurboQuantizer, payload_bit_width
 from .segments import Record, pack_segment, read_segment
 
 # celld folds L0 segments into an L1 object so a takeover reads a handful of
@@ -60,6 +60,17 @@ DEFAULT_COMPACTION_THRESHOLD = 32
 
 class ChainBroken(RuntimeError):
     """A lane's epoch prefix has data but no contiguous chain from zero."""
+
+
+def records_bit_width(records, default: int) -> int:
+    """The widest payload width among a batch's put records.
+
+    Stamped into the segment header so it describes what the segment actually
+    holds -- payloads self-describe, so a batch can mix widths (a base built
+    from a requantized L1 plus fresh writes, say) and the header reports the
+    widest rather than whatever width was merely requested."""
+    return max((payload_bit_width(r.vector) for r in records if r.op == "put"),
+               default=default)
 
 
 # ---------------------------------------------------------------------------
@@ -272,7 +283,10 @@ def build_chain(keys: list[str], until: int | None = None) -> list[str]:
         eligible = [c for c in ranges[pos] if until is None or c[0] <= until]
         if not eligible:
             break
-        hi, key = max(eligible)
+        # Widest coverage first; on equal coverage prefer the L1 -- it may
+        # hold requantized (narrower) payloads that supersede the L0's.
+        hi, key = max(eligible, key=lambda c: (
+            c[0], c[1].rsplit("/", 1)[-1].startswith("L1-"), c[1]))
         chain.append(key)
         pos = hi + 1
     return chain
@@ -339,6 +353,10 @@ class Space:
         self.ack_verify = ack_verify
         self.compaction = compaction
         self.compaction_threshold = compaction_threshold
+        if (compact_bit_width is not None
+                and compact_bit_width not in SUPPORTED_BIT_WIDTHS):
+            raise ValueError(
+                f"compact_bit_width must be one of {SUPPORTED_BIT_WIDTHS}")
         self.compact_bit_width = compact_bit_width
 
         self.state: SharedState | None = None
@@ -555,7 +573,8 @@ class Space:
         seq = self._next_seq
         blob = pack_segment(
             records, lo=seq, hi=seq, epoch=self.epoch, created_at=time.time(),
-            dim=self.quantizer.dim, bit_width=self.quantizer.bit_width,
+            dim=self.quantizer.dim,
+            bit_width=records_bit_width(records, self.quantizer.bit_width),
             note=note, author=self.agent,
         )
         # Unconditional: the lane and epoch in the key are the fence.
@@ -616,30 +635,49 @@ class Space:
         """
         if not self.active or not self._base_written:
             return None
-        hi = self._next_seq - 1
-        if hi < 1:
-            return None
         bit_width = self.compact_bit_width if bit_width is None else bit_width
+        if bit_width is not None and bit_width not in SUPPORTED_BIT_WIDTHS:
+            raise ValueError(f"bit_width must be one of {SUPPORTED_BIT_WIDTHS}")
+        hi = self._next_seq - 1
+        if hi < 0:
+            return None
         records = self._base_records()
-        seg_width = self.quantizer.bit_width
+        narrowed = False
         if bit_width is not None:
-            records = [
-                Record.put(r.fragment,
-                           self.quantizer.requantize(r.vector, bit_width))
-                if r.op == "put" else r
-                for r in records
-            ]
-            seg_width = bit_width
+            requantized = []
+            for r in records:
+                if r.op != "put":
+                    requantized.append(r)
+                    continue
+                vector = self.quantizer.requantize(r.vector, bit_width)
+                narrowed = narrowed or vector is not r.vector
+                requantized.append(Record.put(r.fragment, vector))
+            records = requantized
+        # A single-object lane has nothing to fold -- unless a narrowing was
+        # requested and actually bit: then the L1 covering just [0, 0] is the
+        # point, and chain assembly prefers it over the wide base it shadows.
+        if hi < 1 and not narrowed:
+            return None
         blob = pack_segment(
             records, lo=0, hi=hi, epoch=self.epoch,
             created_at=time.time(), dim=self.quantizer.dim,
-            bit_width=seg_width, author=self.agent,
+            bit_width=records_bit_width(records, self.quantizer.bit_width),
+            author=self.agent,
             note=f"L1 compaction of 0..{hi}",
         )
         key = l1_key(self.space, self.agent, self.epoch, 0, hi)
         self.objects.put(key, blob)
         if self.ack_verify:
             self.ownership.verify()
+        if narrowed:
+            # The L1 is now this lane's durable form, so own must match it:
+            # the next base rewrite carries the narrow payloads (what a
+            # restart would replay anyway) and the next compaction sees them
+            # already narrow and no-ops instead of redoing the work.
+            for record in records:
+                if record.op == "put" and record.fragment_id in self.own:
+                    fragment, _vector = self.own[record.fragment_id]
+                    self.own[record.fragment_id] = (fragment, record.vector)
         return key
 
     def gc(self, keep_epochs: int = 1) -> int:

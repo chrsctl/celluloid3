@@ -481,9 +481,11 @@ class MemoryLayer:
         additionally requantizes the folded vectors down to a narrower
         codebook -- TurboQuant's compression applied a second time, by age:
         the working set keeps the store's write width, compacted history
-        drops to 2 or 1 bits.  Returns the L1 key, or None when the lane is
-        already a single object -- the common case right after a wake,
-        because the base written at sequence zero is itself a compaction.
+        drops to 2 or 1 bits.  Returns the L1 key, or None when there is
+        nothing to do: the lane is already a single object (the common case
+        right after a wake, because the base written at sequence zero is
+        itself a compaction) and no requested narrowing would change any
+        payload.
         """
         with self._lock:
             self._state()
