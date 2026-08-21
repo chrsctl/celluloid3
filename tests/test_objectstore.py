@@ -3,10 +3,10 @@ compare-and-swap.  Every backend must implement them identically."""
 
 import pytest
 
-from celloid3 import (
+from celluloid3 import (
     FileObjectStore, InMemoryObjectStore, PreconditionFailed, open_object_store,
 )
-from celloid3.objectstore import etag_of
+from celluloid3.objectstore import etag_of
 
 BACKENDS = ["file", "ram"]
 

@@ -6,9 +6,9 @@ import time
 
 import pytest
 
-from celloid3 import Fenced, Held, MemoryLayer
-from celloid3.fragments import owner_key
-from celloid3.ownership import Ownership
+from celluloid3 import Fenced, Held, MemoryLayer
+from celluloid3.fragments import owner_key
+from celluloid3.ownership import Ownership
 
 KEY = owner_key("team", "planner")
 LABEL = "lane 'planner'"

@@ -10,8 +10,8 @@ import time
 
 import pytest
 
-from celloid3 import Fenced, Held, MemoryLayer
-from celloid3.fragments import lane_prefix, lanes_prefix
+from celluloid3 import Fenced, Held, MemoryLayer
+from celluloid3.fragments import lane_prefix, lanes_prefix
 
 SPACE = "team"
 
@@ -158,7 +158,7 @@ def test_the_same_fact_learned_twice_converges_on_one_record(team, monkeypatch):
     """Content addressing does double duty in a shared space: two agents that
     independently arrive at the same conclusion store it once, and the record
     remembers that both of them got there."""
-    monkeypatch.setattr("celloid3.memory.time.time", lambda: 1234.0)
+    monkeypatch.setattr("celluloid3.memory.time.time", lambda: 1234.0)
     planner, coder = team("planner"), team("coder")
     a = planner.remember("the pilot ships on the 14th", metadata={"kind": "date"})
     b = coder.remember("the pilot ships on the 14th", metadata={"kind": "date"})

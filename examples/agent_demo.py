@@ -12,9 +12,9 @@ import tempfile
 import time
 from dataclasses import replace
 
-from celloid3 import Fenced, HashingEmbedder, Held, MemoryLayer, MemoryPool
-from celloid3.fragments import epoch_prefix, lanes_prefix
-from celloid3.objectstore import ObjectStore, open_object_store
+from celluloid3 import Fenced, HashingEmbedder, Held, MemoryLayer, MemoryPool
+from celluloid3.fragments import epoch_prefix, lanes_prefix
+from celluloid3.objectstore import ObjectStore, open_object_store
 
 SPACE = "product-team"
 

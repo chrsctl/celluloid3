@@ -9,8 +9,8 @@ import io
 
 import pytest
 
-from celloid3 import PreconditionFailed, S3ObjectStore
-from celloid3.objectstore import etag_of
+from celluloid3 import PreconditionFailed, S3ObjectStore
+from celluloid3.objectstore import etag_of
 
 
 class StubClientError(Exception):
@@ -134,7 +134,7 @@ def test_list_strips_the_store_prefix(s3):
 
 
 def test_a_shared_space_runs_on_the_s3_backend(s3):
-    from celloid3 import HashingEmbedder, MemoryLayer
+    from celluloid3 import HashingEmbedder, MemoryLayer
     store, _client = s3
     embed = HashingEmbedder(dim=64)
     planner = MemoryLayer(store, space="team", agent="planner", embedder=embed,
@@ -148,7 +148,7 @@ def test_a_shared_space_runs_on_the_s3_backend(s3):
 
 
 def test_lane_keys_carry_the_agent_and_the_epoch(s3):
-    from celloid3 import HashingEmbedder, MemoryLayer
+    from celluloid3 import HashingEmbedder, MemoryLayer
     store, client = s3
     mem = MemoryLayer(store, space="team", agent="planner",
                       embedder=HashingEmbedder(dim=64), dim=64, ttl=60)

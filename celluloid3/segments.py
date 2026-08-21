@@ -1,7 +1,7 @@
 """Log segments: the unit of durability, and the unit of a round trip.
 
 celld replicates each cell as a chain of LTX segments under an epoch prefix.
-celloid3 does the same thing with memory, per agent: a segment is one batch of
+celluloid3 does the same thing with memory, per agent: a segment is one batch of
 log records -- ``put`` (a fragment plus its quantized vector) and ``forget``
 (a tombstone) -- serialized into a single object and written into that agent's
 own lane with one plain PUT.
