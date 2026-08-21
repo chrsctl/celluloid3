@@ -1,38 +1,41 @@
-"""celloid3 -- an S3-native fragmented memory layer for AI agents.
+"""celloid3 -- a shared memory layer for AI agents, on object storage.
 
-Durable agent memory in a bucket you own: each agent's long-term memory is a
-*cell* replicated to object storage as an epoch-prefixed append-only log of
-TurboQuant-compressed fragments.  Ownership is one conditional write, the
-data path is plain PUTs, and recall costs no round trips at all.
+A *space* is memory a team of agents holds in common: each agent writes into
+its own **lane** and reads the union of everyone's.  Lanes are epoch-fenced
+by their key, so many agents write concurrently with plain unconditional PUTs
+and never coordinate; the merged view converges regardless of arrival order.
 """
 
-from .cell import Cell, CellState, ChainBroken, Cut, QuantIndex, build_chain
 from .embedder import HashingEmbedder
 from .fragments import Fragment
-from .memory import CellPool, MemoryLayer, RecallHit
+from .memory import MemoryLayer, MemoryPool, RecallHit
 from .objectstore import (
     FileObjectStore, InMemoryObjectStore, ObjectStore, PreconditionFailed,
     S3ObjectStore, open_object_store,
 )
-from .ownership import CellHeld, Fenced, OwnerRecord, Ownership
+from .ownership import Fenced, Held, OwnerRecord, Ownership
 from .quantizer import TurboQuantizer
 from .segments import Record, Segment, pack_segment, read_segment
+from .space import (
+    ChainBroken, Cut, QuantIndex, SharedState, Space, build_chain, select_chain,
+)
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     # agent-facing
     "MemoryLayer",
-    "CellPool",
+    "MemoryPool",
     "RecallHit",
     "Fragment",
     "HashingEmbedder",
     "Cut",
     # engine
-    "Cell",
-    "CellState",
+    "Space",
+    "SharedState",
     "QuantIndex",
     "build_chain",
+    "select_chain",
     "TurboQuantizer",
     "Record",
     "Segment",
@@ -41,7 +44,7 @@ __all__ = [
     # coordination
     "Ownership",
     "OwnerRecord",
-    "CellHeld",
+    "Held",
     "Fenced",
     "ChainBroken",
     # storage backends

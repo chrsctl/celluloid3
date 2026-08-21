@@ -133,14 +133,27 @@ def test_list_strips_the_store_prefix(s3):
                                                    "cells/a/ltx/e2/"]
 
 
-def test_memory_layer_runs_on_the_s3_backend(s3):
+def test_a_shared_space_runs_on_the_s3_backend(s3):
     from celloid3 import HashingEmbedder, MemoryLayer
     store, _client = s3
-    mem = MemoryLayer(store, cell="assistant", embedder=HashingEmbedder(dim=64),
-                      dim=64)
-    mem.remember("the bucket is the database")
-    mem.hibernate()
-    reopened = MemoryLayer(store, cell="assistant",
-                           embedder=HashingEmbedder(dim=64))
-    assert reopened.recall("what is the database?", k=1)[0].fragment.text == \
-        "the bucket is the database"
+    embed = HashingEmbedder(dim=64)
+    planner = MemoryLayer(store, space="team", agent="planner", embedder=embed,
+                          dim=64, ttl=60)
+    planner.remember("the bucket is the database")
+    coder = MemoryLayer(store, space="team", agent="coder", embedder=embed,
+                        ttl=60)
+    hit = coder.recall("what is the database?", k=1)[0]
+    assert hit.fragment.text == "the bucket is the database"
+    assert hit.authors == ("planner",)
+
+
+def test_lane_keys_carry_the_agent_and_the_epoch(s3):
+    from celloid3 import HashingEmbedder, MemoryLayer
+    store, client = s3
+    mem = MemoryLayer(store, space="team", agent="planner",
+                      embedder=HashingEmbedder(dim=64), dim=64, ttl=60)
+    mem.remember("a fact")
+    segments = [k for k in client.objects if k.endswith(".tqs")]
+    assert segments == [
+        "agent-memory/spaces/team/lanes/planner/e0000000001/000000000000.tqs"
+    ]

@@ -5,6 +5,7 @@ from celloid3 import (
 )
 
 DIM = 256
+SPACE = "team"
 
 
 @pytest.fixture
@@ -26,19 +27,31 @@ def ram_bucket():
 
 @pytest.fixture
 def mem(bucket, embedder):
-    return MemoryLayer(bucket, cell="agent", embedder=embedder, dim=DIM)
+    """One agent in a shared space."""
+    return MemoryLayer(bucket, space=SPACE, agent="agent", embedder=embedder,
+                       dim=DIM, ttl=60)
 
 
-def open_layer(bucket, embedder, cell="agent", **kwargs):
-    return MemoryLayer(bucket, cell=cell, embedder=embedder, **kwargs)
+@pytest.fixture
+def team(bucket, embedder):
+    """A factory for agents sharing one space, all against one bucket."""
+    made = {}
+
+    def open_agent(name, **kwargs):
+        kwargs.setdefault("ttl", 60)
+        made[name] = MemoryLayer(bucket, space=SPACE, agent=name,
+                                 embedder=embedder, dim=DIM, **kwargs)
+        return made[name]
+
+    yield open_agent
 
 
 class CountingStore(ObjectStore):
     """Wraps a bucket and counts round trips.
 
     Round-trip counts are the thesis of this design -- one PUT per commit,
-    zero GETs per recall, a handful of GETs per wake -- so the tests assert
-    them directly rather than trusting the prose.
+    zero GETs per recall, one LIST to catch up on the whole team -- so the
+    tests assert them directly rather than trusting the prose.
     """
 
     def __init__(self, inner):

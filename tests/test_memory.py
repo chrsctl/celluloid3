@@ -1,6 +1,8 @@
 """The agent-facing API: remember, recall, forget, checkpoints, time travel,
 metadata filtering, attachments."""
 
+import time
+
 import numpy as np
 import pytest
 
@@ -29,27 +31,31 @@ def test_remember_recall_roundtrip(mem):
 
 
 def test_metadata_and_parents_survive_a_wake(bucket, embedder):
-    first = MemoryLayer(bucket, cell="a", embedder=embedder, dim=256, ttl=60)
+    first = MemoryLayer(bucket, space="team", agent="a", embedder=embedder,
+                        dim=256, ttl=60)
     root = first.remember("the incident started at 02:14", metadata={"kind": "incident"})
     child = first.remember("root cause: an expired certificate",
                            metadata={"kind": "postmortem"}, parents=(root,))
     first.hibernate()
 
-    second = MemoryLayer(bucket, cell="a", embedder=embedder, ttl=60)
+    second = MemoryLayer(bucket, space="team", agent="a", embedder=embedder, ttl=60)
     fragment = second.get(child)
     assert fragment.metadata == {"kind": "postmortem"}
     assert fragment.parents == (root,)
 
 
-def test_identical_memories_deduplicate(mem, monkeypatch):
-    """Fragments are named by the hash of their content, so learning the same
-    thing twice costs nothing -- and two agents that learn it independently
-    converge on one record."""
-    monkeypatch.setattr("celloid3.memory.time.time", lambda: 1234.0)
+def test_identical_memories_deduplicate(mem):
+    """Fragments are named by the hash of their content -- text, metadata and
+    parents, deliberately not the timestamp -- so learning the same thing
+    twice costs nothing however far apart the two occasions are."""
     first = mem.remember("a repeated observation", metadata={"kind": "note"})
+    time.sleep(0.01)
     second = mem.remember("a repeated observation", metadata={"kind": "note"})
     assert first == second
     assert len(mem) == 1
+    # ...but a different note, or different metadata, is a different memory
+    assert mem.remember("a repeated observation", metadata={"kind": "other"}) != first
+    assert len(mem) == 2
 
 
 def test_short_ids_resolve_like_git_shas(mem):
@@ -141,7 +147,8 @@ def test_filtered_scan_reaches_past_the_top_k(mem):
 def test_attachments_live_beside_the_log(bucket, embedder):
     """Segments are replayed in full on every wake, so big payloads go next to
     the log rather than into it."""
-    first = MemoryLayer(bucket, cell="a", embedder=embedder, dim=256, ttl=60)
+    first = MemoryLayer(bucket, space="team", agent="a", embedder=embedder,
+                        dim=256, ttl=60)
     payload = b"\x89PNG not really an image" * 500
     key = first.attach("diagram.png", payload)
     first.remember("architecture diagram of the ingest service",
@@ -149,15 +156,19 @@ def test_attachments_live_beside_the_log(bucket, embedder):
     assert first.attach("diagram.png", payload) == key   # content-addressed
     first.hibernate()
 
-    second = MemoryLayer(bucket, cell="a", embedder=embedder, ttl=60)
+    second = MemoryLayer(bucket, space="team", agent="a", embedder=embedder, ttl=60)
     hit = second.recall("architecture diagram", k=1)[0]
     assert second.get_attachment(hit.fragment.metadata["attachment"]) == payload
     assert second.get_attachment("cells/a/blobs/00/nope/x.png") is None
 
 
-def test_cells_are_isolated(bucket, embedder):
-    planner = MemoryLayer(bucket, cell="planner", embedder=embedder, dim=256, ttl=60)
-    coder = MemoryLayer(bucket, cell="coder", embedder=embedder, ttl=60)
+def test_spaces_are_isolated(bucket, embedder):
+    """Different spaces share nothing -- a team's memory and a private one are
+    just two spaces in the same bucket."""
+    planner = MemoryLayer(bucket, space="planning", agent="a", embedder=embedder,
+                         dim=256, ttl=60)
+    coder = MemoryLayer(bucket, space="engineering", agent="a", embedder=embedder,
+                      ttl=60)
     planner.remember("the planner remembers the roadmap")
     coder.remember("the coder remembers the stack trace")
     assert len(planner) == len(coder) == 1
@@ -166,13 +177,13 @@ def test_cells_are_isolated(bucket, embedder):
 
 def test_store_config_is_created_once_and_then_enforced(bucket, embedder, tmp_path):
     from celloid3 import FileObjectStore
-    MemoryLayer(bucket, cell="a", embedder=embedder, dim=256)
+    MemoryLayer(bucket, space="team", agent="a", embedder=embedder, dim=256)
     # the store's codebook is fixed at creation; a mismatched reopen is refused
     with pytest.raises(ValueError):
-        MemoryLayer(bucket, cell="a", embedder=embedder, dim=64)
+        MemoryLayer(bucket, space="team", agent="a", embedder=embedder, dim=64)
     # ...and a brand-new store has to be told the dimension somehow
     with pytest.raises(ValueError):
-        MemoryLayer(FileObjectStore(tmp_path / "empty"), cell="a")
+        MemoryLayer(FileObjectStore(tmp_path / "empty"), space="team", agent="a")
 
 
 def test_config_creation_is_a_race_only_one_agent_wins(bucket, embedder):
@@ -186,7 +197,7 @@ def test_config_creation_is_a_race_only_one_agent_wins(bucket, embedder):
 
 
 def test_recall_without_an_embedder_needs_a_vector(bucket):
-    mem = MemoryLayer(bucket, cell="a", dim=32, ttl=60)
+    mem = MemoryLayer(bucket, space="team", agent="a", dim=32, ttl=60)
     fid = mem.remember("stored with an explicit vector",
                        embedding=np.arange(32, dtype=float))
     with pytest.raises(ValueError):
@@ -196,13 +207,14 @@ def test_recall_without_an_embedder_needs_a_vector(bucket):
 
 
 def test_context_manager_hands_the_cell_back(bucket, embedder):
-    with MemoryLayer(bucket, cell="a", embedder=embedder, dim=256, ttl=60) as mem:
+    with MemoryLayer(bucket, space="team", agent="a", embedder=embedder,
+                        dim=256, ttl=60) as mem:
         mem.remember("written inside the with-block")
-        assert mem.cell.active
-    record, _etag = mem.cell.ownership.read()
+        assert mem.space.active
+    record, _etag = mem.space.ownership.read()
     assert record.owned is False
 
-    with MemoryLayer(bucket, cell="a", embedder=embedder, ttl=60) as second:
+    with MemoryLayer(bucket, space="team", agent="a", embedder=embedder, ttl=60) as second:
         assert len(second) == 1
 
 
@@ -213,7 +225,7 @@ def test_stats_report_the_compression_and_the_wake(mem):
     assert stats["compression"] >= 7          # 4-bit vs float32, minus headers
     assert stats["bit_width"] == 4
     assert stats["epoch"] == 1
-    assert stats["head"] == "e1:0"
+    assert stats["head"] == "agent:e1:0"
 
 
 def test_history_reads_like_a_log(mem):
@@ -228,6 +240,6 @@ def test_history_reads_like_a_log(mem):
 def test_hibernated_layer_reactivates_on_use(mem):
     fill(mem)
     mem.hibernate()
-    assert not mem.cell.active
+    assert not mem.space.active
     assert len(mem.recall("deploy", k=2)) == 2      # woke itself back up
     assert mem.epoch == 2
