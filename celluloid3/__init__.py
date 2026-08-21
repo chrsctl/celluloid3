@@ -1,4 +1,4 @@
-"""celloid3 -- a shared memory layer for AI agents, on object storage.
+"""celluloid3 -- a shared memory layer for AI agents, on object storage.
 
 A *space* is memory a team of agents holds in common: each agent writes into
 its own **lane** and reads the union of everyone's.  Lanes are epoch-fenced

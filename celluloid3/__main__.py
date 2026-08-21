@@ -1,8 +1,8 @@
-"""Command-line interface: ``python -m celloid3 <command>``.
+"""Command-line interface: ``python -m celluloid3 <command>``.
 
 Uses the built-in HashingEmbedder so it runs with zero configuration.  The
 store defaults to ./agent-memory (a local directory that behaves like a
-bucket) or $CELLOID3_STORE; point it at ``s3://bucket/prefix`` and nothing
+bucket) or $CELLULOID3_STORE; point it at ``s3://bucket/prefix`` and nothing
 else changes.
 
 ``--space`` picks the shared memory; ``--agent`` picks which lane to write
@@ -54,18 +54,18 @@ def _kv(pairs: list[str]) -> dict:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="celloid3",
+        prog="celluloid3",
         description="shared memory layer for AI agents, on object storage",
     )
     parser.add_argument(
-        "--store", default=os.environ.get("CELLOID3_STORE", "./agent-memory"),
+        "--store", default=os.environ.get("CELLULOID3_STORE", "./agent-memory"),
         help="bucket URI (s3://bucket/prefix) or local path (default ./agent-memory)",
     )
     parser.add_argument("--space", "-s",
-                        default=os.environ.get("CELLOID3_SPACE", "shared"),
+                        default=os.environ.get("CELLULOID3_SPACE", "shared"),
                         help="the shared memory to open (default 'shared')")
     parser.add_argument("--agent", "-a",
-                        default=os.environ.get("CELLOID3_AGENT", "default"),
+                        default=os.environ.get("CELLULOID3_AGENT", "default"),
                         help="which lane to write into (default 'default')")
     parser.add_argument("--ttl", type=float, default=10.0,
                         help="lane lease lifetime in seconds (default 10)")

@@ -1,4 +1,4 @@
-"""celloid3 -- a shared memory layer for AI agents, on object storage.
+"""celluloid3 -- a shared memory layer for AI agents, on object storage.
 
 Many agents, one memory.  A *space* is a pool of memory that a team of agents
 reads and writes together; each agent writes into its own **lane** and reads
@@ -13,7 +13,7 @@ Idea lineage:
   is the fence"; writes are durable before they are acknowledged (RPO=0)
   behind a gate that reads the ownership record once; idle state is shed LRU
   and published as unowned without resetting its epoch; L1 compaction keeps
-  catch-up cheap.  celloid3 generalizes the key-is-the-fence trick from one
+  catch-up cheap.  celluloid3 generalizes the key-is-the-fence trick from one
   writer to many by putting the agent's lane in the key beside the epoch.
 - **turbovec** (RyanCodrai/turbovec): TurboQuant embedding compression, so a
   space's whole searchable index is small enough to pull over the network on

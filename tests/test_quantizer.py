@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from celloid3.quantizer import (
+from celluloid3.quantizer import (
     SUPPORTED_BIT_WIDTHS,
     TurboQuantizer,
     lloyd_max_levels,

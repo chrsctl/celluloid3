@@ -1,11 +1,11 @@
-//! Native scoring kernel for celloid3 (idea lineage: RyanCodrai/turbovec,
+//! Native scoring kernel for celluloid3 (idea lineage: RyanCodrai/turbovec,
 //! whose Rust core scores packed codes against per-query lookup tables).
 //!
 //! Vectors stay bit-packed in RAM; scoring fuses the codebook and the rotated
 //! query into one per-coordinate lookup table, then accumulates straight from
 //! the packed bytes — codes are never materialized as a float matrix.
 //!
-//! This is the one place in celloid3 where CPU time can matter: recall does no
+//! This is the one place in celluloid3 where CPU time can matter: recall does no
 //! I/O at all, so an exhaustive scan over a large resident cell is the only
 //! thing between a query and its answer.
 
@@ -78,7 +78,7 @@ fn score_packed(
 }
 
 #[pymodule]
-fn celloid3_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn celluloid3_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(score_packed, m)?)?;
     Ok(())
 }

@@ -1,4 +1,4 @@
-"""The bucket: celloid3's only durable substrate and its only coordinator.
+"""The bucket: celluloid3's only durable substrate and its only coordinator.
 
 celld's premise, ported verbatim: "Object-storage compare-and-swap ensures
 that exactly one node owns a cell at a time, without a membership protocol,
@@ -190,7 +190,7 @@ class FileObjectStore(ObjectStore):
 
     Conditional create and compare-and-swap are emulated with a per-key
     ``flock``, so the semantics hold across processes on one machine.  This
-    is what makes celloid3 runnable with zero infrastructure -- the same code
+    is what makes celluloid3 runnable with zero infrastructure -- the same code
     path that talks to S3 in production talks to ./agent-memory in a test.
     """
 
@@ -326,7 +326,7 @@ class S3ObjectStore(ObjectStore):
                 import boto3
             except ImportError as exc:  # pragma: no cover
                 raise ImportError(
-                    "the S3 backend needs boto3: pip install 'celloid3[s3]'"
+                    "the S3 backend needs boto3: pip install 'celluloid3[s3]'"
                 ) from exc
             client = boto3.client("s3", **client_kwargs)
         self.client = client

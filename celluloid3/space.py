@@ -8,7 +8,7 @@ celld's central optimization is that the fence lives in the *key*:
      the data path needs no conditional write."
 
 That works because an epoch never has two writers.  A shared memory has many
-writers at once, so celloid3 generalizes the same trick one level out: each
+writers at once, so celluloid3 generalizes the same trick one level out: each
 agent owns a **lane**, and the lane id sits in the key next to the epoch.  A
 lane never has two writers either, so every agent's data path stays a plain
 unconditional PUT and no agent ever waits for, blocks, or retries behind

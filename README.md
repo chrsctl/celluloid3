@@ -1,4 +1,4 @@
-# celloid3
+# celluloid3
 
 **A shared memory layer for AI agents, on object storage.** A team of agents
 reads and writes one pool of memory in a bucket you own. Each agent writes
@@ -7,7 +7,7 @@ of all lanes, and they all converge on the same memory without a server, a
 lock service, or a vector database.
 
 ```python
-from celloid3 import MemoryLayer
+from celluloid3 import MemoryLayer
 
 planner = MemoryLayer("s3://my-bucket/memory", space="team", agent="planner",
                       embedder=my_embedder)
@@ -33,7 +33,7 @@ Give them one shared store and you need something to arbitrate the writes —
 a database, a queue, a lock service — which is a server, an availability
 story, and a bill.
 
-celloid3 removes the arbitration instead of centralizing it. Two agents
+celluloid3 removes the arbitration instead of centralizing it. Two agents
 never write to the same key, so there is nothing to arbitrate:
 
 | | |
@@ -51,7 +51,7 @@ never write to the same key, so there is nothing to arbitrate:
 | **[turbovec](https://github.com/RyanCodrai/turbovec)** | TurboQuant embedding compression — normalize → seeded random rotation → Lloyd-Max scalar quantization → bit-packing (~8× smaller at 4 bits, up to 16× at 2) with length-renormalized debiased scoring, no training step. A Rust core for the hot scoring kernel. |
 | **[sqlite-vec](https://github.com/asg017/sqlite-vec)** | Small, dependency-light, "fast enough" exact brute-force search that runs anywhere; low-bit vector types; metadata filtering pushed into the ranked scan. |
 
-**What celloid3 adds: the fence generalizes.** celld can use a plain PUT
+**What celluloid3 adds: the fence generalizes.** celld can use a plain PUT
 because an epoch never has two writers. That is a property of the *key*, not
 of the number of writers a system has — so putting the agent's lane in the key
 beside the epoch gives many concurrent writers the identical guarantee. One
@@ -62,7 +62,7 @@ data path. Sharing costs nothing.
 
 ```
 my-bucket/memory/
-├── celloid3.json                                    quantizer config [create-once]
+├── celluloid3.json                                    quantizer config [create-once]
 └── spaces/product-team/
     ├── lanes/planner/owner.json                     lane ownership        [CAS]
     ├── lanes/planner/e0000000003/000000000000.tqs   base           [plain PUT]
@@ -157,10 +157,10 @@ whenever two agents write at once. celld doesn't:
 > needs no conditional write.
 
 celld can do that because **every activation advances the epoch**, so an epoch
-never has two writers. celloid3 keeps that and adds the agent's lane to the
+never has two writers. celluloid3 keeps that and adds the agent's lane to the
 key, so a *lane at an epoch* never has two writers either. The concurrency
 control lives entirely in the *name* of the object — for one writer or fifty.
-([`space.py`](celloid3/space.py), [`ownership.py`](celloid3/ownership.py))
+([`space.py`](celluloid3/space.py), [`ownership.py`](celluloid3/ownership.py))
 
 A partitioned agent that keeps running writes into a superseded prefix. Its
 PUTs succeed, because nothing rejects a plain PUT — and no reader will ever
@@ -327,10 +327,10 @@ CPU time can matter, because recall does no I/O at all:
 ```bash
 pip install maturin
 cd rust && maturin build --release
-pip install target/wheels/celloid3_core-*.whl
+pip install target/wheels/celluloid3_core-*.whl
 ```
 
-`celloid3` detects it automatically and falls back to a vectorized numpy path
+`celluloid3` detects it automatically and falls back to a vectorized numpy path
 when absent. Pure Python stays a first-class citizen; orchestration — the
 ownership protocol, the lanes, the merge — stays in Python on purpose.
 
@@ -349,24 +349,24 @@ coder.get_attachment(key)
 ## CLI
 
 ```bash
-python -m celloid3 -a planner remember "the customer wants SSO before the pilot"
-python -m celloid3 -a coder   remember "the auth service has no OIDC client yet"
+python -m celluloid3 -a planner remember "the customer wants SSO before the pilot"
+python -m celluloid3 -a coder   remember "the auth service has no OIDC client yet"
 
-python -m celloid3 -a coder recall "what is blocking the pilot?" -k 3
-python -m celloid3 -a coder recall "the pilot" --by planner
-python -m celloid3 -a coder recall "the pilot" --where kind=requirement
+python -m celluloid3 -a coder recall "what is blocking the pilot?" -k 3
+python -m celluloid3 -a coder recall "the pilot" --by planner
+python -m celluloid3 -a coder recall "the pilot" --where kind=requirement
 
-python -m celloid3 -a planner checkpoint pre-pilot
-python -m celloid3 -a planner recall "OIDC" --at pre-pilot
-python -m celloid3 -a planner agents
-python -m celloid3 log
-python -m celloid3 --store s3://my-bucket/memory --space team -a planner stats
+python -m celluloid3 -a planner checkpoint pre-pilot
+python -m celluloid3 -a planner recall "OIDC" --at pre-pilot
+python -m celluloid3 -a planner agents
+python -m celluloid3 log
+python -m celluloid3 --store s3://my-bucket/memory --space team -a planner stats
 ```
 
 `--space` picks the shared memory, `--agent` picks the lane. Two shells with
 different `--agent` values write to the same space at the same time and see
 each other's memories. The store defaults to `./agent-memory` or
-`$CELLOID3_STORE`; the CLI uses a built-in deterministic feature-hashing
+`$CELLULOID3_STORE`; the CLI uses a built-in deterministic feature-hashing
 embedder so everything runs offline — pass any `text -> vector` callable as
 `embedder=` for real semantics.
 
@@ -378,7 +378,7 @@ branching, conflict-free merges and human-auditable diffs come from git for
 free. If you want to *code-review* an agent's memory, or fork it for an
 experiment, that model wins.
 
-celloid3 trades those for what object storage gives and git does not: durable
+celluloid3 trades those for what object storage gives and git does not: durable
 acknowledged writes in one round trip rather than a `git push`, many agents
 writing the same memory simultaneously with no merge step at all, single-writer
 safety per lane enforced by the storage layer, and eviction that costs one

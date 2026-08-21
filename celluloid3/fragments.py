@@ -17,7 +17,7 @@ key so that "the data path needs no conditional write"; that works because an
 epoch never has two writers.  A *shared* memory has many writers at once, so
 each agent gets its own **lane** and the lane id joins the epoch in the key:
 
-    celloid3.json                                       store config  [create]
+    celluloid3.json                                       store config  [create]
     spaces/<space>/lanes/<agent>/owner.json             lane ownership   [CAS]
     spaces/<space>/lanes/<agent>/e<epoch>/<seq>.tqs     log segment [plain PUT]
     spaces/<space>/lanes/<agent>/e<epoch>/L1-<lo>-<hi>.tqs  compacted  [plain]
@@ -42,7 +42,7 @@ import json
 import re
 from dataclasses import dataclass, field
 
-CONFIG_KEY = "celloid3.json"
+CONFIG_KEY = "celluloid3.json"
 
 
 def canonical_json(obj) -> str:

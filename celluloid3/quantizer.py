@@ -39,7 +39,7 @@ from functools import lru_cache
 import numpy as np
 
 try:  # optional Rust kernel (rust/ crate, built with maturin); numpy fallback below
-    from celloid3_core import score_packed as _native_score_packed
+    from celluloid3_core import score_packed as _native_score_packed
 except ImportError:
     _native_score_packed = None
 
@@ -184,7 +184,7 @@ class TurboQuantizer:
     ) -> np.ndarray:
         """Score every packed row against an already-rotated query.
 
-        Uses the native Rust kernel (celloid3_core) when installed; otherwise
+        Uses the native Rust kernel (celluloid3_core) when installed; otherwise
         a vectorized numpy path.  Either way vectors stay bit-packed in RAM.
         """
         if packed_matrix.size == 0:

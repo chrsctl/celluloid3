@@ -1,6 +1,6 @@
 import pytest
 
-from celloid3 import (
+from celluloid3 import (
     FileObjectStore, HashingEmbedder, InMemoryObjectStore, MemoryLayer, ObjectStore,
 )
 

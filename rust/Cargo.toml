@@ -1,12 +1,12 @@
 [package]
-name = "celloid3-core"
+name = "celluloid3-core"
 version = "0.1.0"
 edition = "2021"
-description = "Native scoring kernel for celloid3 (bit-unpack + LUT dot product)"
+description = "Native scoring kernel for celluloid3 (bit-unpack + LUT dot product)"
 license = "MIT"
 
 [lib]
-name = "celloid3_core"
+name = "celluloid3_core"
 crate-type = ["cdylib"]
 
 [dependencies]

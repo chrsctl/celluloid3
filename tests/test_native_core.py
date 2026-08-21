@@ -3,10 +3,10 @@
 import numpy as np
 import pytest
 
-import celloid3.quantizer as qmod
-from celloid3.quantizer import SUPPORTED_BIT_WIDTHS, TurboQuantizer
+import celluloid3.quantizer as qmod
+from celluloid3.quantizer import SUPPORTED_BIT_WIDTHS, TurboQuantizer
 
-native = pytest.importorskip("celloid3_core")
+native = pytest.importorskip("celluloid3_core")
 
 
 @pytest.mark.parametrize("bit_width", SUPPORTED_BIT_WIDTHS)
