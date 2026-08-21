@@ -264,10 +264,24 @@ class MemoryLayer:
         if embedding is None:
             embedding = self._embed(text)
         with self._lock:
-            fragment = Fragment.create(text=text, created_at=time.time(),
+            created_at = time.time()
+            fragment = Fragment.create(text=text, created_at=created_at,
                                        metadata=metadata, parents=parents)
-            self._state()
-            if fragment.id in self.space.own:
+            state = self._state(fresh=True)
+            # A tombstone wins over its put forever -- that is what makes the
+            # merge order-independent -- so re-learning forgotten content must
+            # be a *new* record, not a resurrection.  Bump the revision (part
+            # of the id hash) past every tombstoned id; deterministic, so two
+            # agents re-learning the same fact still converge on one record.
+            revision = 0
+            while (fragment.id in state.tombstones
+                   or fragment.id in self.space.staged_forgets):
+                revision += 1
+                fragment = Fragment.create(text=text, created_at=created_at,
+                                           metadata=metadata, parents=parents,
+                                           revision=revision)
+            if (fragment.id in self.space.own
+                    or fragment.id in self.space.staged_puts):
                 return fragment.id      # already ours: an exact repeat is free
             # Note the deliberate absence of a check against the *merged* view.
             # If another agent already knows this, we still record that we
@@ -287,7 +301,8 @@ class MemoryLayer:
         """
         with self._lock:
             state = self._state(fresh=True)
-            if fragment_id not in state.fragments:
+            if (fragment_id not in state.fragments
+                    and fragment_id not in self.space.staged_puts):
                 return False
             self.space.stage(Record.forget(fragment_id))
             self._maybe_flush()
