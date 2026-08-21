@@ -28,9 +28,10 @@ def quantizer():
 def test_roundtrip_carries_everything_recall_needs(quantizer):
     records = _records(5, quantizer)
     blob = pack_segment(records, lo=3, hi=3, epoch=7, created_at=1234.5,
-                        dim=64, bit_width=4, note="ingest")
+                        dim=64, bit_width=4, note="ingest", author="planner")
     segment = read_segment(blob)
     assert (segment.lo, segment.hi, segment.epoch) == (3, 3, 7)
+    assert segment.author == "planner"       # provenance travels with the data
     assert segment.created_at == 1234.5
     assert segment.note == "ingest"
     assert segment.added == 5 and segment.removed == 0
@@ -88,7 +89,7 @@ def test_corrupt_segments_are_rejected_not_misread(quantizer):
 
 # -- chain assembly ---------------------------------------------------------
 
-PREFIX = "cells/a/ltx/e0000000001/"
+PREFIX = "spaces/team/lanes/planner/e0000000001/"
 
 
 def key(seq):

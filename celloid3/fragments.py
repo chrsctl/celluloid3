@@ -1,27 +1,45 @@
 """Memory fragments and the bucket key layout.
 
 A fragment is one immutable, content-addressed memory: text, metadata, the
-links to whatever it derives from, and a timestamp.  Identical memories share
-an id, so re-remembering something is free and two agents that learn the same
-fact converge on one record.
+links to whatever it derives from, and a timestamp.
 
-The key layout is celld's, one level up: a *cell* is a namespace of memory
-(an agent, a user, a document), and everything a cell owns lives under its
-own prefix.  Within a cell, state is an append-only log under an epoch
-prefix -- see cell.py for why the epoch belongs in the key.
+Its id hashes *what* is remembered -- text, metadata, parents -- and
+deliberately not *when*.  In a shared space that is what makes convergence
+real: two agents that independently reach the same conclusion produce the same
+id, so the memory is stored once and carries both their names, rather than
+becoming two near-identical rows that both come back from every search.  The
+timestamp rides along as an attribute, and the merge keeps the earliest one --
+when the team first knew this -- which is a rule that does not depend on the
+order the lanes were read in.
 
-    celloid3.json                                  store config (created once)
-    cells/<cell>/owner.json                        ownership record  [CAS]
-    cells/<cell>/ltx/e<epoch>/<seq>.tqs            log segment      [plain PUT]
-    cells/<cell>/ltx/e<epoch>/L1-<lo>-<hi>.tqs     compacted range  [plain PUT]
-    cells/<cell>/blobs/<ab>/<sha256>/<name>        large attachment [plain PUT]
-    cells/<cell>/tags/<name>.json                  named cut        [create]
+The layout generalizes celld's one trick.  celld puts the fencing epoch in the
+key so that "the data path needs no conditional write"; that works because an
+epoch never has two writers.  A *shared* memory has many writers at once, so
+each agent gets its own **lane** and the lane id joins the epoch in the key:
+
+    celloid3.json                                       store config  [create]
+    spaces/<space>/lanes/<agent>/owner.json             lane ownership   [CAS]
+    spaces/<space>/lanes/<agent>/e<epoch>/<seq>.tqs     log segment [plain PUT]
+    spaces/<space>/lanes/<agent>/e<epoch>/L1-<lo>-<hi>.tqs  compacted  [plain]
+    spaces/<space>/blobs/<ab>/<sha256>/<name>           attachment  [plain PUT]
+    spaces/<space>/tags/<name>.json                     named cut     [create]
+    spaces/<space>/leases/<name>.json                   task lease       [CAS]
+
+A lane never has two writers -- the same guarantee celld gives an epoch, now
+scoped so that N agents write to one space concurrently without ever
+addressing the same key, and therefore without ever coordinating.  Reading is
+the union of every lane; because fragments are immutable and tombstones are
+applied by id, that union converges regardless of the order lanes arrive in.
+
+Attachments, checkpoints and task leases are space-wide: they are the parts
+agents genuinely share rather than contribute to.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 
 CONFIG_KEY = "celloid3.json"
@@ -43,13 +61,12 @@ class Fragment:
     def create(text: str, created_at: float, metadata: dict | None = None,
                parents: tuple = ()) -> "Fragment":
         metadata = dict(metadata or {})
-        body = {
+        identity = {
             "text": text,
-            "created_at": created_at,
             "metadata": metadata,
             "parents": list(parents),
         }
-        fid = hashlib.sha256(canonical_json(body).encode()).hexdigest()
+        fid = hashlib.sha256(canonical_json(identity).encode()).hexdigest()
         return Fragment(id=fid, text=text, created_at=created_at,
                         metadata=metadata, parents=tuple(parents))
 
@@ -75,59 +92,88 @@ class Fragment:
 
 # -- key helpers ------------------------------------------------------------
 
-
-def cell_prefix(cell: str) -> str:
-    return f"cells/{cell}/"
+_SAFE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 
 
-def owner_key(cell: str) -> str:
-    return f"cells/{cell}/owner.json"
+def check_name(name: str, kind: str) -> str:
+    """Names become object keys, so they have to survive being one."""
+    if not _SAFE_NAME.match(name or ""):
+        raise ValueError(
+            f"{kind} name {name!r} must match [A-Za-z0-9][A-Za-z0-9._-]*"
+        )
+    return name
 
 
-def ltx_prefix(cell: str) -> str:
-    return f"cells/{cell}/ltx/"
+def space_prefix(space: str) -> str:
+    return f"spaces/{space}/"
 
 
-def epoch_prefix(cell: str, epoch: int) -> str:
-    return f"cells/{cell}/ltx/e{epoch:010d}/"
+def lanes_prefix(space: str) -> str:
+    return f"spaces/{space}/lanes/"
 
 
-def segment_key(cell: str, epoch: int, seq: int) -> str:
-    return f"{epoch_prefix(cell, epoch)}{seq:012d}.tqs"
+def lane_prefix(space: str, agent: str) -> str:
+    return f"spaces/{space}/lanes/{agent}/"
 
 
-def l1_key(cell: str, epoch: int, lo: int, hi: int) -> str:
-    """Compacted level-1 object covering segments [lo, hi].
-
-    Sorts before every L0 key at the same prefix (``L`` < digits is false, so
-    the digits win) -- restore does not rely on ordering, it parses the range
-    out of the name and prefers the widest coverage.
-    """
-    return f"{epoch_prefix(cell, epoch)}L1-{lo:012d}-{hi:012d}.tqs"
+def owner_key(space: str, agent: str) -> str:
+    return f"{lane_prefix(space, agent)}owner.json"
 
 
-def blob_key(cell: str, digest: str, name: str) -> str:
-    return f"cells/{cell}/blobs/{digest[:2]}/{digest}/{name}"
+def epoch_prefix(space: str, agent: str, epoch: int) -> str:
+    return f"{lane_prefix(space, agent)}e{epoch:010d}/"
 
 
-def tag_key(cell: str, name: str) -> str:
-    return f"cells/{cell}/tags/{name}.json"
+def segment_key(space: str, agent: str, epoch: int, seq: int) -> str:
+    return f"{epoch_prefix(space, agent, epoch)}{seq:012d}.tqs"
 
 
-def parse_epoch(prefix: str) -> int | None:
-    """``cells/x/ltx/e0000000003/`` -> 3."""
-    part = prefix.rstrip("/").rsplit("/", 1)[-1]
-    if not part.startswith("e") or not part[1:].isdigit():
+def l1_key(space: str, agent: str, epoch: int, lo: int, hi: int) -> str:
+    """Compacted level-1 object covering segments [lo, hi] of one lane."""
+    return f"{epoch_prefix(space, agent, epoch)}L1-{lo:012d}-{hi:012d}.tqs"
+
+
+def blob_key(space: str, digest: str, name: str) -> str:
+    return f"spaces/{space}/blobs/{digest[:2]}/{digest}/{name}"
+
+
+def tag_key(space: str, name: str) -> str:
+    return f"spaces/{space}/tags/{name}.json"
+
+
+def tags_prefix(space: str) -> str:
+    return f"spaces/{space}/tags/"
+
+
+def lease_key(space: str, name: str) -> str:
+    return f"spaces/{space}/leases/{name}.json"
+
+
+def parse_lane(key: str, space: str) -> str | None:
+    """``spaces/team/lanes/planner/e0000000001/...`` -> ``planner``."""
+    prefix = lanes_prefix(space)
+    if not key.startswith(prefix):
         return None
-    return int(part[1:])
+    rest = key[len(prefix):]
+    return rest.split("/", 1)[0] if "/" in rest else None
+
+
+def parse_epoch(key_or_prefix: str) -> int | None:
+    """``.../lanes/planner/e0000000003/`` -> 3, or None if that part is not
+    an epoch.  Accepts a full segment key or a prefix."""
+    parts = key_or_prefix.rstrip("/").split("/")
+    for part in reversed(parts):
+        if part.startswith("e") and part[1:].isdigit():
+            return int(part[1:])
+    return None
 
 
 def parse_segment(key: str) -> tuple[int, int] | None:
     """Segment key -> the (lo, hi) sequence range it covers, or None.
 
     An L0 segment covers (seq, seq); an L1 object covers the range in its
-    name.  Restore uses these ranges to assemble one contiguous chain out of
-    whichever mix of L0 and L1 objects the prefix happens to hold.
+    name.  Chain assembly uses these ranges to build one contiguous chain out
+    of whichever mix of L0 and L1 objects a lane happens to hold.
     """
     name = key.rsplit("/", 1)[-1]
     if not name.endswith(".tqs"):

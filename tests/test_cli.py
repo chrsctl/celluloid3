@@ -48,12 +48,12 @@ def test_checkpoint_and_time_travel(capsys, store):
     assert run(capsys, store, "checkpoints").strip() == "v1"
 
 
-def test_forget_then_stats_and_cells(capsys, store):
+def test_forget_then_stats_and_spaces(capsys, store):
     run(capsys, store, "remember", "a fact worth forgetting")
     fid = run(capsys, store, "recall", "forgetting", "-k", "1").split()[1]
     run(capsys, store, "forget", fid)
     assert json.loads(run(capsys, store, "stats"))["fragments"] == 0
-    assert run(capsys, store, "cells").strip() == "default"
+    assert run(capsys, store, "spaces").strip() == "shared"
 
 
 def test_forgetting_something_absent_fails(capsys, store):
@@ -69,12 +69,25 @@ def test_owner_record_is_readable(capsys, store):
     assert record["epoch"] >= 1
 
 
-def test_named_cells_are_separate(capsys, store):
-    run(capsys, store, "--cell", "planner", "remember", "the roadmap")
-    run(capsys, store, "--cell", "coder", "remember", "the stack trace")
-    assert sorted(run(capsys, store, "cells").split()) == ["coder", "planner"]
-    assert "roadmap" in run(capsys, store, "--cell", "planner", "recall", "roadmap")
-    assert "roadmap" not in run(capsys, store, "--cell", "coder", "recall", "roadmap")
+def test_agents_share_a_space(capsys, store):
+    """Two shells, two agents, one memory."""
+    run(capsys, store, "-a", "planner", "remember", "the customer wants SSO")
+    run(capsys, store, "-a", "coder", "remember", "the auth service has no OIDC")
+    assert sorted(run(capsys, store, "-a", "coder", "agents").split()) == \
+        ["(you)", "coder", "planner"]
+    # the coder recalls what the planner learned, and knows who learned it
+    out = run(capsys, store, "-a", "coder", "recall", "what does the customer want")
+    assert "SSO" in out and "[planner]" in out
+    # ...and can narrow to one agent
+    assert "SSO" not in run(capsys, store, "-a", "coder", "recall",
+                            "customer", "--by", "coder")
+
+
+def test_separate_spaces_share_nothing(capsys, store):
+    run(capsys, store, "-s", "private", "remember", "a private thought")
+    run(capsys, store, "-s", "team", "remember", "a shared thought")
+    assert sorted(run(capsys, store, "spaces").split()) == ["private", "team"]
+    assert "private" not in run(capsys, store, "-s", "team", "recall", "thought")
 
 
 def test_compact_and_gc(capsys, store):

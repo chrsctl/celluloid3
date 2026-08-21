@@ -5,9 +5,14 @@ store defaults to ./agent-memory (a local directory that behaves like a
 bucket) or $CELLOID3_STORE; point it at ``s3://bucket/prefix`` and nothing
 else changes.
 
-Every invocation is an activation, so the epoch advances on each command --
-that is the design, not a leak: an epoch never has two writers, and the CLI
-is a different writer every time.
+``--space`` picks the shared memory; ``--agent`` picks which lane to write
+into.  Two shells with different ``--agent`` values can write to the same
+space at the same time and will see each other's memories; two with the
+*same* agent id cannot, because a lane must never have two writers.
+
+Every invocation is an activation, so the lane's epoch advances on each
+command.  That is the design, not a leak: the CLI is a different writer every
+time, and an epoch never has two writers.
 """
 
 from __future__ import annotations
@@ -22,19 +27,19 @@ from .embedder import HashingEmbedder
 from .fragments import CONFIG_KEY
 from .memory import MemoryLayer
 from .objectstore import open_object_store
-from .ownership import CellHeld, Fenced
+from .ownership import Fenced, Held
 
 
 def _open(args) -> MemoryLayer:
     # The store's own config decides the embedding dimension, so look before
-    # opening: an existing store dictates the dimension, a fresh one gets the
-    # CLI default.  Then fit the embedder to whatever the bucket says.
+    # opening: an existing store dictates it, a fresh one gets the CLI default.
     objects = open_object_store(args.store)
     existing = objects.get(CONFIG_KEY) is not None
     dim = getattr(args, "dim", None) or (None if existing else 256)
     mem = MemoryLayer(
         objects,
-        cell=args.cell,
+        space=args.space,
+        agent=args.agent,
         dim=dim,
         bit_width=getattr(args, "bit_width", 4),
         ttl=args.ttl,
@@ -50,16 +55,20 @@ def _kv(pairs: list[str]) -> dict:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="celloid3",
-        description="S3-native fragmented memory layer for AI agents",
+        description="shared memory layer for AI agents, on object storage",
     )
     parser.add_argument(
         "--store", default=os.environ.get("CELLOID3_STORE", "./agent-memory"),
         help="bucket URI (s3://bucket/prefix) or local path (default ./agent-memory)",
     )
-    parser.add_argument("--cell", "-c", default="default",
-                        help="which cell (agent/user/document) to open")
+    parser.add_argument("--space", "-s",
+                        default=os.environ.get("CELLOID3_SPACE", "shared"),
+                        help="the shared memory to open (default 'shared')")
+    parser.add_argument("--agent", "-a",
+                        default=os.environ.get("CELLOID3_AGENT", "default"),
+                        help="which lane to write into (default 'default')")
     parser.add_argument("--ttl", type=float, default=10.0,
-                        help="ownership lease lifetime in seconds (default 10)")
+                        help="lane lease lifetime in seconds (default 10)")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_init = sub.add_parser("init", help="create a store")
@@ -70,27 +79,32 @@ def build_parser() -> argparse.ArgumentParser:
     p_rem.add_argument("text", nargs="+", help="one memory per argument")
     p_rem.add_argument("--meta", action="append", default=[], metavar="KEY=VALUE")
 
-    p_rec = sub.add_parser("recall", help="semantic search")
+    p_rec = sub.add_parser("recall", help="search everything the space knows")
     p_rec.add_argument("query")
     p_rec.add_argument("-k", type=int, default=5)
     p_rec.add_argument("--at", default=None,
-                       help="checkpoint name, HEAD~n, or e<epoch>:<seq>")
+                       help="checkpoint name, HEAD~n, or a literal cut")
     p_rec.add_argument("--where", action="append", default=[], metavar="KEY=VALUE")
+    p_rec.add_argument("--by", default=None, help="only this agent's memories")
 
-    p_forget = sub.add_parser("forget", help="tombstone a memory (log keeps it)")
+    p_forget = sub.add_parser("forget", help="tombstone a memory for the space")
     p_forget.add_argument("fragment_id")
 
-    p_cp = sub.add_parser("checkpoint", help="name the current cut")
+    p_cp = sub.add_parser("checkpoint", help="name where every lane has got to")
     p_cp.add_argument("name")
 
-    sub.add_parser("checkpoints", help="list named cuts")
-    sub.add_parser("log", help="the cell's segment log")
-    sub.add_parser("stats", help="cell statistics")
-    sub.add_parser("owner", help="read the ownership record")
-    sub.add_parser("cells", help="list cells in the store")
-    sub.add_parser("compact", help="fold this epoch's chain into one L1 object")
+    p_lease = sub.add_parser("lease", help="who holds a named task lease")
+    p_lease.add_argument("name")
 
-    p_gc = sub.add_parser("gc", help="delete superseded objects (destructive)")
+    sub.add_parser("checkpoints", help="list named cuts")
+    sub.add_parser("log", help="the space's log, interleaved across lanes")
+    sub.add_parser("stats", help="statistics for this agent's view")
+    sub.add_parser("owner", help="read this lane's ownership record")
+    sub.add_parser("agents", help="every agent that has written to this space")
+    sub.add_parser("spaces", help="list spaces in the store")
+    sub.add_parser("compact", help="fold this agent's lane into one L1 object")
+
+    p_gc = sub.add_parser("gc", help="delete this lane's superseded objects")
     p_gc.add_argument("--keep-epochs", type=int, default=1, dest="keep_epochs")
     return parser
 
@@ -98,10 +112,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
-    if args.command == "cells":
+    if args.command == "spaces":
         objects = open_object_store(args.store)
-        for prefix in objects.list_prefixes("cells/"):
-            print(prefix[len("cells/"):].rstrip("/"))
+        for prefix in objects.list_prefixes("spaces/"):
+            print(prefix[len("spaces/"):].rstrip("/"))
         return 0
 
     try:
@@ -112,8 +126,8 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         return _run(args, mem)
-    except CellHeld as exc:
-        print(f"cell busy: {exc}", file=sys.stderr)
+    except Held as exc:
+        print(f"lane busy: {exc}", file=sys.stderr)
         return 2
     except Fenced as exc:
         print(f"fenced: {exc}", file=sys.stderr)
@@ -136,12 +150,15 @@ def _run(args, mem: MemoryLayer) -> int:
             ids = [mem.remember(text, metadata=metadata) for text in args.text]
         for fid in ids:
             print(fid[:12])
-        print(f"durable at {mem.cell.head}", file=sys.stderr)
+        print(f"durable in lane {mem.agent!r} at e{mem.epoch}", file=sys.stderr)
 
     elif args.command == "recall":
         where = _kv(args.where) or None
-        for hit in mem.recall(args.query, k=args.k, at=args.at, where=where):
-            print(f"{hit.score:+.4f}  {hit.fragment.id[:12]}  {hit.fragment.text}")
+        for hit in mem.recall(args.query, k=args.k, at=args.at, where=where,
+                              by=args.by):
+            who = ",".join(hit.authors) or "?"
+            print(f"{hit.score:+.4f}  {hit.fragment.id[:12]}  [{who}]  "
+                  f"{hit.fragment.text}")
 
     elif args.command == "forget":
         try:
@@ -150,7 +167,8 @@ def _run(args, mem: MemoryLayer) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 1
         mem.forget(fragment_id)
-        print(f"forgot {fragment_id[:12]} (still readable at earlier cuts)")
+        print(f"forgot {fragment_id[:12]} for the whole space "
+              "(still readable at earlier cuts)")
 
     elif args.command == "checkpoint":
         try:
@@ -164,13 +182,27 @@ def _run(args, mem: MemoryLayer) -> int:
         for name in mem.checkpoints():
             print(name)
 
+    elif args.command == "agents":
+        mem.activate()
+        for name in mem.agents():
+            mark = " (you)" if name == mem.agent else ""
+            print(f"{name}{mark}")
+
+    elif args.command == "lease":
+        record = mem.lease_holder(args.name)
+        if record is None or not record.live:
+            print(f"{args.name}: free")
+        else:
+            print(f"{args.name}: held by {record.session!r} until "
+                  f"{time.strftime('%H:%M:%S', time.localtime(record.expires_at))}")
+
     elif args.command == "log":
         for entry in mem.history(limit=50):
             stamp = time.strftime("%Y-%m-%d %H:%M:%S",
                                   time.localtime(entry["timestamp"]))
             note = f"  {entry['note']}" if entry["note"] else ""
-            print(f"{entry['cut']:>12}  {stamp}  "
-                  f"+{entry['added']} -{entry['removed']}{note}")
+            print(f"{entry['agent']:>12}  e{entry['epoch']}:{entry['seq']}  "
+                  f"{stamp}  +{entry['added']} -{entry['removed']}{note}")
 
     elif args.command == "stats":
         print(json.dumps(mem.stats(), indent=2))
@@ -181,9 +213,9 @@ def _run(args, mem: MemoryLayer) -> int:
 
     elif args.command == "compact":
         key = mem.compact()
-        segments = mem.cell._next_seq
+        segments = mem.space._next_seq
         print(key if key else
-              f"chain is already one object ({segments} segment"
+              f"lane is already one object ({segments} segment"
               f"{'' if segments == 1 else 's'} this epoch)")
 
     elif args.command == "gc":

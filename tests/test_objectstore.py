@@ -61,16 +61,17 @@ def test_conditional_delete(store):
 
 
 def test_list_and_prefixes(store):
-    for key in ["cells/a/ltx/e1/0.tqs", "cells/a/ltx/e1/1.tqs",
-                "cells/a/ltx/e2/0.tqs", "cells/b/owner.json"]:
+    for key in ["spaces/t/lanes/planner/e1/0.tqs", "spaces/t/lanes/planner/e1/1.tqs",
+                "spaces/t/lanes/planner/e2/0.tqs", "spaces/t/lanes/coder/owner.json"]:
         store.put(key, b"x")
-    assert store.list("cells/a/ltx/e1/") == [
-        "cells/a/ltx/e1/0.tqs", "cells/a/ltx/e1/1.tqs"
+    assert store.list("spaces/t/lanes/planner/e1/") == [
+        "spaces/t/lanes/planner/e1/0.tqs", "spaces/t/lanes/planner/e1/1.tqs"
     ]
-    assert store.list_prefixes("cells/a/ltx/") == [
-        "cells/a/ltx/e1/", "cells/a/ltx/e2/"
+    # one LIST over the space is how an agent catches up on the whole team
+    assert len(store.list("spaces/t/lanes/")) == 4
+    assert store.list_prefixes("spaces/t/lanes/") == [
+        "spaces/t/lanes/coder/", "spaces/t/lanes/planner/"
     ]
-    assert store.list_prefixes("cells/") == ["cells/a/", "cells/b/"]
 
 
 def test_get_many_is_a_fan_out_not_a_loop(store):

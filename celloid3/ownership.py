@@ -6,6 +6,16 @@ The bucket accepts one such write, so two nodes cannot acquire the same
 cell."  That is the entire coordination layer.  No membership protocol, no
 failure detector, no consensus service, no lock server.
 
+Two things use it here, and the difference matters:
+
+* **Lane ownership** is claimed automatically and is *not* how agents share.
+  A lane belongs to one agent id, so this only stops the same agent id from
+  being run twice at once, and lets a restarted agent take its own lane back
+  at a fresh epoch.  Agents share by writing to *different* lanes, which
+  needs no coordination at all.
+* **Task leases** are the explicit primitive: when several agents in a space
+  must not all do the same job, exactly one of them wins ``space.lease(...)``.
+
 Three rules from celld are load-bearing and are implemented literally here:
 
 1. **Every activation advances the epoch.**  A takeover advances it and a
@@ -37,15 +47,14 @@ import time
 import uuid
 from dataclasses import dataclass
 
-from .fragments import owner_key
 from .objectstore import ObjectStore, PreconditionFailed
 
 DEFAULT_TTL = 10.0        # celld's CELLD_TTL_MS default, in seconds
 RENEW_FRACTION = 1 / 3    # "renews the lease after one third of the lifetime"
 
 
-class CellHeld(RuntimeError):
-    """Another agent holds a live lease on this cell."""
+class Held(RuntimeError):
+    """Someone else holds a live claim -- on this lane, or on this task lease."""
 
 
 class Fenced(RuntimeError):
@@ -62,7 +71,7 @@ def new_session() -> str:
 
 @dataclass(frozen=True)
 class OwnerRecord:
-    cell: str
+    subject: str
     epoch: int
     session: str | None
     owned: bool
@@ -79,7 +88,7 @@ class OwnerRecord:
 
     def to_bytes(self) -> bytes:
         return json.dumps({
-            "cell": self.cell,
+            "subject": self.subject,
             "epoch": self.epoch,
             "session": self.session,
             "owned": self.owned,
@@ -88,13 +97,13 @@ class OwnerRecord:
         }, sort_keys=True).encode()
 
     @staticmethod
-    def from_bytes(blob: bytes, cell: str) -> "OwnerRecord | None":
+    def from_bytes(blob: bytes, subject: str) -> "OwnerRecord | None":
         try:
             data = json.loads(blob)
         except (ValueError, UnicodeDecodeError):
             return None
         return OwnerRecord(
-            cell=data.get("cell", cell),
+            subject=data.get("subject", subject),
             epoch=int(data["epoch"]),
             session=data.get("session"),
             owned=bool(data.get("owned", True)),
@@ -106,11 +115,11 @@ class OwnerRecord:
 class Ownership:
     """The compare-and-swap protocol over one cell's ownership record."""
 
-    def __init__(self, objects: ObjectStore, cell: str,
+    def __init__(self, objects: ObjectStore, key: str, label: str,
                  session: str | None = None, ttl: float = DEFAULT_TTL):
         self.objects = objects
-        self.cell = cell
-        self.key = owner_key(cell)
+        self.key = key
+        self.subject = label       # what to call this claim in messages
         self.session = session or new_session()
         self.ttl = ttl
         self.record: OwnerRecord | None = None   # our own claim, if we hold one
@@ -123,7 +132,7 @@ class Ownership:
         if entry is None:
             return None, None
         blob, etag = entry
-        return OwnerRecord.from_bytes(blob, self.cell), etag
+        return OwnerRecord.from_bytes(blob, self.subject), etag
 
     @property
     def epoch(self) -> int:
@@ -145,22 +154,22 @@ class Ownership:
 
         Conditional create when the record is absent, compare-and-swap on the
         previous record when it exists.  Exactly one racing agent wins; the
-        losers see ``PreconditionFailed`` and retry into ``CellHeld``.
+        losers see ``PreconditionFailed`` and retry into ``Held``.
         """
         for _ in range(4):
             current, etag = self.read()
             if current is not None and current.live and current.session != self.session:
-                if not steal_expired:
-                    raise CellHeld(f"cell {self.cell!r} held by {current.session!r}")
-                raise CellHeld(
-                    f"cell {self.cell!r} held by {current.session!r} until "
+                raise Held(
+                    f"{self.subject} is held by session {current.session!r} until "
                     f"{current.expires_at:.3f}"
                 )
+            if current is not None and not current.live and not steal_expired:
+                raise Held(f"{self.subject} is not free to claim")
             if current is not None and current.live and current.session == self.session:
                 return self.renew()  # already active here: a renewal, not an activation
             now = time.time()
             claim = OwnerRecord(
-                cell=self.cell,
+                subject=self.subject,
                 epoch=(current.epoch + 1) if current else 1,
                 session=self.session,
                 owned=True,
@@ -178,7 +187,7 @@ class Ownership:
                 continue  # someone beat us to it; re-read and decide again
             self.record, self._etag = claim, etag_new
             return claim
-        raise CellHeld(f"cell {self.cell!r}: lost the ownership CAS repeatedly")
+        raise Held(f"{self.subject}: lost the ownership CAS repeatedly")
 
     # -- keeping it -------------------------------------------------------
 
@@ -186,22 +195,22 @@ class Ownership:
         """Extend our lease at the same epoch.  Renewal never advances the
         epoch: the lineage we are replicating into must not change under us."""
         if self.record is None:
-            raise Fenced(f"cell {self.cell!r}: no lease to renew")
+            raise Fenced(f"{self.subject}: no lease to renew")
         current, etag = self.read()
         if current is None or current.session != self.session \
                 or current.epoch != self.record.epoch:
             self.record = None
-            raise Fenced(f"cell {self.cell!r}: ownership moved to another agent")
+            raise Fenced(f"{self.subject}: ownership moved to another session")
         now = time.time()
         renewed = OwnerRecord(
-            cell=self.cell, epoch=self.record.epoch, session=self.session,
+            subject=self.subject, epoch=self.record.epoch, session=self.session,
             owned=True, acquired_at=now, expires_at=now + self.ttl,
         )
         try:
             self._etag = self.objects.put(self.key, renewed.to_bytes(), if_match=etag)
         except PreconditionFailed as exc:
             self.record = None
-            raise Fenced(f"cell {self.cell!r}: lost the renewal CAS") from exc
+            raise Fenced(f"{self.subject}: lost the renewal CAS") from exc
         self.record = renewed
         return renewed
 
@@ -222,16 +231,16 @@ class Ownership:
         acknowledged.
         """
         if self.record is None:
-            raise Fenced(f"cell {self.cell!r}: not owned")
+            raise Fenced(f"{self.subject}: not owned")
         if self.self_fenced:
             self.record = None
-            raise Fenced(f"cell {self.cell!r}: lease expired before acknowledgement")
+            raise Fenced(f"{self.subject}: lease expired before acknowledgement")
         current, _etag = self.read()
         if current is None or current.session != self.session \
                 or current.epoch != self.record.epoch:
             self.record = None
             raise Fenced(
-                f"cell {self.cell!r}: fenced -- ownership is now "
+                f"{self.subject}: fenced -- ownership is now "
                 f"{None if current is None else current.session!r} at epoch "
                 f"{None if current is None else current.epoch}"
             )
@@ -253,7 +262,7 @@ class Ownership:
             self.record = None
             return
         unowned = OwnerRecord(
-            cell=self.cell, epoch=current.epoch, session=None, owned=False,
+            subject=self.subject, epoch=current.epoch, session=None, owned=False,
             acquired_at=current.acquired_at, expires_at=current.acquired_at,
         )
         try:

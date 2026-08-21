@@ -1,9 +1,10 @@
 """Log segments: the unit of durability, and the unit of a round trip.
 
 celld replicates each cell as a chain of LTX segments under an epoch prefix.
-celloid3 does the same thing with memory: a segment is one batch of log
-records -- ``put`` (a fragment plus its quantized vector) and ``forget`` (a
-tombstone) -- serialized into a single object and written with one plain PUT.
+celloid3 does the same thing with memory, per agent: a segment is one batch of
+log records -- ``put`` (a fragment plus its quantized vector) and ``forget``
+(a tombstone) -- serialized into a single object and written into that agent's
+own lane with one plain PUT.
 
 Two properties drive the format:
 
@@ -16,7 +17,14 @@ Two properties drive the format:
 * **A segment is self-contained.**  It carries the fragment text, metadata
   and packed vector together, so replaying a chain rebuilds the entire
   searchable state without a single follow-up GET.  Recall never fetches
-  anything; only ``attach()``-ed payloads live outside the log.
+  anything; only ``attach()``-ed payloads live outside the log.  This matters
+  twice over in a shared space: catching up on what five other agents learned
+  is one fan-out over their new segments, not a fan-out plus a fragment fetch
+  per hit.
+
+Every segment also names its author, so a merged view knows which agent
+contributed which memory -- and a memory several agents arrived at
+independently records all of them.
 
 Layout (little-endian).  The outer header stays uncompressed so a segment can
 be identified without inflating it; the body is deflated, which pays for
@@ -24,7 +32,8 @@ itself on the text and metadata (the packed vectors are already dense).
 
     magic "TQS1" | u16 version | u16 flags | body
     body := u64 lo | u64 hi | u64 epoch | f64 created_at | u32 dim
-          | u8 bit_width | pad3 | u32 n_records | u32 note_len | note
+          | u8 bit_width | pad3 | u32 n_records | u32 note_len
+          | u32 author_len | note | author
           | n_records * ( u8 op | pad3 | u32 meta_len | u32 vec_len
                         | 32B raw fragment id | meta_json | packed_vector )
 """
@@ -43,7 +52,7 @@ VERSION = 1
 FLAG_DEFLATE = 1 << 0
 
 OUTER = struct.Struct("<4sHH")
-BODY = struct.Struct("<QQQdIBxxxII")
+BODY = struct.Struct("<QQQdIBxxxIII")
 RECORD = struct.Struct("<BxxxII32s")
 
 OP_PUT = 0
@@ -81,6 +90,7 @@ class Segment:
     dim: int
     bit_width: int
     note: str
+    author: str = ""
     records: list = field(default_factory=list)
 
     @property
@@ -93,12 +103,14 @@ class Segment:
 
 
 def pack_segment(records, *, lo: int, hi: int, epoch: int, created_at: float,
-                 dim: int, bit_width: int, note: str = "",
+                 dim: int, bit_width: int, note: str = "", author: str = "",
                  compress: bool = True) -> bytes:
     records = list(records)
     note_bytes = note.encode()
+    author_bytes = author.encode()
     chunks = [BODY.pack(lo, hi, epoch, created_at, dim, bit_width,
-                        len(records), len(note_bytes)), note_bytes]
+                        len(records), len(note_bytes), len(author_bytes)),
+              note_bytes, author_bytes]
     for record in records:
         if record.op == "put":
             if record.fragment is None:
@@ -138,13 +150,15 @@ def read_segment(blob: bytes) -> Segment:
         except zlib.error as exc:
             raise SegmentError(f"corrupt segment body: {exc}") from exc
     try:
-        lo, hi, epoch, created_at, dim, bit_width, count, note_len = \
-            BODY.unpack_from(body)
+        (lo, hi, epoch, created_at, dim, bit_width, count, note_len,
+         author_len) = BODY.unpack_from(body)
     except struct.error as exc:
         raise SegmentError(f"truncated segment header: {exc}") from exc
     pos = BODY.size
     note = body[pos:pos + note_len].decode()
     pos += note_len
+    author = body[pos:pos + author_len].decode()
+    pos += author_len
 
     records = []
     for _ in range(count):
@@ -167,4 +181,5 @@ def read_segment(blob: bytes) -> Segment:
             fragment = Fragment.from_dict(payload)
         records.append(Record(_OP_NAMES[op_code], fragment_id, fragment, vector))
     return Segment(lo=lo, hi=hi, epoch=epoch, created_at=created_at, dim=dim,
-                   bit_width=bit_width, note=note, records=records)
+                   bit_width=bit_width, note=note, author=author,
+                   records=records)
