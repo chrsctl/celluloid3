@@ -98,5 +98,13 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v4
+      # The harness selftest is canonical-only: this repo does not carry the
+      # harness tests, because it does not edit harness code. Kept as a step
+      # so a repo that does carry them still runs them here.
       - name: harness selftest on Git Bash
-        run: ./.agents/harness/selftest.sh
+        run: |
+          if [ -f ./.agents/harness/selftest.sh ]; then
+            ./.agents/harness/selftest.sh
+          else
+            echo "no .agents/harness/selftest.sh here (canonical-only); nothing to run"
+          fi
