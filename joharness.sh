@@ -673,7 +673,20 @@ cmd_env() {
 
   if [ -n "$want" ]; then
     valid_name "$want" || die "invalid layer name '${want}'"
-    [ -d "${ENV_ROOT}/${want}" ] || die "no such layer .agents/env/${want} (try: $0 env)"
+    if [ ! -d "${ENV_ROOT}/${want}" ]; then
+      # Canonical carries every layer, so a name it does not have is a
+      # typo and dies here. A consumer carries the one layer it selected
+      # — the sync ships no others — so an absent name is a REQUEST, and
+      # refusing it would leave no way to ask for a different layer: the
+      # sync reads this file to decide what to ship. Written, then
+      # fetched on the next sync.
+      if grep -q '^JOHARNESS_CANONICAL=1' "$CONF" 2>/dev/null; then
+        die "no such layer .agents/env/${want} (try: $0 env)"
+      fi
+      warn "no .agents/env/${want} here yet; selection written, the next harness" \
+        "sync brings the layer (.agents/docs/consumer-repos.md). Until then this" \
+        "repo runs 'none'."
+    fi
     conf_set JOHARNESS_ENV "$want"
     log "selected environment '${want}' (${CONF})"
     [ "$want" = "none" ] || log "provision it with: $0 setup"
@@ -751,7 +764,14 @@ cmd_session_start() {
     if has_setup "$name" && [ "$mode" != "eager" ]; then
       printf 'Not provisioned at session start (setup=lazy).\n'
       printf 'Need it? Run: ./joharness.sh setup\n'
-      printf 'Never need it? It cost nothing.\n\n'
+      printf 'Never need it? It cost nothing.\n'
+      # Says "at session start" because that is the only claim it can make.
+      # A RESUMED session reads this as "nothing is running" and is right —
+      # but a session that provisioned earlier reads it as "still as I left
+      # it" and is wrong: the files survive, the daemons do not. Cost of not
+      # saying so, measured in one consumer run: two separate stalls, each
+      # found by a command failing rather than by the banner.
+      printf 'Resumed session? Files survive, daemons do not — setup again.\n\n'
     fi
   fi
 
