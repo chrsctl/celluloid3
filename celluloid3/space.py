@@ -8,7 +8,7 @@ celld's central optimization is that the fence lives in the *key*:
      the data path needs no conditional write."
 
 That works because an epoch never has two writers.  A shared memory has many
-writers at once, so celloid3 generalizes the same trick one level out: each
+writers at once, so celluloid3 generalizes the same trick one level out: each
 agent owns a **lane**, and the lane id sits in the key next to the epoch.  A
 lane never has two writers either, so every agent's data path stays a plain
 unconditional PUT and no agent ever waits for, blocks, or retries behind
@@ -49,8 +49,8 @@ from .fragments import (
 )
 from .objectstore import ObjectStore, PreconditionFailed
 from .ownership import DEFAULT_TTL, Fenced, Ownership
-from .quantizer import TurboQuantizer
-from .segments import Record, pack_segment, read_segment
+from .quantizer import SUPPORTED_BIT_WIDTHS, TurboQuantizer, payload_bit_width
+from .segments import Record, SegmentError, pack_segment, read_segment
 
 # celld folds L0 segments into an L1 object so a takeover reads a handful of
 # objects instead of thousands; this is the same knob as CELLD_LTX_COMPACTION.
@@ -60,6 +60,29 @@ DEFAULT_COMPACTION_THRESHOLD = 32
 
 class ChainBroken(RuntimeError):
     """A lane's epoch prefix has data but no contiguous chain from zero."""
+
+
+def spans_cover(spans, lo: int, hi: int) -> bool:
+    """True when sorted (lo, hi) spans jointly cover every seq in [lo, hi]."""
+    need = lo
+    for s_lo, s_hi in spans:
+        if s_lo > need:
+            break
+        need = max(need, s_hi + 1)
+        if need > hi:
+            return True
+    return need > hi
+
+
+def records_bit_width(records, default: int) -> int:
+    """The widest payload width among a batch's put records.
+
+    Stamped into the segment header so it describes what the segment actually
+    holds -- payloads self-describe, so a batch can mix widths (a base built
+    from a requantized L1 plus fresh writes, say) and the header reports the
+    widest rather than whatever width was merely requested."""
+    return max((payload_bit_width(r.vector) for r in records if r.op == "put"),
+               default=default)
 
 
 # ---------------------------------------------------------------------------
@@ -107,8 +130,14 @@ class Cut:
         for part in text.split(","):
             if not part.strip():
                 continue
-            agent, epoch, seq = part.rsplit(":", 2)
-            entries[agent] = (int(epoch.lstrip("e")), int(seq))
+            try:
+                agent, epoch, seq = part.rsplit(":", 2)
+                entries[agent] = (int(epoch.lstrip("e")), int(seq))
+            except ValueError as exc:
+                raise ValueError(
+                    f"not a cut: {part.strip()!r} "
+                    "(expected agent:e<epoch>:<seq>, comma-separated)"
+                ) from exc
         return Cut.of(entries)
 
     def to_json(self) -> dict:
@@ -136,23 +165,27 @@ class QuantIndex:
     expanded through a codebook lookup at scoring time, so the 8x (4-bit) or
     16x (2-bit) compression survives into the resident footprint -- which is
     what decides how much shared memory a node can hold at once.
+
+    Rows self-describe their bit width, and widths may be mixed: fresh L0
+    segments arrive at the store's write width while requantizing compaction
+    (``compact_bit_width``) folds history down to a narrower one.  Scoring
+    batches rows per width -- same brute-force scan, one matrix per codebook.
     """
 
     def __init__(self, quantizer: TurboQuantizer):
         self.q = quantizer
-        self.ids: list[str] = []
-        self.rows: dict[str, tuple[np.ndarray, float]] = {}
-        self._matrix: np.ndarray | None = None
-        self._scales: np.ndarray | None = None
+        self.rows: dict[str, tuple[np.ndarray, float, int]] = {}
+        self._buckets: list[tuple[int, list, np.ndarray, np.ndarray]] | None = None
 
     def upsert(self, fragment_id: str, payload: bytes) -> None:
-        packed, norm, corr, dnorm = self.q.decode_payload(payload)
-        self.rows[fragment_id] = (packed, self.q.scale(norm, corr, dnorm))
-        self._matrix = None
+        packed, bit_width, norm, corr, dnorm = self.q.decode_payload(payload)
+        self.rows[fragment_id] = (packed, self.q.scale(norm, corr, dnorm),
+                                  bit_width)
+        self._buckets = None
 
     def remove(self, fragment_id: str) -> None:
         if self.rows.pop(fragment_id, None) is not None:
-            self._matrix = None
+            self._buckets = None
 
     def __contains__(self, fragment_id: str) -> bool:
         return fragment_id in self.rows
@@ -165,26 +198,34 @@ class QuantIndex:
         return sum(row[0].nbytes for row in self.rows.values())
 
     def _materialize(self) -> None:
-        self.ids = list(self.rows)
-        if self.ids:
-            self._matrix = np.stack([self.rows[i][0] for i in self.ids])
-            self._scales = np.array([self.rows[i][1] for i in self.ids],
-                                    dtype=np.float32)
-        else:
-            self._matrix = np.zeros((0, 0), dtype=np.uint8)
-            self._scales = np.zeros(0, dtype=np.float32)
+        by_width: dict[int, list[str]] = defaultdict(list)
+        for fid, (_packed, _scale, bit_width) in self.rows.items():
+            by_width[bit_width].append(fid)
+        self._buckets = [
+            (bit_width,
+             ids,
+             np.stack([self.rows[i][0] for i in ids]),
+             np.array([self.rows[i][1] for i in ids], dtype=np.float32))
+            for bit_width, ids in sorted(by_width.items())
+        ]
 
     def search(self, query: np.ndarray, k: int) -> list[tuple[str, float]]:
-        if self._matrix is None:
+        if self._buckets is None:
             self._materialize()
-        if not self.ids:
+        if not self.rows:
             return []
-        scores = self.q.score_matrix(self._matrix, self._scales,
-                                     self.q.rotate_query(query))
-        k = max(1, min(k, len(self.ids)))
+        rotated = self.q.rotate_query(query)
+        ids: list[str] = []
+        chunks: list[np.ndarray] = []
+        for bit_width, bucket_ids, matrix, scales in self._buckets:
+            ids += bucket_ids
+            chunks.append(self.q.score_matrix(matrix, scales, rotated,
+                                              bit_width))
+        scores = np.concatenate(chunks)
+        k = max(1, min(k, len(ids)))
         top = np.argpartition(-scores, k - 1)[:k]
         top = top[np.argsort(-scores[top])]
-        return [(self.ids[i], float(scores[i])) for i in top]
+        return [(ids[i], float(scores[i])) for i in top]
 
 
 @dataclass
@@ -260,7 +301,10 @@ def build_chain(keys: list[str], until: int | None = None) -> list[str]:
         eligible = [c for c in ranges[pos] if until is None or c[0] <= until]
         if not eligible:
             break
-        hi, key = max(eligible)
+        # Widest coverage first; on equal coverage prefer the L1 -- it may
+        # hold requantized (narrower) payloads that supersede the L0's.
+        hi, key = max(eligible, key=lambda c: (
+            c[0], c[1].rsplit("/", 1)[-1].startswith("L1-"), c[1]))
         chain.append(key)
         pos = hi + 1
     return chain
@@ -295,7 +339,7 @@ class PeerLane:
     agent: str
     epoch: int | None = None
     applied: set = field(default_factory=set)   # keys already replayed
-    last_seq: int = -1
+    broken: set = field(default_factory=set)    # keys that failed to parse
 
 
 class Space:
@@ -313,6 +357,7 @@ class Space:
         ack_verify: bool = True,
         compaction: bool = True,
         compaction_threshold: int = DEFAULT_COMPACTION_THRESHOLD,
+        compact_bit_width: int | None = None,
     ):
         self.objects = objects
         self.space = check_name(space, "space")
@@ -326,6 +371,11 @@ class Space:
         self.ack_verify = ack_verify
         self.compaction = compaction
         self.compaction_threshold = compaction_threshold
+        if (compact_bit_width is not None
+                and compact_bit_width not in SUPPORTED_BIT_WIDTHS):
+            raise ValueError(
+                f"compact_bit_width must be one of {SUPPORTED_BIT_WIDTHS}")
+        self.compact_bit_width = compact_bit_width
 
         self.state: SharedState | None = None
         # What *this* lane is responsible for re-serializing into its base.
@@ -333,6 +383,11 @@ class Space:
         self.own_tombstones: set[str] = set()
         self.peers: dict[str, PeerLane] = {}
         self._staged: list[Record] = []
+        # Ids currently staged, by op -- kept beside the list so a batch's
+        # write path can answer "did this batch already put/forget id X?"
+        # in O(1) instead of scanning the staged records per call.
+        self.staged_puts: set[str] = set()
+        self.staged_forgets: set[str] = set()
         self._next_seq = 0
         self._base_written = False
         self._restored_from: int | None = None
@@ -363,9 +418,21 @@ class Space:
         self.own, self.own_tombstones, self.peers = {}, set(), {}
         self._next_seq = 0
         self._base_written = False
-        self._restore_own_lane()
-        own_reads = self.state.objects_read
-        self.refresh(force=True)
+        try:
+            self._restore_own_lane()
+            own_reads = self.state.objects_read
+            self.refresh(force=True)
+        except BaseException:
+            # A failed wake must not look like an empty memory: leave the
+            # space inactive so the next call replays from scratch, and hand
+            # the lane back so a healthy process can take it in the meantime.
+            self.state = None
+            self.own, self.own_tombstones, self.peers = {}, set(), {}
+            try:
+                self.ownership.release()
+            except Exception:
+                pass  # the original failure is the one worth reporting
+            raise
         self.wake_objects_read = own_reads + self.refresh_objects_read
         self.wake_seconds = time.time() - started
         self.last_used = time.time()
@@ -391,6 +458,8 @@ class Space:
         self.own_tombstones = set()
         self.peers = {}
         self._staged = []
+        self.staged_puts = set()
+        self.staged_forgets = set()
 
     # -- replay -----------------------------------------------------------
 
@@ -458,8 +527,21 @@ class Space:
             if epoch != peer.epoch:
                 # The peer restarted under a fresh epoch and re-serialized its
                 # state there.  Replaying it again is a no-op by construction.
-                peer.epoch, peer.applied = epoch, set()
-            wanted += [(agent, key) for key in chain if key not in peer.applied]
+                peer.epoch, peer.applied, peer.broken = epoch, set(), set()
+            applied_spans = sorted(
+                s for s in (parse_segment(k) for k in peer.applied)
+                if s is not None)
+            for key in chain:
+                if key in peer.applied or key in peer.broken:
+                    continue
+                span = parse_segment(key)
+                if span is not None and spans_cover(applied_spans, *span):
+                    # Nothing new inside: an L1 whose L0s we already replayed
+                    # (the lane's owner compacted).  Fetching it would re-pay
+                    # the whole lane's bytes and duplicate its log entries.
+                    peer.applied.add(key)
+                    continue
+                wanted.append((agent, key))
 
         fetched = 0
         if wanted:
@@ -468,13 +550,20 @@ class Space:
                 blob = blobs.get(key)
                 if blob is None:
                     continue
-                segment = read_segment(blob)
+                try:
+                    segment = read_segment(blob)
+                except SegmentError:
+                    # One agent's corrupt object must not break everyone
+                    # else's catch-up -- and must not be refetched on every
+                    # refresh either.  Remember it as broken for this epoch;
+                    # the lane heals through its owner compacting (the L1 is
+                    # not covered, so it is fetched) or restarting fresh.
+                    self.peers[agent].broken.add(key)
+                    continue
                 for record in segment.records:
                     self.state.apply(record, segment.author or agent)
                 self._note(segment, agent)
-                peer = self.peers[agent]
-                peer.applied.add(key)
-                peer.last_seq = max(peer.last_seq, segment.hi)
+                self.peers[agent].applied.add(key)
                 fetched += 1
         self.refresh_objects_read = fetched
         self.last_refresh = time.time()
@@ -495,6 +584,8 @@ class Space:
         if not self.active:
             self.activate()
         self._staged.append(record)
+        (self.staged_puts if record.op == "put"
+         else self.staged_forgets).add(record.fragment_id)
         self.last_used = time.time()
 
     @property
@@ -541,7 +632,8 @@ class Space:
         seq = self._next_seq
         blob = pack_segment(
             records, lo=seq, hi=seq, epoch=self.epoch, created_at=time.time(),
-            dim=self.quantizer.dim, bit_width=self.quantizer.bit_width,
+            dim=self.quantizer.dim,
+            bit_width=records_bit_width(records, self.quantizer.bit_width),
             note=note, author=self.agent,
         )
         # Unconditional: the lane and epoch in the key are the fence.
@@ -567,6 +659,8 @@ class Space:
             sum(1 for r in records if r.op == "forget"),
         ))
         self._staged = []
+        self.staged_puts = set()
+        self.staged_forgets = set()
         self._next_seq += 1
         self._base_written = True
         self.last_used = time.time()
@@ -580,29 +674,71 @@ class Space:
 
     # -- compaction -------------------------------------------------------
 
-    def compact(self) -> str | None:
+    def compact(self, bit_width: int | None = None) -> str | None:
         """Fold this lane's chain into one additive L1 object.
 
         celld: L1 objects let "takeovers read fewer objects instead of
         thousands".  In a shared space the saving is shared too -- every other
         agent lists and replays this lane, so compacting it makes everyone's
         catch-up cheaper.
+
+        ``bit_width`` (or the space's ``compact_bit_width`` default) makes
+        compaction lossy the same way the write path already is: the folded
+        records' vectors are requantized down to the narrower codebook, so
+        history pays fewer bits than the working set.  Fresh L0 segments keep
+        the store's write width; only what survives long enough to be folded
+        gets the cheaper encoding -- and every reader knows which is which
+        because payloads carry their own width.  Requantization happens in
+        the rotated domain from the stored codes (see
+        ``TurboQuantizer.requantize``), so nothing is re-embedded.  Note the
+        loss compounds across repeated compactions exactly once: an already
+        narrow payload is left alone rather than round-tripped.
         """
         if not self.active or not self._base_written:
             return None
+        bit_width = self.compact_bit_width if bit_width is None else bit_width
+        if bit_width is not None and bit_width not in SUPPORTED_BIT_WIDTHS:
+            raise ValueError(f"bit_width must be one of {SUPPORTED_BIT_WIDTHS}")
         hi = self._next_seq - 1
-        if hi < 1:
+        if hi < 0:
+            return None
+        records = self._base_records()
+        narrowed = False
+        if bit_width is not None:
+            requantized = []
+            for r in records:
+                if r.op != "put":
+                    requantized.append(r)
+                    continue
+                vector = self.quantizer.requantize(r.vector, bit_width)
+                narrowed = narrowed or vector is not r.vector
+                requantized.append(Record.put(r.fragment, vector))
+            records = requantized
+        # A single-object lane has nothing to fold -- unless a narrowing was
+        # requested and actually bit: then the L1 covering just [0, 0] is the
+        # point, and chain assembly prefers it over the wide base it shadows.
+        if hi < 1 and not narrowed:
             return None
         blob = pack_segment(
-            self._base_records(), lo=0, hi=hi, epoch=self.epoch,
+            records, lo=0, hi=hi, epoch=self.epoch,
             created_at=time.time(), dim=self.quantizer.dim,
-            bit_width=self.quantizer.bit_width, author=self.agent,
+            bit_width=records_bit_width(records, self.quantizer.bit_width),
+            author=self.agent,
             note=f"L1 compaction of 0..{hi}",
         )
         key = l1_key(self.space, self.agent, self.epoch, 0, hi)
         self.objects.put(key, blob)
         if self.ack_verify:
             self.ownership.verify()
+        if narrowed:
+            # The L1 is now this lane's durable form, so own must match it:
+            # the next base rewrite carries the narrow payloads (what a
+            # restart would replay anyway) and the next compaction sees them
+            # already narrow and no-ops instead of redoing the work.
+            for record in records:
+                if record.op == "put" and record.fragment_id in self.own:
+                    fragment, _vector = self.own[record.fragment_id]
+                    self.own[record.fragment_id] = (fragment, record.vector)
         return key
 
     def gc(self, keep_epochs: int = 1) -> int:

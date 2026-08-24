@@ -1,7 +1,7 @@
 """Log segments: the unit of durability, and the unit of a round trip.
 
 celld replicates each cell as a chain of LTX segments under an epoch prefix.
-celloid3 does the same thing with memory, per agent: a segment is one batch of
+celluloid3 does the same thing with memory, per agent: a segment is one batch of
 log records -- ``put`` (a fragment plus its quantized vector) and ``forget``
 (a tombstone) -- serialized into a single object and written into that agent's
 own lane with one plain PUT.
@@ -155,10 +155,13 @@ def read_segment(blob: bytes) -> Segment:
     except struct.error as exc:
         raise SegmentError(f"truncated segment header: {exc}") from exc
     pos = BODY.size
-    note = body[pos:pos + note_len].decode()
-    pos += note_len
-    author = body[pos:pos + author_len].decode()
-    pos += author_len
+    try:
+        note = body[pos:pos + note_len].decode()
+        pos += note_len
+        author = body[pos:pos + author_len].decode()
+        pos += author_len
+    except UnicodeDecodeError as exc:
+        raise SegmentError(f"corrupt segment header text: {exc}") from exc
 
     records = []
     for _ in range(count):
@@ -175,11 +178,18 @@ def read_segment(blob: bytes) -> Segment:
             raise SegmentError("truncated segment payload")
         fragment_id = raw_id.hex()
         fragment = None
-        if op_code == OP_PUT:
-            payload = json.loads(meta_blob)
-            payload["id"] = fragment_id
-            fragment = Fragment.from_dict(payload)
-        records.append(Record(_OP_NAMES[op_code], fragment_id, fragment, vector))
+        # Anything a flipped byte can turn record parsing into -- bad UTF-8,
+        # bad JSON, a missing field, an unknown op code -- is one corruption,
+        # so it surfaces as one exception type callers can actually isolate.
+        try:
+            if op_code == OP_PUT:
+                payload = json.loads(meta_blob)
+                payload["id"] = fragment_id
+                fragment = Fragment.from_dict(payload)
+            op = _OP_NAMES[op_code]
+        except (ValueError, KeyError, TypeError) as exc:
+            raise SegmentError(f"corrupt segment record: {exc!r}") from exc
+        records.append(Record(op, fragment_id, fragment, vector))
     return Segment(lo=lo, hi=hi, epoch=epoch, created_at=created_at, dim=dim,
                    bit_width=bit_width, note=note, author=author,
                    records=records)

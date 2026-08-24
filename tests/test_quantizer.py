@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from celloid3.quantizer import (
+from celluloid3.quantizer import (
     SUPPORTED_BIT_WIDTHS,
     TurboQuantizer,
     lloyd_max_levels,
@@ -48,7 +48,8 @@ def test_lloyd_max_levels_are_sorted_and_symmetric():
 def test_encode_header_and_zero_vector():
     q = TurboQuantizer(dim=32, bit_width=4)
     blob = q.encode(np.zeros(32))
-    packed, norm, corr, dnorm = q.decode_payload(blob)
+    packed, bit_width, norm, corr, dnorm = q.decode_payload(blob)
+    assert bit_width == 4
     assert norm == 0.0
     assert q.scale(norm, corr, dnorm) == 0.0
 
@@ -71,7 +72,7 @@ def _recall_at_k(dim, bit_width, n=400, k=10, seed=0):
     q = TurboQuantizer(dim=dim, bit_width=bit_width)
     rows, scales = [], []
     for v in data:
-        packed, norm, corr, dnorm = q.decode_payload(q.encode(v))
+        packed, _bw, norm, corr, dnorm = q.decode_payload(q.encode(v))
         rows.append(packed)
         scales.append(q.scale(norm, corr, dnorm))
     scores = q.score_matrix(np.stack(rows), np.array(scales, dtype=np.float32),

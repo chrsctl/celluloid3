@@ -1,4 +1,4 @@
-"""celloid3 -- a shared memory layer for AI agents, on object storage.
+"""celluloid3 -- a shared memory layer for AI agents, on object storage.
 
 Many agents, one memory.  A *space* is a pool of memory that a team of agents
 reads and writes together; each agent writes into its own **lane** and reads
@@ -13,7 +13,7 @@ Idea lineage:
   is the fence"; writes are durable before they are acknowledged (RPO=0)
   behind a gate that reads the ownership record once; idle state is shed LRU
   and published as unowned without resetting its epoch; L1 compaction keeps
-  catch-up cheap.  celloid3 generalizes the key-is-the-fence trick from one
+  catch-up cheap.  celluloid3 generalizes the key-is-the-fence trick from one
   writer to many by putting the agent's lane in the key beside the epoch.
 - **turbovec** (RyanCodrai/turbovec): TurboQuant embedding compression, so a
   space's whole searchable index is small enough to pull over the network on
@@ -144,6 +144,7 @@ class MemoryLayer:
         ack_verify: bool = True,
         compaction: bool = True,
         compaction_threshold: int = DEFAULT_COMPACTION_THRESHOLD,
+        compact_bit_width: int | None = None,
         **backend_kwargs,
     ):
         if backend_kwargs and isinstance(uri, ObjectStore):
@@ -163,6 +164,7 @@ class MemoryLayer:
             self.objects, space, agent, self.quantizer,
             session=session or new_session(), ttl=ttl, ack_verify=ack_verify,
             compaction=compaction, compaction_threshold=compaction_threshold,
+            compact_bit_width=compact_bit_width,
         )
         # celld: "Two requests to the same cell never run at the same instant."
         # One lane is single-threaded, which is why none of the state below
@@ -262,10 +264,24 @@ class MemoryLayer:
         if embedding is None:
             embedding = self._embed(text)
         with self._lock:
-            fragment = Fragment.create(text=text, created_at=time.time(),
+            created_at = time.time()
+            fragment = Fragment.create(text=text, created_at=created_at,
                                        metadata=metadata, parents=parents)
-            self._state()
-            if fragment.id in self.space.own:
+            state = self._state(fresh=True)
+            # A tombstone wins over its put forever -- that is what makes the
+            # merge order-independent -- so re-learning forgotten content must
+            # be a *new* record, not a resurrection.  Bump the revision (part
+            # of the id hash) past every tombstoned id; deterministic, so two
+            # agents re-learning the same fact still converge on one record.
+            revision = 0
+            while (fragment.id in state.tombstones
+                   or fragment.id in self.space.staged_forgets):
+                revision += 1
+                fragment = Fragment.create(text=text, created_at=created_at,
+                                           metadata=metadata, parents=parents,
+                                           revision=revision)
+            if (fragment.id in self.space.own
+                    or fragment.id in self.space.staged_puts):
                 return fragment.id      # already ours: an exact repeat is free
             # Note the deliberate absence of a check against the *merged* view.
             # If another agent already knows this, we still record that we
@@ -285,7 +301,8 @@ class MemoryLayer:
         """
         with self._lock:
             state = self._state(fresh=True)
-            if fragment_id not in state.fragments:
+            if (fragment_id not in state.fragments
+                    and fragment_id not in self.space.staged_puts):
                 return False
             self.space.stage(Record.forget(fragment_id))
             self._maybe_flush()
@@ -472,18 +489,24 @@ class MemoryLayer:
 
     # -- maintenance ------------------------------------------------------
 
-    def compact(self) -> str | None:
+    def compact(self, bit_width: int | None = None) -> str | None:
         """Fold this agent's lane into one additive L1 object.
 
-        Returns the L1 key, or None when the lane is already a single object
-        -- the common case right after a wake, because the base written at
-        sequence zero is itself a compaction.
+        ``bit_width`` (or ``compact_bit_width`` from the constructor)
+        additionally requantizes the folded vectors down to a narrower
+        codebook -- TurboQuant's compression applied a second time, by age:
+        the working set keeps the store's write width, compacted history
+        drops to 2 or 1 bits.  Returns the L1 key, or None when there is
+        nothing to do: the lane is already a single object (the common case
+        right after a wake, because the base written at sequence zero is
+        itself a compaction) and no requested narrowing would change any
+        payload.
         """
         with self._lock:
             self._state()
             if self.space.pending or not self.space._base_written:
                 self.space.flush(note="compact")
-            return self.space.compact()
+            return self.space.compact(bit_width=bit_width)
 
     def gc(self, keep_epochs: int = 1) -> int:
         """Delete this agent's superseded objects.  Destructive -- it ends the

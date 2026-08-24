@@ -6,7 +6,7 @@ import time
 import numpy as np
 import pytest
 
-from celloid3 import MemoryLayer
+from celluloid3 import MemoryLayer
 
 FACTS = [
     "the production deploy failed because DATABASE_URL was missing",
@@ -176,7 +176,7 @@ def test_spaces_are_isolated(bucket, embedder):
 
 
 def test_store_config_is_created_once_and_then_enforced(bucket, embedder, tmp_path):
-    from celloid3 import FileObjectStore
+    from celluloid3 import FileObjectStore
     MemoryLayer(bucket, space="team", agent="a", embedder=embedder, dim=256)
     # the store's codebook is fixed at creation; a mismatched reopen is refused
     with pytest.raises(ValueError):
@@ -189,7 +189,7 @@ def test_store_config_is_created_once_and_then_enforced(bucket, embedder, tmp_pa
 def test_config_creation_is_a_race_only_one_agent_wins(bucket, embedder):
     """Conditional create: two agents opening a fresh bucket at once cannot
     end up with two incompatible codebooks."""
-    from celloid3.memory import load_or_create_config
+    from celluloid3.memory import load_or_create_config
     first = load_or_create_config(bucket, 256, 4, 11, embedder)
     second = load_or_create_config(bucket, None, 8, 99, embedder)
     assert first == second

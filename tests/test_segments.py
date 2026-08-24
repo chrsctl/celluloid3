@@ -5,8 +5,8 @@ import time
 import numpy as np
 import pytest
 
-from celloid3 import Fragment, Record, TurboQuantizer, build_chain, pack_segment, read_segment
-from celloid3.segments import SegmentError
+from celluloid3 import Fragment, Record, TurboQuantizer, build_chain, pack_segment, read_segment
+from celluloid3.segments import SegmentError
 
 
 def _records(n, quantizer, seed=0):

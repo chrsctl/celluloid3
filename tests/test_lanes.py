@@ -11,8 +11,8 @@ from dataclasses import replace
 
 import pytest
 
-from celloid3 import Fenced, MemoryLayer
-from celloid3.fragments import epoch_prefix, lane_prefix, parse_epoch
+from celluloid3 import Fenced, MemoryLayer
+from celluloid3.fragments import epoch_prefix, lane_prefix, parse_epoch
 
 
 SPACE = "team"

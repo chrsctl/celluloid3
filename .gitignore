@@ -7,3 +7,8 @@ build/
 agent-memory/
 rust/target/
 *.so
+target/
+rust/Cargo.lock
+.venv/
+venv/
+wheels/

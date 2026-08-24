@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from celloid3.__main__ import main
+from celluloid3.__main__ import main
 
 
 @pytest.fixture

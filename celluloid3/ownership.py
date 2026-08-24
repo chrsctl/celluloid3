@@ -166,6 +166,15 @@ class Ownership:
             if current is not None and not current.live and not steal_expired:
                 raise Held(f"{self.subject} is not free to claim")
             if current is not None and current.live and current.session == self.session:
+                if self.record is None:
+                    # Same session string, but not this handle's claim: a
+                    # second lease() by the same agent, or a restart racing
+                    # its own still-live record.  That is exclusion working,
+                    # not a renewal -- report it as held like any other loser.
+                    raise Held(
+                        f"{self.subject} is held by session {current.session!r} "
+                        f"until {current.expires_at:.3f}"
+                    )
                 return self.renew()  # already active here: a renewal, not an activation
             now = time.time()
             claim = OwnerRecord(

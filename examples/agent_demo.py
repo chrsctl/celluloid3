@@ -12,9 +12,9 @@ import tempfile
 import time
 from dataclasses import replace
 
-from celloid3 import Fenced, HashingEmbedder, Held, MemoryLayer, MemoryPool
-from celloid3.fragments import epoch_prefix, lanes_prefix
-from celloid3.objectstore import ObjectStore, open_object_store
+from celluloid3 import Fenced, HashingEmbedder, Held, MemoryLayer, MemoryPool
+from celluloid3.fragments import epoch_prefix, lanes_prefix
+from celluloid3.objectstore import ObjectStore, open_object_store
 
 SPACE = "product-team"
 
@@ -154,8 +154,9 @@ def main():
         time.sleep(0.08)
         replacement = agent("ghost")             # same agent id, new process
         replacement.remember("written by the replacement process")
+        replacement_epoch = replacement.epoch    # before hibernate resets it
         replacement.hibernate()
-        print(f"  takeover of lane 'ghost': e{ghost_epoch} -> e{replacement.epoch}")
+        print(f"  takeover of lane 'ghost': e{ghost_epoch} -> e{replacement_epoch}")
         ghost.space.ownership.record = replace(
             ghost.space.ownership.record, expires_at=time.time() + 60)
         try:

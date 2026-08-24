@@ -5,7 +5,7 @@ celld sizes a node by resident cells and sheds under memory pressure --
 "publishes the cells as unowned without resetting their epochs".
 """
 
-from celloid3 import MemoryLayer, MemoryPool
+from celluloid3 import MemoryLayer, MemoryPool
 
 SPACE = "team"
 

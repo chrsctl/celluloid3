@@ -17,7 +17,7 @@ key so that "the data path needs no conditional write"; that works because an
 epoch never has two writers.  A *shared* memory has many writers at once, so
 each agent gets its own **lane** and the lane id joins the epoch in the key:
 
-    celloid3.json                                       store config  [create]
+    celluloid3.json                                       store config  [create]
     spaces/<space>/lanes/<agent>/owner.json             lane ownership   [CAS]
     spaces/<space>/lanes/<agent>/e<epoch>/<seq>.tqs     log segment [plain PUT]
     spaces/<space>/lanes/<agent>/e<epoch>/L1-<lo>-<hi>.tqs  compacted  [plain]
@@ -42,7 +42,7 @@ import json
 import re
 from dataclasses import dataclass, field
 
-CONFIG_KEY = "celloid3.json"
+CONFIG_KEY = "celluloid3.json"
 
 
 def canonical_json(obj) -> str:
@@ -56,28 +56,37 @@ class Fragment:
     created_at: float
     metadata: dict = field(default_factory=dict)
     parents: tuple = ()  # ids this memory derives from (episodic links)
+    revision: int = 0    # bumped past tombstones when content is re-learned
 
     @staticmethod
     def create(text: str, created_at: float, metadata: dict | None = None,
-               parents: tuple = ()) -> "Fragment":
+               parents: tuple = (), revision: int = 0) -> "Fragment":
         metadata = dict(metadata or {})
         identity = {
             "text": text,
             "metadata": metadata,
             "parents": list(parents),
         }
+        if revision:
+            # Only present when nonzero, so every revision-0 id -- which is
+            # every id ever written before revisions existed -- is unchanged.
+            identity["revision"] = int(revision)
         fid = hashlib.sha256(canonical_json(identity).encode()).hexdigest()
         return Fragment(id=fid, text=text, created_at=created_at,
-                        metadata=metadata, parents=tuple(parents))
+                        metadata=metadata, parents=tuple(parents),
+                        revision=int(revision))
 
     def to_dict(self) -> dict:
-        return {
+        data = {
             "id": self.id,
             "text": self.text,
             "created_at": self.created_at,
             "metadata": self.metadata,
             "parents": list(self.parents),
         }
+        if self.revision:
+            data["revision"] = self.revision
+        return data
 
     @staticmethod
     def from_dict(data: dict) -> "Fragment":
@@ -87,6 +96,7 @@ class Fragment:
             created_at=data["created_at"],
             metadata=data.get("metadata", {}),
             parents=tuple(data.get("parents", ())),
+            revision=data.get("revision", 0),
         )
 
 
