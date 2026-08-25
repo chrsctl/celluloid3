@@ -345,3 +345,76 @@ def test_a_pooled_lane_survives_an_idle_gap(bucket, embedder):
     assert pool.agent("planner").epoch == 2
     assert len(pool.agent("planner")) == 2
     pool.drain()
+
+
+# -- a reader that claims nothing -------------------------------------------
+
+def test_a_read_only_handle_reads_everything_and_writes_nothing(bucket, embedder):
+    writer = MemoryLayer(bucket, space=SPACE, agent="planner", embedder=embedder,
+                         dim=256, ttl=60)
+    writer.remember("the customer wants SSO")
+    writer.hibernate()
+
+    reader = MemoryLayer(bucket, space=SPACE, agent="planner", embedder=embedder,
+                         ttl=60, read_only=True)
+    assert reader.read_only
+    assert len(reader.recall("what does the customer want", k=1)) == 1
+    assert len(reader) == 1
+    assert reader.agents() == ["planner"]          # and invents no lane of its own
+    assert reader.stats()["agent"] is None
+
+    for write in (lambda: reader.remember("mine now"),
+                  lambda: reader.remember_many(["mine", "too"]),
+                  lambda: reader.forget("whatever"),
+                  lambda: reader.checkpoint("nope"),
+                  lambda: reader.flush(),
+                  lambda: reader.batch().__enter__(),
+                  lambda: reader.attach("x", b"y"),
+                  lambda: reader.compact(),
+                  lambda: reader.gc(),
+                  lambda: reader.lease("nightly").__enter__()):
+        with pytest.raises(ValueError):
+            write()
+    assert not objects_in_epoch(bucket, "reader", 1)
+
+
+def test_read_only_opens_leave_the_writers_epoch_alone(bucket, embedder):
+    """A monitoring script in a loop used to advance an epoch per run."""
+    writer = MemoryLayer(bucket, space=SPACE, agent="planner", embedder=embedder,
+                         dim=256, ttl=60)
+    writer.remember("a fact worth watching")
+    writer.hibernate()
+    record, _etag = writer.space.ownership.read()
+    epoch = record.epoch
+
+    for _ in range(3):
+        watcher = MemoryLayer(bucket, space=SPACE, agent="planner",
+                              embedder=embedder, ttl=60, read_only=True)
+        assert len(watcher) == 1
+        watcher.hibernate()
+
+    again, _etag = writer.space.ownership.read()
+    assert again.epoch == epoch
+    assert again.session == record.session
+
+
+def test_a_read_only_open_costs_no_more_than_a_writing_one(counted, embedder):
+    writer = MemoryLayer(counted, space=SPACE, agent="planner", embedder=embedder,
+                         dim=256, ttl=60)
+    writer.remember("something to read")
+    writer.hibernate()
+
+    counted.reset()
+    MemoryLayer(counted, space=SPACE, agent="coder", embedder=embedder,
+                ttl=60).activate()
+    writing = (counted.gets, counted.puts, counted.lists)
+
+    counted.reset()
+    MemoryLayer(counted, space=SPACE, agent="coder", embedder=embedder,
+                ttl=60, read_only=True).activate()
+    reading = (counted.gets, counted.puts, counted.lists)
+
+    assert sum(reading) <= sum(writing)
+    assert counted.conditional_puts == 0      # it claims nothing
+    assert counted.puts == 0                  # and writes nothing at all
+

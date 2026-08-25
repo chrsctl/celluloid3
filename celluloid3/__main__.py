@@ -32,6 +32,13 @@ from .ownership import Fenced, Held
 from .segments import SegmentError
 
 
+# Commands that only read.  They open the space without claiming a lane, so
+# `celluloid3 log` stops inventing a `default` agent that never remembered
+# anything -- an owner record, a name in everyone's agents() forever, and an
+# epoch advanced per run, all for a read.
+READS_ONLY = frozenset({"recall", "log", "stats", "agents", "checkpoints",
+                        "lease", "owner", "spaces"})
+
 # The two commands whose job is to bring a store into existence.  For every
 # other command, a store that is not there is a typo in --store, and answering
 # a typo with silence and exit 0 is indistinguishable from an empty memory.
@@ -88,6 +95,7 @@ def _open(args) -> MemoryLayer:
         embedder=HashingEmbedder(dim=dim) if fresh and dim is not None else None,
         bit_width=getattr(args, "bit_width", 4),
         ttl=args.ttl,
+        read_only=args.command in READS_ONLY,
     )
 
 
@@ -250,6 +258,8 @@ def _run(args, mem: MemoryLayer) -> int:
     elif args.command == "agents":
         mem.activate()
         for name in mem.agents():
+            # --agent still says who you are; the read-only handle simply
+            # does not claim that lane to find out.
             mark = " (you)" if name == mem.agent else ""
             print(f"{name}{mark}")
 

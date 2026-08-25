@@ -33,5 +33,9 @@ Trust counted numbers, never written numbers.
 - Scoring path changes touch both paths or neither. Parity tests are the gate.
 - No-coordination invariant is the product. Change needing a lock service, a
   queue or a server is out of scope — ask human.
+- README carries a counted test number. Add tests, re-count, fix it in the
+  SAME commit — `.venv/bin/pytest -q` tail. Written number went stale in two
+  consecutive merges before this line existed (graduated from review findings,
+  `.agents/docs/feedback.md`).
 - `pytest` off `PATH` is system python, without this package or the kernel.
   Always `.venv/bin/pytest`.

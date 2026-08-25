@@ -179,6 +179,7 @@ class MemoryLayer:
         flush_every: int | None = None,
         refresh_every: float | None = 1.0,
         ttl: float = DEFAULT_TTL,
+        read_only: bool = False,
         session: str | None = None,
         ack_verify: bool = True,
         compaction: bool = True,
@@ -212,7 +213,7 @@ class MemoryLayer:
             self.objects, space, agent, self.quantizer,
             session=session or new_session(), ttl=ttl, ack_verify=ack_verify,
             compaction=compaction, compaction_threshold=compaction_threshold,
-            compact_bit_width=compact_bit_width,
+            compact_bit_width=compact_bit_width, read_only=read_only,
         )
         # celld: "Two requests to the same cell never run at the same instant."
         # One lane is single-threaded, which is why none of the state below
@@ -231,10 +232,19 @@ class MemoryLayer:
         where = (f"epoch={self.space.epoch} "
                  f"fragments={len(self.space.state.fragments)} active"
                  if self.space.active else "idle")
+        who = "read-only" if self.read_only else f"agent={self.agent!r}"
         return (f"<MemoryLayer store={self._store!r} space={self.space.space!r} "
-                f"agent={self.agent!r} {where}>")
+                f"{who} {where}>")
 
     # -- identity ---------------------------------------------------------
+
+    @property
+    def read_only(self) -> bool:
+        """True for a handle that claimed no lane and cannot write."""
+        return self.space.read_only
+
+    def _writes(self, what: str) -> None:
+        self.space.refuse_write(what)
 
     @property
     def agent(self) -> str:
@@ -358,6 +368,7 @@ class MemoryLayer:
         Use ``flush_every=N`` or ``with mem.batch():`` to amortize the commit
         across many writes.
         """
+        self._writes("remember")
         if embedding is None:
             embedding = self._embed(text)
         with self._lock:
@@ -411,6 +422,7 @@ class MemoryLayer:
         vectors already.  A length mismatch raises ``ValueError`` before
         anything is staged.
         """
+        self._writes("remember_many")
         texts = list(texts)
         metadatas = self._per_text(metadata, len(texts), "metadata")
         vectors = None if embeddings is None else [
@@ -444,6 +456,7 @@ class MemoryLayer:
         live view.  The lane that first wrote it still has it, so time-travel
         recall at an earlier checkpoint still sees it.
         """
+        self._writes("forget")
         with self._lock:
             state = self._state(fresh=True)
             if (fragment_id not in state.fragments
@@ -463,6 +476,7 @@ class MemoryLayer:
 
     def flush(self, note: str = ""):
         """Commit staged writes as one segment.  Returns (epoch, seq) or None."""
+        self._writes("flushing")
         with self._lock:
             if not self.space.active:
                 return None
@@ -479,6 +493,7 @@ class MemoryLayer:
         One PUT and one ownership read instead of one per line -- and one
         object for the other agents to notice, rather than hundreds.
         """
+        self._writes("a batch")
         with self._lock:
             self._batching += 1
             try:
@@ -581,6 +596,7 @@ class MemoryLayer:
 
     def checkpoint(self, name: str) -> Cut:
         """Name where every lane has got to, for the whole space."""
+        self._writes("a checkpoint")
         with self._lock:
             self._state(fresh=True)
             if self.space.pending or not self.space.head:
@@ -611,6 +627,7 @@ class MemoryLayer:
         another agent has it; an expired lease can be taken over, so a crashed
         agent never wedges the job.
         """
+        self._writes("a task lease")
         claim = self.space.lease(name, ttl=ttl)
         try:
             yield claim
@@ -624,6 +641,7 @@ class MemoryLayer:
 
     def attach(self, name: str, data: bytes) -> str:
         """Park a large payload beside the lanes, shared by the whole space."""
+        self._writes("attach")
         with self._lock:
             if not self.space.active:
                 self.space.activate()
@@ -647,6 +665,7 @@ class MemoryLayer:
         itself a compaction) and no requested narrowing would change any
         payload.
         """
+        self._writes("compaction")
         with self._lock:
             self._state()
             if self.space.pending or not self.space._base_written:
@@ -657,6 +676,7 @@ class MemoryLayer:
         """Delete this agent's superseded objects.  Destructive -- it ends the
         audit trail and can make old checkpoints unreachable.  Never touches
         another agent's lane."""
+        self._writes("garbage collection")
         with self._lock:
             return self.space.gc(keep_epochs=keep_epochs)
 
@@ -667,6 +687,7 @@ class MemoryLayer:
         return record
 
     def renew(self) -> None:
+        self._writes("renewing a lease")
         with self._lock:
             self.space.ownership.renew()
 
@@ -676,16 +697,23 @@ class MemoryLayer:
             index = state.index
             packed = index.packed_bytes
             raw = len(index) * self.quantizer.dim * 4  # float32 baseline
-            mine = sum(1 for fid in state.fragments
-                       if self.agent in state.contributors(fid))
+            mine = 0 if self.read_only else sum(
+                1 for fid in state.fragments
+                if self.agent in state.contributors(fid))
             return {
                 "space": self.space.space,
-                "agent": self.agent,
-                "epoch": self.space.epoch,
+                # A read-only handle owns no lane, so it has no agent identity
+                # and no epoch to report -- printing either would be fiction.
+                "agent": None if self.read_only else self.agent,
+                "epoch": None if self.read_only else self.space.epoch,
+                "read_only": self.read_only,
                 "fragments": len(state.fragments),
                 "mine": mine,
                 "from_others": len(state.fragments) - mine,
-                "known_agents": len(self.space.peers) + 1,
+                # peers already includes this handle's own name when it is
+                # read-only (it replays every lane, its own included), so the
+                # +1 for self is only right for a handle that owns a lane.
+                "known_agents": len(self.space.peers) + (0 if self.read_only else 1),
                 "tombstones": len(state.tombstones),
                 "dim": self.quantizer.dim,
                 "bit_width": self.quantizer.bit_width,

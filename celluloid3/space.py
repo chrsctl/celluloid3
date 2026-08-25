@@ -359,6 +359,7 @@ class Space:
         compaction: bool = True,
         compaction_threshold: int = DEFAULT_COMPACTION_THRESHOLD,
         compact_bit_width: int | None = None,
+        read_only: bool = False,
     ):
         self.objects = objects
         self.space = check_name(space, "space")
@@ -369,6 +370,11 @@ class Space:
             f"lane {self.agent!r} of space {self.space!r}",
             session=session, ttl=ttl,
         )
+        # A read-only space claims nothing: no ownership record, no epoch, no
+        # base segment, and every lane -- including the one this handle is
+        # named after -- replayed as somebody else's.  Reading a team's memory
+        # should cost nothing and change nothing.
+        self.read_only = read_only
         self.ack_verify = ack_verify
         self.compaction = compaction
         self.compaction_threshold = compaction_threshold
@@ -402,6 +408,8 @@ class Space:
 
     @property
     def active(self) -> bool:
+        if self.read_only:
+            return self.state is not None      # nothing was ever claimed
         return self.state is not None and self.ownership.record is not None
 
     @property
@@ -417,17 +425,19 @@ class Space:
         epoch, not a lease stretched over the idle gap.  ``Held`` still means
         what it always meant -- another live session is running this agent id.
         """
-        if self.active and not self.ownership.self_fenced:
+        if self.active and (self.read_only or not self.ownership.self_fenced):
             return
         self.state = None               # a dead claim is not a claim
-        self.ownership.acquire()
+        if not self.read_only:
+            self.ownership.acquire()
         started = time.time()
         self.state = SharedState(self.quantizer)
         self.own, self.own_tombstones, self.peers = {}, set(), {}
         self._next_seq = 0
         self._base_written = False
         try:
-            self._restore_own_lane()
+            if not self.read_only:
+                self._restore_own_lane()
             own_reads = self.state.objects_read
             self.refresh(force=True)
         except BaseException:
@@ -436,10 +446,11 @@ class Space:
             # the lane back so a healthy process can take it in the meantime.
             self.state = None
             self.own, self.own_tombstones, self.peers = {}, set(), {}
-            try:
-                self.ownership.release()
-            except Exception:
-                pass  # the original failure is the one worth reporting
+            if not self.read_only:
+                try:
+                    self.ownership.release()
+                except Exception:
+                    pass  # the original failure is the one worth reporting
             raise
         self.wake_objects_read = own_reads + self.refresh_objects_read
         self.wake_seconds = time.time() - started
@@ -463,6 +474,8 @@ class Space:
         if not self.active:
             self.activate()
             return True
+        if self.read_only:
+            return False              # no lease to renew, no lane to reclaim
         if not self.ownership.self_fenced:
             self.ownership.maybe_renew()
             return False
@@ -555,7 +568,7 @@ class Space:
         keys_by_agent: dict[str, list[str]] = defaultdict(list)
         for key in self.objects.list(lanes_prefix(self.space)):
             agent = parse_lane(key, self.space)
-            if agent is not None and agent != self.agent:
+            if agent is not None and (self.read_only or agent != self.agent):
                 keys_by_agent[agent].append(key)
 
         wanted: list[tuple[str, str]] = []
@@ -610,8 +623,12 @@ class Space:
         return fetched
 
     def agents(self) -> list[str]:
-        """Every lane that exists in this space, whether resident or not."""
-        found = {self.agent}
+        """Every lane that exists in this space, whether resident or not.
+
+        A read-only handle is not one of them: it owns no lane, so listing
+        itself here would be the same invention this whole mode removes.
+        """
+        found = set() if self.read_only else {self.agent}
         for key in self.objects.list(lanes_prefix(self.space)):
             agent = parse_lane(key, self.space)
             if agent:
@@ -620,7 +637,17 @@ class Space:
 
     # -- write path -------------------------------------------------------
 
+    def refuse_write(self, what: str) -> None:
+        """A read-only handle owns no lane, so there is nowhere to write."""
+        if self.read_only:
+            raise ValueError(
+                f"{what} needs a lane and this handle is read-only: it "
+                f"claimed none, advanced no epoch and left no owner record. "
+                f"Open it without read_only=True to write."
+            )
+
     def stage(self, record: Record) -> None:
+        self.refuse_write("staging a record")
         if not self.active:
             self.activate()
         self._staged.append(record)
@@ -654,6 +681,7 @@ class Space:
         epoch.  If it does not, ``Fenced`` is raised and the bytes stay under
         a superseded prefix that no reader will ever select.
         """
+        self.refuse_write("flushing")
         if not self.active:
             raise Fenced(f"lane {self.agent!r} is not active")
         if not self._staged and (self._base_written or not self.own):
@@ -735,6 +763,7 @@ class Space:
         loss compounds across repeated compactions exactly once: an already
         narrow payload is left alone rather than round-tripped.
         """
+        self.refuse_write("compaction")
         if not self.active or not self._base_written:
             return None
         bit_width = self.compact_bit_width if bit_width is None else bit_width
@@ -786,6 +815,7 @@ class Space:
         """Delete this lane's superseded objects.  Destructive: this is what
         ends the audit trail, so it is never automatic.  Only ever touches
         our own lane -- one agent must not garbage-collect another's."""
+        self.refuse_write("garbage collection")
         deleted: list[str] = []
         keys = self._lane_keys(self.agent)
         by_epoch: dict[int, list[str]] = defaultdict(list)
@@ -903,6 +933,7 @@ class Space:
         exactly one agent wins, and an expired lease can be taken over -- a
         crashed agent never wedges the job it was holding.
         """
+        self.refuse_write("a task lease")
         check_name(name, "lease")
         claim = Ownership(self.objects, lease_key(self.space, name),
                           f"lease {name!r} of space {self.space!r}",
