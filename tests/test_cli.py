@@ -98,3 +98,54 @@ def test_compact_and_gc(capsys, store):
     assert "already one object" in run(capsys, store, "compact")
     assert "deleted" in run(capsys, store, "gc")
     assert json.loads(run(capsys, store, "stats"))["fragments"] == 5
+
+
+# -- wrong input fails loudly -----------------------------------------------
+
+def test_a_typo_in_store_is_not_an_empty_memory(capsys, tmp_path):
+    """Nothing found, nothing said, exit 0 -- and a new empty store left
+    behind -- is indistinguishable from a memory that is simply empty."""
+    missing = tmp_path / "typo"
+    assert main(["--store", str(missing), "-a", "coder", "recall", "x"]) == 1
+    err = capsys.readouterr().err
+    assert str(missing) in err and "init" in err
+    assert not missing.exists()                    # and it stayed missing
+
+    assert main(["--store", str(missing), "spaces"]) == 1
+    assert not missing.exists()
+
+
+def test_the_commands_that_create_a_store_still_create_one(capsys, tmp_path):
+    fresh = tmp_path / "fresh"
+    assert main(["--store", str(fresh), "-a", "coder", "remember", "hello"]) == 0
+    capsys.readouterr()
+    assert (fresh / "celluloid3.json").exists()
+    assert main(["--store", str(tmp_path / "other"), "init"]) == 0
+
+
+def test_a_directory_without_a_store_in_it_reads_as_missing(capsys, tmp_path):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert main(["--store", str(empty), "recall", "x"]) == 1
+    assert "no store at" in capsys.readouterr().err
+
+
+def test_a_key_value_pair_without_an_equals_sign_says_so(capsys, store):
+    run(capsys, store, "remember", "a fact", "--meta", "kind=note")
+    assert main(["--store", store, "recall", "x", "--where", "badpair"]) == 1
+    assert "expects KEY=VALUE" in capsys.readouterr().err
+    assert main(["--store", store, "remember", "x", "--meta", "badpair"]) == 1
+    assert "expects KEY=VALUE" in capsys.readouterr().err
+
+
+def test_an_unknown_checkpoint_is_an_error_not_a_traceback(capsys, store):
+    run(capsys, store, "remember", "a fact")
+    assert main(["--store", store, "recall", "x", "--at", "nope"]) == 1
+    assert "error:" in capsys.readouterr().err
+
+
+def test_an_unknown_fragment_id_is_an_error_not_a_traceback(capsys, store):
+    run(capsys, store, "remember", "a fact")
+    assert main(["--store", store, "forget", "deadbeef"]) == 1
+    assert "error:" in capsys.readouterr().err
+

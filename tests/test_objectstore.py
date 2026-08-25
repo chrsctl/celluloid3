@@ -96,3 +96,50 @@ def test_open_object_store_uris(tmp_path):
     # mem:// is shared by name, so two agents can contend for one cell
     assert open_object_store("mem://x") is open_object_store("mem://x")
     assert open_object_store("mem://x") is not open_object_store("mem://y")
+
+
+# -- a mistyped store is not a local directory ------------------------------
+
+@pytest.mark.parametrize("uri", ["gs://my-bucket/memory", "redis://host/db",
+                                 "azure://container/prefix"])
+def test_a_scheme_this_build_does_not_implement_is_an_error(uri, tmp_path, monkeypatch):
+    """It used to become a local directory named after the typo and report
+    every write durable -- the loudest possible silence."""
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(ValueError) as raised:
+        open_object_store(uri)
+    assert uri.split("://")[0] + "://" in str(raised.value)
+    assert list(tmp_path.iterdir()) == []          # and created nothing
+
+
+def test_paths_are_still_paths(tmp_path, monkeypatch):
+    """Only a real ``scheme://`` is a scheme: a relative path, a home path and
+    a Windows-shaped string are all just paths."""
+    monkeypatch.chdir(tmp_path)
+    for path in ("./relative/store", "plain", r"C:\Users\dev\memory"):
+        assert isinstance(open_object_store(path), FileObjectStore)
+    assert isinstance(open_object_store(tmp_path / "as-a-path"), FileObjectStore)
+    assert isinstance(open_object_store(f"file://{tmp_path}/via-file"), FileObjectStore)
+    assert isinstance(open_object_store(InMemoryObjectStore()), InMemoryObjectStore)
+
+
+def test_the_directory_an_earlier_typo_created_is_still_openable(tmp_path, monkeypatch):
+    """``gs://b/p`` used to create ``./gs:/b/p``.  Those stores exist; the
+    error says where they are, and they open as what they are -- a path."""
+    monkeypatch.chdir(tmp_path)
+    stranded = tmp_path / "gs:" / "b" / "p"
+    stranded.mkdir(parents=True)
+    with pytest.raises(ValueError) as raised:
+        open_object_store("gs://b/p")
+    assert "gs:/b/p" in str(raised.value)
+    assert isinstance(open_object_store("gs:/b/p"), FileObjectStore)
+
+
+def test_store_scheme_names_what_it_sees(tmp_path):
+    from celluloid3.objectstore import store_scheme
+    assert store_scheme("s3://bucket/prefix") == "s3"
+    assert store_scheme("file:///tmp/x") == "file"
+    assert store_scheme("./agent-memory") is None
+    assert store_scheme(r"C:\Users\dev\memory") is None
+    assert store_scheme(tmp_path) is None
+
