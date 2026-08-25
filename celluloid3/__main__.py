@@ -151,7 +151,7 @@ def _run(args, mem: MemoryLayer) -> int:
     elif args.command == "remember":
         metadata = _kv(args.meta)
         with mem.batch("cli remember"):   # one segment, one round trip
-            ids = [mem.remember(text, metadata=metadata) for text in args.text]
+            ids = mem.remember_many(args.text, metadata=metadata)
         for fid in ids:
             print(fid[:12])
         print(f"durable in lane {mem.agent!r} at e{mem.epoch}", file=sys.stderr)

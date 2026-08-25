@@ -21,6 +21,16 @@ class HashingEmbedder:
         self.dim = dim
         self.ngram_range = ngram_range
 
+    def embed_many(self, texts) -> list[np.ndarray]:
+        """The protocol ``MemoryLayer.remember_many`` looks for.
+
+        Offline and per-text here, so batching saves this embedder nothing --
+        the point is that the built-in exercises the same path a real
+        embeddings client takes, where one call with a list replaces N round
+        trips to a service.
+        """
+        return [self(text) for text in texts]
+
     def __call__(self, text: str) -> np.ndarray:
         normalized = " " + re.sub(r"\s+", " ", text.lower().strip()) + " "
         vec = np.zeros(self.dim, dtype=np.float64)
