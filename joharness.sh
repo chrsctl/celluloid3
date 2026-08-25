@@ -30,6 +30,9 @@
 #                   branches. Reports only
 #   cleanup --apply also `git rm` the workstream files, staged for review.
 #                   Never branches — deleting one is human-only
+#   finish          Loop step 7 gate: what merging this branch NOW would
+#                   leave on the base branch. Red when the merge would add a
+#                   workstream file. Run it before the merge, not after
 #   mode            print the resolved autonomy mode and exit
 #   mode <value>    set it for THIS checkout only: 'supervised',
 #                   'unsupervised', or 'default' to clear. Writes the
@@ -303,8 +306,26 @@ cmd_verify() {
   local name smoke
   name="$(resolve_env)" || die "no usable environment layer under ${ENV_ROOT}"
   smoke="${ENV_ROOT}/${name}/smoke-test.sh"
+  # Layer contract: everything under .agents/env/<name>/ is optional, so a
+  # layer shipping no smoke-test.sh has nothing to verify rather than failing
+  # to verify. `none` is that case by definition, and it is a supported
+  # choice, not a misconfiguration — bootstrap-consumer.sh hands it out when
+  # --env is omitted. Reporting it as an error also made step 7 unsatisfiable
+  # for such a repo: the merge rule asks for `verify` green whenever the diff
+  # touches harness code, and a rule that cannot be satisfied teaches the
+  # override. Same doctrine churn, review and the finish gate already follow —
+  # say so and pass, never go red on what could not be proven. has_setup()
+  # does the symmetric thing for setup.sh one screen up.
+  #
+  # A smoke-test.sh that EXISTS but is not executable is the opposite case and
+  # stays fatal: somebody meant that file to run, and passing green over it
+  # would hide a broken layer behind the sentence above.
+  if [ ! -f "$smoke" ]; then
+    log "environment '${name}' ships no smoke-test.sh — nothing to verify"
+    return 0
+  fi
   [ -x "$smoke" ] ||
-    die ".agents/env/${name} ships no smoke-test.sh (selected: ${name}; try: $0 env)"
+    die ".agents/env/${name}/smoke-test.sh is not executable (chmod +x it)"
   run_setup "$name" || die "environment '${name}' failed to provision"
   "$smoke"
 }
@@ -332,6 +353,54 @@ cmd_upgrade() {
   local repo engine rc=0 dry=0 a
   grep -q '^JOHARNESS_CANONICAL=1' "$CONF" 2>/dev/null &&
     die "this IS the canonical harness; upgrade is for consumers (sync out with .agents/scripts/sync-to-consumer.sh)"
+
+  # Harness upkeep does not run in a session holding product work
+  # (.agents/harness/AGENTS.md, Harness upkeep). Stated as a preference it stayed
+  # the convenient path; here it is a refusal, because the convenient path
+  # is the one that gets taken.
+  #
+  # A workstream file on this branch IS the claim — the same fact the
+  # handover guard and the queue read — so the refusal fires exactly when
+  # a session has work to dilute, and never on a sync branch, which
+  # carries no workstream file by protocol.
+  #
+  # Escape is deliberate and visible, like the churn ceiling's: a genuine
+  # mid-plan sync sets JOHARNESS_UPGRADE_IN_SESSION=1 and says so in the
+  # commit. Silence is what this exists to prevent, not the act.
+  if [ "${JOHARNESS_UPGRADE_IN_SESSION:-0}" != "1" ]; then
+    local ws base
+    # The claim is what THIS branch introduced, not what it inherited. A
+    # base branch that accreted a finished workstream file — the failure
+    # process-scorecard exists to count — would otherwise refuse every sync
+    # branch cut from it, while the refusal told the session to do exactly
+    # what it had already done. A rule that misfires teaches the override,
+    # and an override taken reflexively is no rule.
+    base="$(git -C "$ROOT" merge-base HEAD "origin/${HANDOVER_BASE_BRANCH:-main}" 2>/dev/null)" || base=""
+    if [ -n "$base" ]; then
+      ws="$(
+        {
+          git -C "$ROOT" diff --name-only --diff-filter=A "$base" HEAD -- docs/handover
+          git -C "$ROOT" diff --name-only --diff-filter=A --cached -- docs/handover
+          git -C "$ROOT" ls-files --others --exclude-standard -- docs/handover
+        } 2>/dev/null |
+          { grep -E '^docs/handover/[^/]+\.md$' || :; } |
+          { grep -vE '/(TEMPLATE|README)\.md$' || :; } | sort -u | head -1
+      )"
+      [ -z "$ws" ] || ws="${ROOT}/${ws}"
+    else
+      # No merge-base to compare against, so introduced-vs-inherited cannot
+      # be told apart. Refuse on presence and let the message carry the
+      # override, rather than pass a session that may be mid-plan.
+      ws="$(find "${ROOT}/docs/handover" -maxdepth 1 -name '*.md' \
+        ! -name 'TEMPLATE.md' ! -name 'README.md' 2>/dev/null | head -1)"
+    fi
+    if [ -n "$ws" ]; then
+      log "this branch carries ${ws#"${ROOT}/"} — it holds claimed work"
+      log "cheaper routes, in order: update.yml in CI, a subagent, a session of its own"
+    log "see .agents/docs/consumer-repos.md"
+      die "upgrade refused in a session holding product work; run it from a sync branch with no workstream file, or set JOHARNESS_UPGRADE_IN_SESSION=1 to override deliberately"
+    fi
+  fi
 
   local wf="${ROOT}/.github/workflows/update.yml"
   [ -r "$wf" ] ||
@@ -493,6 +562,26 @@ cmd_ci() {
   if review_on; then
     printf '\n== review\n'
     review_report || rc=1
+  fi
+
+  # Loop step 7's gate, enforced rather than merely available. `finish` was
+  # a correct gate nobody had to run, and step 7 kept not happening:
+  # docs/handover/joharness-minify-optimize.md sat on main from 2026-08-24
+  # through 22 merges, named correctly by the gate every time anyone ran
+  # it. Detect, Record and Generalize had all happened — the step 7 wording
+  # was strengthened after a consumer measured 23 stale files — and it
+  # recurred because stage 4 was missing (.agents/docs/feedback.md).
+  #
+  # Reported at the edge, RED once the branch says done — see
+  # fin_strength for why one trigger could not serve both this and the
+  # review gate. Not behind a flag: whether a review is deep enough is a
+  # judgment, whether a branch that calls itself finished still carries
+  # its own workstream file is not.
+  local fin_strength_now
+  fin_strength_now="$(fin_strength)"
+  if [ -n "$fin_strength_now" ]; then
+    printf '\n== finish\n'
+    fin_gate "$fin_strength_now" || rc=1
   fi
 
   printf '\n'
@@ -866,7 +955,7 @@ review_report() {
   head="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)"
   if [ -z "$base" ]; then
     # Same doctrine as churn's: a check that cannot see the history it needs
-    # says so and passes, rather than reding what it cannot prove.
+    # says so and passes, rather than going red on what it cannot prove.
     printf '  not measurable here (no merge-base; shallow checkout or base branch)\n'
     return 0
   fi
@@ -1358,7 +1447,14 @@ cl_inflight() {
       git -C "$ROOT" merge-base --is-ancestor "$r" "$ref" 2>/dev/null && continue
       base="$(git -C "$ROOT" merge-base "$r" "$ref" 2>/dev/null)" || continue
       [ -n "$base" ] || continue
-      git -C "$ROOT" diff --name-only "$base" "$r" -- docs/handover 2>/dev/null |
+      # Files the branch still HAS, not files it touched. --name-only alone
+      # lists deletions too, so a branch that ran the finishing ritual —
+      # deleting its workstream file, the thing this command exists to
+      # complete — read as still carrying it, and the file was protected
+      # from removal forever. Exactly backwards for the one case cleanup is
+      # for.
+      git -C "$ROOT" diff --name-only --diff-filter=ACMRT "$base" "$r" \
+        -- docs/handover 2>/dev/null |
         gr_docs
     done | sort -u
 }
@@ -1406,7 +1502,11 @@ cmd_cleanup() {
       *) die "unknown option '$a' (try: $0 cleanup [--apply])" ;;
     esac
   done
-  ref="$(base_ref)" || die "no base branch to read merged state from"
+  ref="$(decide_ref)" || die \
+    "no ref for base branch '${HANDOVER_BASE_BRANCH:-main}' in this checkout" \
+    "— every line below would be measured against the branch you are on," \
+    "so a live claim reads as stale and --apply deletes it." \
+    "Run: git fetch origin ${HANDOVER_BASE_BRANCH:-main}"
 
   if [ "$apply" -eq 1 ]; then
     printf '== cleanup --apply (%s)\n\n' "$ref"
@@ -1534,6 +1634,230 @@ gr_field() { gr_fields "$1"; }
 # the template are not nodes; four callers said so in two greps each.
 gr_docs() { awk 'NF && /\.md$/ && !/\/(TEMPLATE|README)\.md$/'; }
 
+# ---------------------------------------------------------------------------
+# Finish gate
+#
+# "No workstream file belongs on `main`" is settled doctrine
+# (docs/handover/README.md) and every mechanism enforcing it fires AFTER the
+# merge: the session-start hook names the rot to *the next session*, `cleanup`
+# mops it in a pull request of its own, and a consumer that made it a suite
+# assertion turns its own base branch red. All three bill the wrong session.
+# The one moment the file can still be deleted for free — this session's step
+# 7, before it merges — had no check at all, so the rule was enforced on
+# whoever came next and never on whoever broke it.
+#
+# Measured in a consumer, one session, eight pull requests: three merged
+# carrying their workstream file and each turned the base branch red within
+# seconds. The two that did not were the two where the retire commit was the
+# last commit before the pull request opened. Same agent, same rule in front
+# of it, same day — which is what "make rot visible, not trust discipline"
+# already says about relying on a ritual being remembered.
+#
+# **No frontmatter is read, deliberately.** The rule this backstops keyed on
+# `status: done` and leaked in minutes when a finished workstream merged
+# labelled `review`; the protocol's own conclusion was that any rule needing
+# the leaving session to set a field correctly fails exactly when someone
+# hurries. What this diffs is the tree: files under docs/handover in this
+# branch's tip that the base branch does not already have are what THIS merge
+# would add, and that needs no field to be true.
+#
+# Files the base branch already carries are somebody else's rot. Reported,
+# never fatal: failing a session for a mess it did not make is how a gate
+# gets worked around.
+fin_docs_at() {
+  git -C "$ROOT" ls-tree -r --name-only "$1" -- docs/handover 2>/dev/null | gr_docs
+}
+
+# Workstream files THIS branch would add to the base ref, one per line.
+# Shared by `finish` and by `ci`'s gate so the two cannot drift: a gate
+# that answers a slightly different question from the command a session
+# runs by hand is a gate that gets argued with rather than obeyed.
+# Inherited files are not adds and never appear here — they are another
+# session's, and `cleanup` is what names them.
+fin_adds_at() {
+  local ref="$1" base_docs f
+  base_docs="$(fin_docs_at "$ref")"
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    printf '%s\n' "$base_docs" | grep -qxF -- "$f" && continue
+    printf '%s\n' "$f"
+  done <<<"$(fin_docs_at HEAD)"
+}
+
+# How hard this branch's own workstream files say the gate should bite:
+# 'done' when one declares itself finished, 'edge' when one is merely at
+# the edge, empty otherwise. Own files only — read from fin_adds_at, so
+# another session's inherited file cannot put this branch at an edge it
+# is not at. That was the first thing this gate got wrong, and it fired
+# on the branch that built it.
+#
+# Two strengths rather than one, because the two gates would otherwise
+# contradict each other. The review gate fires at the edge and needs the
+# workstream file PRESENT — it reads the ## Review section out of it.
+# Step 7 puts the deletion in the pull request's FINAL state, so through
+# a pull request's life the file is supposed to be there. A red at the
+# edge would therefore fight the documented workflow and red every pull
+# request from open until its last commit, which is the noise this gate
+# exists because sessions learned to ignore.
+#
+# 'done' is the session's own word that it has finished, and it is
+# strictly after review. A branch that says done and still carries the
+# file is unambiguously the defect, with no other gate wanting that file
+# to exist any more.
+fin_strength() {
+  local ref f doc status strongest=""
+  ref="$(decide_ref 2>/dev/null)" || return 0
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    doc="$(cat "${ROOT}/${f}" 2>/dev/null)"
+    status="$(printf '%s\n' "$doc" | gr_field status)"
+    if [ "$status" = "done" ]; then
+      printf 'done\n'
+      return 0
+    fi
+    review_at_edge "$doc" >/dev/null && strongest="edge"
+  done <<<"$(fin_adds_at "$ref")"
+  [ -n "$strongest" ] && printf '%s\n' "$strongest"
+  return 0
+}
+
+# `ci`'s step 7 gate. Prints two-space indented like every other section
+# and returns non-zero only when this branch would ADD its own finished
+# workstream file to the base branch.
+fin_gate() {
+  local ref adds n=0 f strength="$1"
+  if ! ref="$(decide_ref 2>/dev/null)"; then
+    # Same doctrine as churn and review: a check that cannot see the
+    # history it needs says so and passes, rather than going red on what it
+    # could not prove.
+    printf '  not measurable here (no base ref in this checkout)\n'
+    return 0
+  fi
+  adds="$(fin_adds_at "$ref")"
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    n=$((n + 1))
+    printf '  ADDS     %s\n' "$f"
+  done <<<"$adds"
+  if [ "$n" -eq 0 ]; then
+    printf '  none — this branch retires what it claimed\n'
+    return 0
+  fi
+  printf '\n  %d workstream file(s) would land on %s and be read as current\n' \
+    "$n" "$ref"
+  printf '  by the next session (Loop step 7). Delete them in THIS branch, as\n'
+  printf '  the last commit before the merge — after it, the fix needs its own\n'
+  printf '  pull request and the base branch is wrong until that lands.\n'
+  printf '  Keepers graduate first: .agents/docs/handover/README.md.\n'
+  printf '  Full picture, inherited files included: %s\n' "'$0 finish'"
+  if [ "$strength" = "done" ]; then
+    return 1
+  fi
+  printf '  Reported, not failed: this branch has not said done yet, and the\n'
+  printf '  review gate needs this file until it does.\n'
+  return 0
+}
+
+# `base_ref` falls back to HEAD when neither `origin/<base>` nor `<base>`
+# resolves. That is right for a command that DESCRIBES — `graph` would rather
+# lint the checkout it has than refuse — and wrong for one that DECIDES,
+# because HEAD compared against HEAD says every file is already on the base
+# branch. Both commands that decide were wrong under it, in opposite
+# directions, and neither said a word:
+#
+#   finish   returned GREEN on a branch carrying a live workstream file, and
+#            printed "already on the base branch — not this merge, not this
+#            session" about the very file the merge was about to strand.
+#   cleanup  called that same live file `stale`, and `--apply` DELETED it.
+#            A session in flight, its claim removed, by the command whose job
+#            is removing claims that are finished.
+#
+# Both found by review of PR60. The `finish` half is a check passing for the
+# wrong reason inside the gate written to enforce that discipline; the
+# `cleanup` half is the older bug the same fallback was hiding, and it loses
+# work rather than missing rot.
+#
+# The case is not exotic. A fresh consumer clone, or CI where
+# `actions/checkout` fetched only the pull request head, has no local base ref
+# — and a session in a fresh clone is exactly who needs both of these. A
+# command that acts on the answer refuses when it has no answer: **"cannot
+# tell" is not "clean", and it is certainly not "delete it".**
+decide_ref() {
+  local b="${HANDOVER_BASE_BRANCH:-main}" c
+  for c in "origin/${b}" "$b"; do
+    if git -C "$ROOT" rev-parse --verify --quiet "$c" >/dev/null 2>&1; then
+      printf '%s' "$c"
+      return 0
+    fi
+  done
+  return 1
+}
+
+cmd_finish() {
+  local ref branch rc=0 f adds=0 pre=0 base_docs tip_docs
+  ref="$(decide_ref)" || die \
+    "no ref for base branch '${HANDOVER_BASE_BRANCH:-main}' in this checkout" \
+    "— a gate cannot pass on a comparison it could not make." \
+    "Run: git fetch origin ${HANDOVER_BASE_BRANCH:-main}"
+  branch="$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || printf '?')"
+  printf '== finish (%s -> %s)\n\n' "$branch" "$ref"
+
+  if [ "$branch" = "${HANDOVER_BASE_BRANCH:-main}" ]; then
+    warn "on the base branch: there is no merge to gate (Loop step 3 cuts one)"
+    return 0
+  fi
+
+  base_docs="$(fin_docs_at "$ref")"
+  tip_docs="$(fin_docs_at HEAD)"
+
+  printf 'workstream files this merge would ADD to %s\n' "$ref"
+  # The adds themselves come from fin_adds_at, which `ci`'s gate also
+  # reads; this loop keeps the per-file reporting the command adds on top.
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    if printf '%s\n' "$base_docs" | grep -qxF -- "$f"; then
+      pre=$((pre + 1))
+      continue
+    fi
+    adds=$((adds + 1))
+    # A deletion that is only staged does not merge, so this stays red — but
+    # saying so is the difference between a gate and a riddle. The natural
+    # order is `git rm` then run this, and at that exact moment the file is
+    # gone from the tree and still in the tip.
+    if [ -n "$(git -C "$ROOT" status --porcelain -- "$f" 2>/dev/null)" ] &&
+       [ ! -e "${ROOT}/${f}" ]; then
+      printf '  ADDS     %s  (deleted here but not committed — commit it)\n' "$f"
+    else
+      printf '  ADDS     %s\n' "$f"
+    fi
+  done <<<"$tip_docs"
+
+  if [ "$adds" -eq 0 ]; then
+    printf '  none — this branch retires what it claimed\n'
+  else
+    rc=1
+    printf '\n  %d workstream file(s) would land on %s and be read as current by\n' \
+      "$adds" "$ref"
+    printf '  the next session. Delete them in THIS branch, as the last commit\n'
+    printf '  before the merge — after it, the fix needs its own pull request and\n'
+    printf '  the base branch is wrong until that lands.\n'
+    printf '  Keepers graduate first: .agents/docs/handover/README.md.\n'
+  fi
+
+  if [ "$pre" -gt 0 ]; then
+    printf '\n%d already on %s — not this merge, not this session: %s\n' \
+      "$pre" "$ref" "'$0 cleanup'"
+  fi
+
+  # The plan file is step 7's other deletion and it is a judgment — whether a
+  # plan is *done* is not on disk. Named, never gated: a gate that guesses
+  # teaches the next session to skip the gate.
+  printf '\nplan file: delete it too when this branch finishes its plan (step 7).\n'
+  printf 'Not checked here — "done" is a judgment, and a gate that guesses at one\n'
+  printf 'is a gate the next session learns to ignore.\n'
+  return "$rc"
+}
+
 # Mermaid node ids must be plain; labels keep the real names.
 gr_id() { printf '%s' "$1" | tr -c 'a-zA-Z0-9' '_'; }
 
@@ -1616,7 +1940,7 @@ cmd_graph() {
   # the same node twice. One entry per workstream name — the protocol says
   # one file per workstream, so a second ref carrying the same name is the
   # same work, not a second node.
-  local r short bname ws wdoc wname claim churn churn_n churn_f seen=""
+  local r short bname ws mb wdoc wname claim churn churn_n churn_f seen=""
   while IFS= read -r r; do
     short="${r#refs/remotes/}"
     bname="${short#*/}"
@@ -1624,8 +1948,29 @@ cmd_graph() {
     [ "$bname" = "$base_branch" ] && continue
     git -C "$ROOT" merge-base --is-ancestor "$r" "$ref" 2>/dev/null && continue
 
-    ws="$(git -C "$ROOT" ls-tree -r --name-only "$r" -- docs/handover 2>/dev/null |
-      gr_docs | head -1)"
+    # Ownership is a DIFF against the merge-base, never a tree read: a branch
+    # inherits every workstream file its base branch carries, so presence in
+    # the tree says nothing about whose work the branch is. Reading the tree
+    # labelled an in-flight branch with a leftover it had merely inherited,
+    # under someone else's workstream name (PR54 r13) — the same class
+    # `upgrade`, `cleanup` and the finish gate each hit separately, and which
+    # `.agents/docs/feedback.md` now carries as a rule.
+    #
+    # The merge-base is between the REMOTE ref and the base ref. This loop
+    # walks refs, not the checkout, so the `HEAD`-vs-base form the other
+    # callers use is the wrong one to copy here.
+    mb="$(git -C "$ROOT" merge-base "$r" "$ref" 2>/dev/null)" || mb=""
+    if [ -n "$mb" ]; then
+      ws="$(git -C "$ROOT" diff --name-only --diff-filter=A "$mb" "$r" \
+        -- docs/handover 2>/dev/null | gr_docs | head -1)"
+    else
+      # No merge-base: introduced and inherited cannot be told apart. `graph`
+      # DESCRIBES, so it shows the branch on presence rather than dropping it
+      # out of the view — the opposite call from `upgrade`, which DECIDES and
+      # therefore refuses on presence. Same split the base_ref comment makes.
+      ws="$(git -C "$ROOT" ls-tree -r --name-only "$r" -- docs/handover \
+        2>/dev/null | gr_docs | head -1)"
+    fi
     [ -n "$ws" ] || continue
     wdoc="$(git -C "$ROOT" show "${r}:${ws}" 2>/dev/null)"
     wname="$(printf '%s\n' "$wdoc" | gr_field workstream)"
@@ -1828,6 +2173,7 @@ main() {
     review)         cmd_review ;;
     feedback)       cmd_feedback "${1:-}" ;;
     cleanup)        cmd_cleanup "$@" ;;
+    finish)         cmd_finish ;;
     graph)          cmd_graph ;;
     # Warning on stderr, value on stdout: the guard captures stdout and must
     # keep getting one clean word, while a human running this against a
