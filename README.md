@@ -432,6 +432,12 @@ each other's memories. The store defaults to `./agent-memory` or
 embedder so everything runs offline — pass any `text -> vector` callable as
 `embedder=` for real semantics.
 
+Exit codes: **0** ok, **1** user error (no store there, a malformed
+`KEY=VALUE`, an unknown checkpoint), **2** the lane is busy — another process
+is running this `--agent` — and **3** fenced. Only `init` and `remember`
+create a store; every other command against a store that is not there says so
+rather than reporting an empty memory.
+
 ## When would git-based memory beat this?
 
 [gitquant](https://github.com/chrsctl/gitquant) is a memory layer of the same
@@ -451,7 +457,7 @@ the log rather than the reflog.
 
 ```bash
 pip install -e .[dev]
-pytest                          # 215 tests, no network, no bucket
+pytest                          # 227 tests, no network, no bucket
 python examples/agent_demo.py
 ```
 

@@ -22,12 +22,46 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 
 from .embedder import HashingEmbedder
 from .fragments import CONFIG_KEY
 from .memory import MemoryLayer
-from .objectstore import open_object_store
+from .objectstore import open_object_store, store_scheme
 from .ownership import Fenced, Held
+from .segments import SegmentError
+
+
+# The two commands whose job is to bring a store into existence.  For every
+# other command, a store that is not there is a typo in --store, and answering
+# a typo with silence and exit 0 is indistinguishable from an empty memory.
+CREATES_A_STORE = frozenset({"init", "remember"})
+
+
+def _no_store(store: str) -> ValueError:
+    return ValueError(f"no store at {store!r} "
+                      f"(create one: celluloid3 --store {store} init)")
+
+
+def _require_store(args) -> None:
+    """Refuse a read command against a store that is not there.
+
+    Checked before anything opens it, because opening a file-backed store
+    creates its directory -- so a typo would leave a new empty store behind on
+    the way to reporting that there was nothing in it.
+    """
+    if args.command in CREATES_A_STORE:
+        return
+    store = str(args.store)
+    scheme = store_scheme(store)
+    if scheme == "file":
+        store_path = Path(store[len("file://"):])
+    elif scheme is not None:
+        return                      # s3:// / mem://: nothing local to look at
+    else:
+        store_path = Path(store)
+    if not (store_path / CONFIG_KEY).exists():
+        raise _no_store(str(args.store))
 
 
 def _open(args) -> MemoryLayer:
@@ -40,9 +74,12 @@ def _open(args) -> MemoryLayer:
     # nothing and gets the same zero-config default a library caller gets --
     # or, for a store written by a custom embedder, the ValueError main()
     # turns into exit 1.
+    _require_store(args)
     objects = open_object_store(args.store)
     dim = getattr(args, "dim", None)
     fresh = objects.get(CONFIG_KEY) is None
+    if fresh and args.command not in CREATES_A_STORE:
+        raise _no_store(str(args.store))     # a remote store, or an empty dir
     return MemoryLayer(
         objects,
         space=args.space,
@@ -55,7 +92,14 @@ def _open(args) -> MemoryLayer:
 
 
 def _kv(pairs: list[str]) -> dict:
-    return dict(pair.split("=", 1) for pair in pairs)
+    out = {}
+    for pair in pairs:
+        key, sep, value = pair.partition("=")
+        if not sep:
+            raise ValueError(
+                f"--where/--meta expects KEY=VALUE, got {pair!r}")
+        out[key] = value
+    return out
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -123,7 +167,12 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
     if args.command == "spaces":
-        objects = open_object_store(args.store)
+        try:
+            _require_store(args)
+            objects = open_object_store(args.store)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
         for prefix in objects.list_prefixes("spaces/"):
             print(prefix[len("spaces/"):].rstrip("/"))
         return 0
@@ -136,6 +185,12 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         return _run(args, mem)
+    except SegmentError:
+        raise            # a corrupt object is a bug or a damaged store, not
+                         # user error: it keeps its traceback
+    except (ValueError, KeyError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     except Held as exc:
         print(f"lane busy: {exc}", file=sys.stderr)
         return 2

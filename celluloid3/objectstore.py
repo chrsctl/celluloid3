@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import threading
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
@@ -427,13 +428,35 @@ class S3ObjectStore(ObjectStore):
 # ---------------------------------------------------------------------------
 
 
+SUPPORTED_SCHEMES = ("s3://", "mem://", "file://")
+
+# ``<letter><letter|digit|+|-|.>*://``.  Deliberately requires the double
+# slash, so a Windows path (``C:\\Users\\...``) is a path, not a scheme.
+_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*://")
+
+
+def store_scheme(uri: str | os.PathLike) -> str | None:
+    """The scheme of a store string, or None when it is a plain path.
+
+    ``store_scheme("s3://bucket/prefix") == "s3"``, ``store_scheme("./x") is
+    None``, and a Windows path is a path.
+    """
+    match = _SCHEME.match(str(uri))
+    return match.group(0)[:-len("://")] if match else None
+
+
 def open_object_store(uri: str | os.PathLike | ObjectStore, **kwargs) -> ObjectStore:
     """Resolve a URI to a backend.
 
     ``s3://bucket/prefix``  -> S3ObjectStore (also R2/Tigris/MinIO via
                                ``endpoint_url=``)
     ``mem://name``          -> InMemoryObjectStore
-    anything else           -> FileObjectStore at that path
+    a path (or ``file://``) -> FileObjectStore at that path
+
+    A scheme this build does not implement raises rather than becoming a
+    local directory named after the typo: ``gs://my-bucket/memory`` used to
+    open ``./gs:/my-bucket/memory`` and report every write durable, which is
+    the loudest possible silence.
     """
     if isinstance(uri, ObjectStore):
         return uri
@@ -450,7 +473,23 @@ def open_object_store(uri: str | os.PathLike | ObjectStore, **kwargs) -> ObjectS
         return _shared_memory_store(text)
     if text.startswith("file://"):
         text = text[len("file://"):]
+    elif _SCHEME.match(text):
+        raise ValueError(_unsupported_scheme(text))
     return FileObjectStore(text)
+
+
+def _unsupported_scheme(text: str) -> str:
+    scheme = text.split("://", 1)[0]
+    # What the fallthrough this replaces would have created, and may already
+    # have: ``gs://b/p`` became a directory literally named ``gs:/b/p``.
+    # That path still opens -- as a path, which is what it is.
+    already = text.replace("://", ":/", 1)
+    hint = (f"; the directory an earlier run created is {already!r} -- pass "
+            f"that path to read it"
+            if Path(already).exists()
+            else "; pass a plain path for a local directory")
+    return (f"unsupported store scheme {scheme}://: this build understands "
+            f"{', '.join(SUPPORTED_SCHEMES)} and plain paths" + hint)
 
 
 _MEMORY_STORES: dict[str, InMemoryObjectStore] = {}
