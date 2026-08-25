@@ -48,7 +48,7 @@ from .fragments import (
     tags_prefix,
 )
 from .objectstore import ObjectStore, PreconditionFailed
-from .ownership import DEFAULT_TTL, Fenced, Ownership
+from .ownership import DEFAULT_TTL, Fenced, Held, Ownership
 from .quantizer import SUPPORTED_BIT_WIDTHS, TurboQuantizer, payload_bit_width
 from .segments import Record, SegmentError, pack_segment, read_segment
 
@@ -409,9 +409,16 @@ class Space:
 
     def activate(self) -> None:
         """Claim this lane (which advances its epoch), replay it, then catch
-        up on everyone else's."""
-        if self.active:
+        up on everyone else's.
+
+        A resident lane whose lease expired counts as unclaimed: rule 2 fenced
+        it on its own clock, so coming back is a fresh activation at a fresh
+        epoch, not a lease stretched over the idle gap.  ``Held`` still means
+        what it always meant -- another live session is running this agent id.
+        """
+        if self.active and not self.ownership.self_fenced:
             return
+        self.state = None               # a dead claim is not a claim
         self.ownership.acquire()
         started = time.time()
         self.state = SharedState(self.quantizer)
@@ -436,6 +443,34 @@ class Space:
         self.wake_objects_read = own_reads + self.refresh_objects_read
         self.wake_seconds = time.time() - started
         self.last_used = time.time()
+
+    def hold(self) -> bool:
+        """Keep this lane usable across an idle gap.  True if it was reclaimed.
+
+        Renew while the lease is still live -- 1 GET plus 1 conditional PUT,
+        and only past a third of it.  Once it has expired, renewing is not
+        allowed (rule 2), so the lane is re-acquired at a fresh epoch and
+        replayed: a full wake, which is why it happens once per expiry and
+        not once per call.
+
+        A lane a live peer session holds is never taken: that is the one
+        writer per lane the whole design rests on.  ``acquire`` raises
+        ``Held`` there, and this is where it becomes the ``Fenced`` a caller
+        already knows how to read -- "your writes went nowhere" -- naming the
+        session that holds it.
+        """
+        if not self.active:
+            self.activate()
+            return True
+        if not self.ownership.self_fenced:
+            self.ownership.maybe_renew()
+            return False
+        try:
+            self.activate()
+        except Held as exc:
+            self.ownership.record = None
+            raise Fenced(f"lane {self.agent!r}: {exc}") from exc
+        return True
 
     def deactivate(self, flush: bool = True) -> None:
         """Hand the lane back: durable, then unowned at the same epoch.
@@ -512,6 +547,10 @@ class Space:
         if self.state is None:
             self.activate()
             return self.refresh_objects_read
+        # A reader that never writes still owns its lane; renewing here is
+        # what keeps a read loop from churning epochs (renewal never advances
+        # one) or from finding itself fenced on its first write.
+        self.ownership.maybe_renew()
         keys_by_agent: dict[str, list[str]] = defaultdict(list)
         for key in self.objects.list(lanes_prefix(self.space)):
             agent = parse_lane(key, self.space)
@@ -618,9 +657,10 @@ class Space:
             raise Fenced(f"lane {self.agent!r} is not active")
         if not self._staged and (self._base_written or not self.own):
             return None
-        if self.ownership.self_fenced:
-            self.ownership.record = None
-            raise Fenced(f"lane {self.agent!r}: lease expired before flush")
+        # An expired lease of our own is not a lost write: reclaim the lane
+        # at a fresh epoch and commit into that lineage.  ``_staged`` survives
+        # an activation, so the records this call is holding go with it.
+        self.hold()
 
         staged = self._staged
         if self._base_written:

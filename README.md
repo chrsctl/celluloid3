@@ -110,10 +110,14 @@ agents that have read the same lanes hold identical state.
 - Another agent's writes become visible at your next refresh — automatic
   within `refresh_every` (1 s by default), or on demand via `refresh()`.
 - All agents **converge**, in any order, with no coordination.
+- An agent that **thinks for longer than its lease** keeps its lane. The next
+  call reclaims it at a fresh epoch and replays it; reads renew it as they go.
 
 The one thing that is *not* allowed: two processes running the same `agent` id
 at once. The second gets `Held`, because a lane, like a celld epoch, must never
 have two writers. Different agent ids on the same space is the normal case.
+`Fenced` therefore means someone else is running your agent id -- never that
+you were slow.
 
 ## What it costs
 
@@ -188,7 +192,15 @@ things use it: claiming a lane, and `lease()`.
 
 An agent that cannot reach the bucket cannot renew, and stops writing on its
 own clock — before it can learn about the takeover it cannot see. The default
-lease is 10 s (celld's `CELLD_TTL_MS`), renewed after a third of it.
+lease is 10 s (celld's `CELLD_TTL_MS`), renewed after a third of it. Every
+public call renews, not only writes, so a busy agent never gets near expiry.
+
+An agent that was merely *slow* is a different case, and the common one: one
+model call is longer than 10 s. Its expiry passes, so rule 2 still fences it —
+and then its next call re-acquires the lane at a fresh epoch, replays it and
+commits into that lineage, staged writes included. No lease is ever stretched
+over the gap, and a lane a live session holds is never taken: that raises
+`Fenced` naming the holder.
 
 ### 4. Acknowledge behind a durability proof plus one ownership read
 
