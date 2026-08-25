@@ -149,3 +149,57 @@ def test_an_unknown_fragment_id_is_an_error_not_a_traceback(capsys, store):
     assert main(["--store", store, "forget", "deadbeef"]) == 1
     assert "error:" in capsys.readouterr().err
 
+
+# -- reading does not write -------------------------------------------------
+
+def test_read_commands_leave_no_lane_behind(capsys, store):
+    """`celluloid3 log` used to invent a `default` agent that never remembered
+    anything: an owner record, a name in everyone's agents() forever, and an
+    epoch advanced per run -- for a read."""
+    from celluloid3 import FileObjectStore
+
+    run(capsys, store, "-a", "planner", "remember", "the customer wants SSO")
+    run(capsys, store, "-a", "coder", "remember", "the auth service has no OIDC")
+
+    for argv in (["log"], ["stats"], ["agents"], ["recall", "SSO"],
+                 ["checkpoints"], ["owner"], ["spaces"]):
+        assert main(["--store", store, *argv]) == 0
+    capsys.readouterr()
+
+    lanes = FileObjectStore(store).list("spaces/shared/lanes/")
+    assert not [key for key in lanes if "/default/" in key]
+    # ...and `agents` with no --agent lists the two writers, not itself
+    assert run(capsys, store, "agents").split() == ["coder", "planner"]
+    # `owner` for a lane nobody claimed is null, not a record it just made
+    assert json.loads(run(capsys, store, "owner")) is None
+
+
+def test_a_read_command_does_not_advance_an_epoch(capsys, store):
+    run(capsys, store, "-a", "planner", "remember", "a fact")
+    before = json.loads(run(capsys, store, "-a", "planner", "stats"))
+    for _ in range(3):
+        run(capsys, store, "log")
+        run(capsys, store, "recall", "fact")
+    after = json.loads(run(capsys, store, "-a", "planner", "stats"))
+    assert before["epoch"] is after["epoch"] is None      # read-only handles
+    # ...and the writer's own lane record is untouched by all that reading
+    assert json.loads(run(capsys, store, "-a", "planner", "owner"))["epoch"] == 1
+
+
+def test_stats_does_not_invent_an_identity_it_does_not_have(capsys, store):
+    run(capsys, store, "-a", "planner", "remember", "a fact")
+    stats = json.loads(run(capsys, store, "-a", "planner", "stats"))
+    assert stats["read_only"] is True
+    assert stats["agent"] is None and stats["epoch"] is None
+    assert stats["fragments"] == 1        # ...but it still reads everything
+    assert stats["known_agents"] == 1     # the one writer, not itself as well
+    assert stats["mine"] == 0 and stats["from_others"] == 1
+
+
+def test_the_writing_commands_still_claim_a_lane(capsys, store):
+    run(capsys, store, "-a", "planner", "remember", "a fact")
+    assert json.loads(run(capsys, store, "-a", "planner", "owner"))["epoch"] == 1
+    run(capsys, store, "-a", "planner", "checkpoint", "now")
+    assert "now" in run(capsys, store, "checkpoints")
+    assert "deleted" in run(capsys, store, "-a", "planner", "gc")
+

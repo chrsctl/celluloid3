@@ -432,6 +432,13 @@ each other's memories. The store defaults to `./agent-memory` or
 embedder so everything runs offline — pass any `text -> vector` callable as
 `embedder=` for real semantics.
 
+Reading does not write: `recall`, `log`, `stats`, `agents`, `checkpoints`,
+`lease`, `owner` and `spaces` open the space without claiming a lane — no
+owner record, no epoch advanced, no `default` agent invented by a command that
+only looked. `init`, `remember`, `forget`, `checkpoint`, `compact` and `gc`
+claim one, exactly as before. In Python it is `MemoryLayer(...,
+read_only=True)`; a write on such a handle raises.
+
 Exit codes: **0** ok, **1** user error (no store there, a malformed
 `KEY=VALUE`, an unknown checkpoint), **2** the lane is busy — another process
 is running this `--agent` — and **3** fenced. Only `init` and `remember`
@@ -457,7 +464,7 @@ the log rather than the reflog.
 
 ```bash
 pip install -e .[dev]
-pytest                          # 227 tests, no network, no bucket
+pytest                          # 234 tests, no network, no bucket
 python examples/agent_demo.py
 ```
 
