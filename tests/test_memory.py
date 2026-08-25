@@ -182,9 +182,16 @@ def test_store_config_is_created_once_and_then_enforced(bucket, embedder, tmp_pa
     # the store's codebook is fixed at creation; a mismatched reopen is refused
     with pytest.raises(ValueError):
         MemoryLayer(bucket, space="team", agent="a", embedder=embedder, dim=64)
-    # ...and a brand-new store has to be told the dimension somehow
+    # ...a brand-new store opened with nothing at all takes the built-in
+    # embedder's default dimension (see the zero-config tests below)...
+    zero_config = MemoryLayer(FileObjectStore(tmp_path / "empty"),
+                              space="team", agent="a")
+    assert zero_config.quantizer.dim == 256
+    # ...but an embedder that cannot say what dimension it produces still has
+    # to be told.
     with pytest.raises(ValueError):
-        MemoryLayer(FileObjectStore(tmp_path / "empty"), space="team", agent="a")
+        MemoryLayer(FileObjectStore(tmp_path / "dimless"), space="team",
+                    agent="a", embedder=lambda text: [0.0] * 8)
 
 
 def test_config_creation_is_a_race_only_one_agent_wins(bucket, embedder):
@@ -405,4 +412,146 @@ def test_cli_remember_routes_through_remember_many(tmp_path, capsys):
     reader = MemoryLayer(store, space="shared", agent="reader", ttl=60)
     assert len(reader._state(fresh=True).fragments) == 3
     assert len(reader.space.state.log) == 1      # three texts, one segment
+
+
+# -- what a first-time user meets -------------------------------------------
+
+def test_zero_config_open_stores_and_recalls(tmp_path):
+    """The line the README opens with has to run: no embedder, no dim, no
+    keyword arguments at all."""
+    mem = MemoryLayer(tmp_path / "agent-memory")
+    mem.remember("the deploy failed because DATABASE_URL was missing")
+    assert "DATABASE_URL" in mem.recall("why did the deploy break?", k=1)[0].fragment.text
+    assert mem.stats()["dim"] == 256
+
+
+def test_an_explicit_dim_with_no_embedder_still_means_bring_your_own_vector(bucket):
+    """The path that existed before the default: ``dim=`` alone configures the
+    codebook and configures no embedder."""
+    mem = MemoryLayer(bucket, space="team", agent="a", dim=64)
+    assert mem.embedder is None
+    with pytest.raises(ValueError):
+        mem.remember("no vector, no embedder")
+    fid = mem.remember("brought my own", embedding=np.ones(64))
+    assert mem.get(fid).text == "brought my own"
+
+
+def test_a_hashing_store_reopens_with_no_embedder_at_its_own_dim(bucket, tmp_path):
+    from celluloid3 import HashingEmbedder
+    first = MemoryLayer(bucket, space="team", agent="a",
+                        embedder=HashingEmbedder(dim=64))
+    first.remember("written by the built-in embedder")
+    first.hibernate()
+
+    reopened = MemoryLayer(bucket, space="team", agent="b")   # nothing passed
+    assert reopened.quantizer.dim == 64                       # not 256
+    assert isinstance(reopened.embedder, HashingEmbedder)
+    assert reopened.embedder.dim == 64
+    assert len(reopened.recall("built-in", k=1)) == 1
+
+
+def test_a_custom_embedder_store_refuses_to_default(tmp_path, capsys):
+    """A default that guesses wrong is worse than the error it replaces: hash
+    vectors scored against a real model's vectors look fine and mean nothing.
+    """
+    class TinyModel:
+        dim = 8
+
+        def __call__(self, text):
+            return np.linspace(0.0, 1.0, 8) * len(text)
+
+    store = str(tmp_path / "model-store")
+    MemoryLayer(store, space="team", agent="a", embedder=TinyModel()).remember("mine")
+
+    with pytest.raises(ValueError) as raised:
+        MemoryLayer(store, space="team", agent="b")
+    assert store in str(raised.value)
+    assert "embedder=" in str(raised.value)
+    assert "dim=8" in str(raised.value)      # ...and the bring-your-own escape
+
+    assert main(["--store", store, "recall", "anything"]) != 0
+    assert "custom embedder" in capsys.readouterr().err
+    # ...and it is still openable by the caller who has the embedder.
+    assert MemoryLayer(store, space="team", agent="b",
+                       embedder=TinyModel()).stats()["dim"] == 8
+
+
+def test_a_subclass_of_the_built_in_embedder_counts_as_custom(bucket):
+    """Subclassing ``HashingEmbedder`` to change what it produces is somebody
+    else's embedder; marking it built-in would let the next process reopen the
+    store with the plain one."""
+    from celluloid3 import HashingEmbedder
+
+    class Reversed(HashingEmbedder):
+        def __call__(self, text):
+            return super().__call__(text[::-1])
+
+    MemoryLayer(bucket, space="team", agent="a", embedder=Reversed(dim=64))
+    with pytest.raises(ValueError):
+        MemoryLayer(bucket, space="team", agent="b")
+
+
+def test_a_store_written_before_the_marker_reads_as_custom(bucket):
+    """Every store that exists today has no ``embedder`` key.  Reading those as
+    custom is the whole compatibility story -- no version check, and no store
+    silently re-embedded."""
+    import json
+
+    from celluloid3.fragments import CONFIG_KEY
+    bucket.put(CONFIG_KEY, json.dumps({
+        "version": 1, "dim": 128, "bit_width": 4, "rotation_seed": 11,
+    }).encode())
+
+    with pytest.raises(ValueError):
+        MemoryLayer(bucket, space="team", agent="a")
+    old = MemoryLayer(bucket, space="team", agent="a", dim=128)   # still opens
+    assert old.quantizer.dim == 128
+
+
+def test_repr_says_what_the_handle_is_without_claiming_a_lane(counted, embedder):
+    mem = MemoryLayer(counted, space="team", agent="planner", embedder=embedder,
+                      dim=256, ttl=60)
+    counted.reset()
+    printed = repr(mem)
+    assert counted.gets == counted.puts == counted.lists == 0   # no round trips
+    assert not mem.space.active                                 # and no lane
+    assert "team" in printed and "planner" in printed and "idle" in printed
+
+    mem.remember("now it is active")
+    printed = repr(mem)
+    assert "active" in printed and "fragments=1" in printed and "epoch=1" in printed
+
+
+def test_pool_repr_says_how_full_it_is(bucket, embedder):
+    from celluloid3 import MemoryPool
+    pool = MemoryPool(bucket, space="team", embedder=embedder, dim=256,
+                      max_resident=4, ttl=60)
+    pool.agent("planner")
+    assert "team" in repr(pool) and "1/4" in repr(pool)
+    pool.drain()
+
+
+def test_one_exception_catches_everything_this_package_raises():
+    """A caller that wants "anything celluloid3 raised" should not have to
+    import five names -- and the five keep the bases they always had."""
+    from celluloid3 import (
+        Celluloid3Error, ChainBroken, Fenced, Held, PreconditionFailed,
+        SegmentError,
+    )
+    for error in (Held, Fenced, ChainBroken, PreconditionFailed, SegmentError):
+        assert issubclass(error, Celluloid3Error)
+        try:
+            raise error("boom")
+        except Celluloid3Error as caught:
+            assert isinstance(caught, ValueError if error is SegmentError
+                              else RuntimeError)
+
+
+def test_the_package_ships_its_type_marker():
+    """PEP 561: annotated signatures reach a user's type checker only if the
+    marker is installed beside the package."""
+    import pathlib
+
+    import celluloid3
+    assert (pathlib.Path(celluloid3.__file__).parent / "py.typed").exists()
 

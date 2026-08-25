@@ -42,6 +42,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from .errors import Celluloid3Error
 from .fragments import (
     blob_key, check_name, l1_key, lane_prefix, lanes_prefix, lease_key,
     owner_key, parse_epoch, parse_lane, parse_segment, segment_key, tag_key,
@@ -58,7 +59,7 @@ from .segments import Record, SegmentError, pack_segment, read_segment
 DEFAULT_COMPACTION_THRESHOLD = 32
 
 
-class ChainBroken(RuntimeError):
+class ChainBroken(RuntimeError, Celluloid3Error):
     """A lane's epoch prefix has data but no contiguous chain from zero."""
 
 

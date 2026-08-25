@@ -7,6 +7,7 @@ and never coordinate; the merged view converges regardless of arrival order.
 """
 
 from .embedder import HashingEmbedder
+from .errors import Celluloid3Error
 from .fragments import Fragment
 from .memory import MemoryLayer, MemoryPool, RecallHit
 from .objectstore import (
@@ -15,7 +16,7 @@ from .objectstore import (
 )
 from .ownership import Fenced, Held, OwnerRecord, Ownership
 from .quantizer import TurboQuantizer
-from .segments import Record, Segment, pack_segment, read_segment
+from .segments import Record, Segment, SegmentError, pack_segment, read_segment
 from .space import (
     ChainBroken, Cut, QuantIndex, SharedState, Space, build_chain, select_chain,
 )
@@ -44,9 +45,12 @@ __all__ = [
     # coordination
     "Ownership",
     "OwnerRecord",
+    # errors -- every one of these is a Celluloid3Error too
+    "Celluloid3Error",
     "Held",
     "Fenced",
     "ChainBroken",
+    "SegmentError",
     # storage backends
     "ObjectStore",
     "S3ObjectStore",

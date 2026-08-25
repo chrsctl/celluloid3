@@ -45,6 +45,7 @@ import struct
 import zlib
 from dataclasses import dataclass, field
 
+from .errors import Celluloid3Error
 from .fragments import Fragment
 
 MAGIC = b"TQS1"
@@ -61,7 +62,7 @@ _OP_NAMES = {OP_PUT: "put", OP_FORGET: "forget"}
 _OP_CODES = {v: k for k, v in _OP_NAMES.items()}
 
 
-class SegmentError(ValueError):
+class SegmentError(ValueError, Celluloid3Error):
     """A segment object is truncated, corrupt, or not a segment at all."""
 
 

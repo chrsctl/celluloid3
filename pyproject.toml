@@ -20,3 +20,6 @@ celluloid3 = "celluloid3.__main__:main"
 
 [tool.setuptools]
 packages = ["celluloid3"]
+
+[tool.setuptools.package-data]
+celluloid3 = ["py.typed"]

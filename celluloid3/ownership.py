@@ -47,17 +47,18 @@ import time
 import uuid
 from dataclasses import dataclass
 
+from .errors import Celluloid3Error
 from .objectstore import ObjectStore, PreconditionFailed
 
 DEFAULT_TTL = 10.0        # celld's CELLD_TTL_MS default, in seconds
 RENEW_FRACTION = 1 / 3    # "renews the lease after one third of the lifetime"
 
 
-class Held(RuntimeError):
+class Held(RuntimeError, Celluloid3Error):
     """Someone else holds a live claim -- on this lane, or on this task lease."""
 
 
-class Fenced(RuntimeError):
+class Fenced(RuntimeError, Celluloid3Error):
     """This agent is no longer the owner at its epoch.
 
     Anything it wrote landed under a superseded epoch prefix, where no
