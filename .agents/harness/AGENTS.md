@@ -21,7 +21,10 @@ the selected layer — as a read-first pointer by default, whole when md=eager
    `docs/plans/*.md` (shape + claim rules: `.agents/docs/plans/README.md`). Hook
    prints queue + wanted agent tier at session start. Oldest actionable
    first, urgent first if marked. No issue, no requirement, no plan: ask
-   human. Not invent work.
+   human. Not invent work. ONE exception, `JOHARNESS_MODE=unsupervised`
+   (session start says so): edge = generate work, never ask. Boundary holds
+   — no commit under `.agents/harness/`
+   ([`docs/product/unsupervised-mode.md`](../../docs/product/unsupervised-mode.md)).
 3. **Claim.** Cut branch from `main` (branch flow:
    `.agents/docs/product/README.md`). Write `docs/handover/<workstream>.md`. Push
    NOW — no push, no claim. Hook shows overlap? `/who`. Only `RUNNING`
@@ -81,6 +84,8 @@ the selected layer — as a read-first pointer by default, whole when md=eager
    later sessions read as current — measured at 23 in one consumer repo,
    thirteen merges adding six and removing none, because "optional,
    human-only" one sentence up reads as covering this one too.
+   `./joharness.sh cleanup` counts what earlier merges left; `--apply`
+   stages the workstream-file deletions. Branches it only counts.
 
 ## Decide alone
 
