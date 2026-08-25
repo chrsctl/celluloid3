@@ -221,9 +221,14 @@ class MemoryLayer:
         self.hibernate()
 
     def _state(self, fresh: bool = False) -> SharedState:
+        # Every public call holds the lane, not just the write path: an agent
+        # that spends a minute thinking between two calls has not given
+        # anything up, and a read loop should renew rather than let the lease
+        # run out.  A reclaim replays the space on the way in, so it makes the
+        # refresh below redundant.
         if not self.space.active:
             self.space.activate()
-        elif fresh and self.refresh_every is not None:
+        elif not self.space.hold() and fresh and self.refresh_every is not None:
             if time.time() - self.space.last_refresh >= self.refresh_every:
                 self.space.refresh()
         return self.space.state

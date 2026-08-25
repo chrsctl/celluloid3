@@ -224,10 +224,18 @@ class Ownership:
         return renewed
 
     def maybe_renew(self) -> None:
-        """Renew once a third of the lease has burned (celld's cadence)."""
-        if self.record is None:
+        """Renew once a third of the lease has burned (celld's cadence).
+
+        Measured against the expiry we published, which is the clock rule 2
+        fences us on -- so "a third burned" and "self-fenced" can never
+        disagree.  Past that expiry there is nothing to renew: rule 2 already
+        stopped us, and coming back is an *activation* at a fresh epoch (rule
+        1), never a lease stretched over the gap.  ``Space.hold`` does that
+        part.
+        """
+        if self.record is None or self.self_fenced:
             return
-        if time.time() - self.record.acquired_at >= self.ttl * RENEW_FRACTION:
+        if self.record.expires_at - time.time() <= self.ttl * (1 - RENEW_FRACTION):
             self.renew()
 
     # -- the acknowledgement gate ----------------------------------------

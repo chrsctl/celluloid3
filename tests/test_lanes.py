@@ -11,7 +11,7 @@ from dataclasses import replace
 
 import pytest
 
-from celluloid3 import Fenced, MemoryLayer
+from celluloid3 import Fenced, MemoryLayer, MemoryPool
 from celluloid3.fragments import epoch_prefix, lane_prefix, parse_epoch
 
 
@@ -236,3 +236,112 @@ def test_documented_round_trip_costs(counted, embedder):
     counted.reset()
     reader.hibernate()
     assert (counted.gets, counted.puts, counted.conditional_puts) == (1, 1, 1)
+
+
+# -- an idle agent keeps its lane -------------------------------------------
+
+def test_an_idle_writer_reclaims_its_own_lane(bucket, embedder):
+    """This is memory for LLM agents, and an LLM agent thinks for longer than
+    a 10 s lease.  A gap nobody else used is not a lost write: the lane comes
+    back at a fresh epoch, carrying everything it held."""
+    mem = MemoryLayer(bucket, space=SPACE, agent="a", embedder=embedder,
+                      dim=256, ttl=0.05)
+    mem.remember("before the long think")
+    time.sleep(0.1)                                  # one ordinary model call
+    mem.remember("after the long think")
+    assert mem.epoch == 2
+    mem.hibernate()
+
+    reader = MemoryLayer(bucket, space=SPACE, agent="reader", embedder=embedder,
+                         ttl=60)
+    texts = {f.text for f in reader._state(fresh=True).fragments.values()}
+    assert texts == {"before the long think", "after the long think"}
+
+
+def test_a_lane_a_live_peer_holds_is_never_reclaimed(bucket, embedder):
+    """Self-healing stops exactly where the invariant starts.  A lane taken
+    over while we were idle still fences us -- and says who has it."""
+    first = MemoryLayer(bucket, space=SPACE, agent="a", embedder=embedder,
+                        dim=256, ttl=0.05)
+    first.remember("mine, while I held the lane")
+    time.sleep(0.1)
+
+    second = MemoryLayer(bucket, space=SPACE, agent="a", embedder=embedder, ttl=60)
+    second.remember("the process that took over")
+    assert second.epoch == 2
+
+    with pytest.raises(Fenced) as fenced:
+        first.remember("written after the takeover")
+    assert second.space.ownership.session in str(fenced.value)
+
+    observer = MemoryLayer(bucket, space=SPACE, agent="b", embedder=embedder, ttl=60)
+    texts = {f.text for f in observer._state(fresh=True).fragments.values()}
+    assert texts == {"mine, while I held the lane", "the process that took over"}
+
+
+def test_reads_renew_the_lane_instead_of_churning_epochs(bucket, embedder):
+    """A reader holds its lane by renewing -- 1 GET and 1 conditional PUT past
+    a third of the lease -- not by re-acquiring, which would re-serialize the
+    whole lane into a new base every time."""
+    mem = MemoryLayer(bucket, space=SPACE, agent="a", embedder=embedder,
+                      dim=256, ttl=0.2)
+    mem.remember("one fact to recall")
+    deadline = time.time() + 0.5
+    while time.time() < deadline:
+        mem.recall("fact", k=1)
+        time.sleep(0.02)
+    assert mem.epoch == 1
+    mem.remember("still my lane, never left it")
+    assert mem.epoch == 1
+
+
+def test_an_idle_gap_costs_one_epoch_however_many_writes_follow(bucket, embedder):
+    """A re-acquire rewrites the lane's base, so it happens once per expiry --
+    not once per call, and not once per write."""
+    mem = MemoryLayer(bucket, space=SPACE, agent="a", embedder=embedder,
+                      dim=256, ttl=0.05)
+    mem.remember("awake")
+    assert mem.epoch == 1
+    for gap in range(3):
+        time.sleep(0.1)
+        mem.remember(f"first write after gap {gap}")
+        mem.remember(f"second write after gap {gap}")
+    assert mem.epoch == 4                   # three gaps, three re-acquires
+    assert len(mem) == 7
+    mem.hibernate()
+
+    reader = MemoryLayer(bucket, space=SPACE, agent="reader", embedder=embedder,
+                         ttl=60)
+    assert len(reader._state(fresh=True).fragments) == 7
+
+
+def test_a_batch_open_across_a_slow_call_still_commits(bucket, embedder):
+    """The staged records are the whole point of the fix: a batch held open
+    across one model call must land, not raise.  An activation leaves
+    ``_staged`` alone, so the reclaim carries them into the new epoch."""
+    mem = MemoryLayer(bucket, space=SPACE, agent="a", embedder=embedder,
+                      dim=256, ttl=0.05)
+    with mem.batch("one slow tool call"):
+        mem.remember("staged before the lease ran out")
+        mem.remember("staged beside it")
+        time.sleep(0.1)              # the lease dies with the batch still open
+    assert mem.epoch == 2            # the commit reclaimed the lane
+    assert len(mem) == 2
+    mem.hibernate()
+
+    reader = MemoryLayer(bucket, space=SPACE, agent="reader", embedder=embedder,
+                         ttl=60)
+    texts = {f.text for f in reader._state(fresh=True).fragments.values()}
+    assert texts == {"staged before the lease ran out", "staged beside it"}
+
+
+def test_a_pooled_lane_survives_an_idle_gap(bucket, embedder):
+    """``MemoryPool.agent`` hands back a resident lane.  One whose lease ran
+    out while the agent was thinking has to come back usable, not fenced."""
+    pool = MemoryPool(bucket, space=SPACE, embedder=embedder, dim=256, ttl=0.05)
+    pool.agent("planner").remember("the customer wants SSO")
+    time.sleep(0.1)
+    pool.agent("planner").remember("...and SCIM")
+    assert pool.agent("planner").epoch == 2
+    assert len(pool.agent("planner")) == 2
+    pool.drain()

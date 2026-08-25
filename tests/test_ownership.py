@@ -103,6 +103,33 @@ def test_self_fencing_at_published_expiry(bucket):
     assert own.self_fenced
 
 
+def test_renewal_fires_once_a_third_of_the_lease_has_burned(bucket):
+    """celld's cadence, measured against the expiry we published -- the same
+    clock rule 2 fences us on, so the two can never disagree."""
+    own = Ownership(bucket, KEY, LABEL, ttl=0.3)
+    own.acquire()
+    published = own.record.expires_at
+    own.maybe_renew()
+    assert own.record.expires_at == published    # too early: nothing spent yet
+    time.sleep(0.12)
+    own.maybe_renew()
+    assert own.record.expires_at > published
+    assert own.record.epoch == 1                 # a renewal is not an activation
+
+
+def test_renewal_never_stretches_a_lease_past_its_expiry(bucket):
+    """Self-healing does not soften rule 2.  Once our published expiry has
+    passed we are fenced; coming back is an activation at a fresh epoch (see
+    ``Space.hold``), never the dead lease extended over the gap."""
+    own = Ownership(bucket, KEY, LABEL, ttl=0.05)
+    own.acquire()
+    time.sleep(0.08)
+    published = own.record.expires_at
+    own.maybe_renew()
+    assert own.record.expires_at == published
+    assert own.self_fenced
+
+
 def test_release_publishes_unowned_without_resetting_the_epoch(bucket):
     own = Ownership(bucket, KEY, LABEL, ttl=60)
     own.acquire()
