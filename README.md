@@ -347,6 +347,13 @@ MemoryLayer("./agent-memory")                           # a local directory
 MemoryLayer("mem://scratch")                            # in-process, for tests
 ```
 
+Opened with nothing else, a store gets the built-in offline embedder at 256
+dimensions — no network, no model download, the same default the CLI has always
+used. Pass `embedder=` for real semantics. A store records which kind of
+embedder created it, so one written by your model is never reopened with the
+built-in: that would score hash vectors against model vectors and return hits
+that look fine and mean nothing. It raises and names what to pass instead.
+
 S3 has been strongly read-after-write consistent since 2020 and gained
 conditional creates (`If-None-Match: *`) in 2024 and conditional overwrites
 (`If-Match`) shortly after. GCS (generation preconditions) and Azure Blob (ETag
@@ -444,7 +451,7 @@ the log rather than the reflog.
 
 ```bash
 pip install -e .[dev]
-pytest                          # 138 tests, no network, no bucket
+pytest                          # 215 tests, no network, no bucket
 python examples/agent_demo.py
 ```
 

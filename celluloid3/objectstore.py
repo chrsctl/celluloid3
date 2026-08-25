@@ -31,6 +31,8 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 
+from .errors import Celluloid3Error
+
 try:  # POSIX advisory locking for the file backend's conditional writes
     import fcntl
 except ImportError:  # pragma: no cover - Windows
@@ -42,7 +44,7 @@ except ImportError:  # pragma: no cover - Windows
 DEFAULT_CONCURRENCY = 32
 
 
-class PreconditionFailed(RuntimeError):
+class PreconditionFailed(RuntimeError, Celluloid3Error):
     """A conditional write lost the race (HTTP 412/409).
 
     This is the single primitive the whole coordination story rests on: the

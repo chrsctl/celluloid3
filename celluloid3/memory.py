@@ -59,7 +59,15 @@ from .space import (
     DEFAULT_COMPACTION_THRESHOLD, Cut, SharedState, Space,
 )
 
-CONFIG_VERSION = 1
+CONFIG_VERSION = 2
+DEFAULT_DIM = 256         # what the CLI has always given a fresh store
+
+# What a store records about the embedder that created it.  The library
+# attaches its built-in embedder by default, and a default that guesses wrong
+# is worse than the error it replaces: hash vectors scored against a real
+# model's vectors return hits that look fine and mean nothing.  So a store
+# says which kind it was written with, and only ``hashing`` opts in.
+HASHING, CUSTOM = "hashing", "custom"
 
 
 @dataclass(frozen=True)
@@ -84,14 +92,12 @@ def load_or_create_config(objects: ObjectStore, dim: int | None, bit_width: int,
     """
     blob = objects.get(CONFIG_KEY)
     if blob is not None:
-        config = json.loads(blob)
-        if dim is not None and int(dim) != config["dim"]:
-            raise ValueError(
-                f"store was created with dim={config['dim']}, got dim={dim}"
-            )
-        return config
+        return _read_config(blob, dim)
+    zero_config = embedder is None and dim is None
     if dim is None:
         dim = getattr(embedder, "dim", None)
+    if dim is None and zero_config:
+        dim = DEFAULT_DIM             # nothing asked for: the built-in, offline
     if dim is None:
         raise ValueError(
             "dim is required to create a new store "
@@ -102,13 +108,46 @@ def load_or_create_config(objects: ObjectStore, dim: int | None, bit_width: int,
         "dim": int(dim),
         "bit_width": int(bit_width),
         "rotation_seed": int(rotation_seed),
+        # ``type is``, not ``isinstance``: a subclass of the built-in is
+        # somebody else's embedder, and marking it hashing would let another
+        # process reopen the store with the plain built-in.
+        "embedder": (HASHING if zero_config or type(embedder) is HashingEmbedder
+                     else CUSTOM),
     }
     body = json.dumps(config, indent=2, sort_keys=True).encode()
     try:
         objects.put(CONFIG_KEY, body, if_none_match=True)
     except PreconditionFailed:
-        return json.loads(objects.get(CONFIG_KEY))
+        return _read_config(objects.get(CONFIG_KEY), dim)
     return config
+
+
+def _read_config(blob: bytes, dim: int | None) -> dict:
+    config = json.loads(blob)
+    if dim is not None and int(dim) != config["dim"]:
+        raise ValueError(
+            f"store was created with dim={config['dim']}, got dim={dim}"
+        )
+    # Written before stores recorded this: read as custom, the safe direction.
+    # No version check -- an old config opening unchanged is the whole
+    # compatibility story.
+    config.setdefault("embedder", CUSTOM)
+    return config
+
+
+def default_embedder(config: dict, store: str):
+    """The built-in embedder, when the store says it wrote its vectors.
+
+    Anything else raises rather than guess: a ``HashingEmbedder`` attached to
+    a store a real model wrote scores hash vectors against model vectors and
+    returns confident nonsense.
+    """
+    if config.get("embedder") != HASHING:
+        raise ValueError(
+            f"store {store} was created with a custom embedder; pass embedder= "
+            f"(or dim={config['dim']} if you pass vectors yourself)"
+        )
+    return HashingEmbedder(dim=config["dim"])
 
 
 class MemoryLayer:
@@ -153,9 +192,18 @@ class MemoryLayer:
                 "backend options only apply when opening a URI"
             )
         self.objects = open_object_store(uri, **backend_kwargs)
-        self.embedder = embedder
+        self._store = (str(uri) if isinstance(uri, (str, os.PathLike))
+                       else str(getattr(self.objects, "root", type(self.objects).__name__)))
         config = load_or_create_config(self.objects, dim, bit_width,
                                        rotation_seed, embedder)
+        # Zero config means the built-in offline embedder, the same one the
+        # CLI has always used -- but only where the store says its vectors
+        # came from it.  An explicit ``embedder=`` always wins, and an
+        # explicit ``dim=`` with no embedder still means "I bring my own
+        # vectors", so that path does not move.
+        if embedder is None and dim is None:
+            embedder = default_embedder(config, self._store)
+        self.embedder = embedder
         self.quantizer = TurboQuantizer(
             dim=config["dim"], bit_width=config["bit_width"],
             seed=config["rotation_seed"],
@@ -176,6 +224,15 @@ class MemoryLayer:
         # None disables automatic catch-up; refresh() is then explicit.
         self.refresh_every = refresh_every
         self._batching = 0
+
+    def __repr__(self) -> str:
+        """One line, no round trips, and no activation: printing a handle to
+        find out what it is must not claim a lane."""
+        where = (f"epoch={self.space.epoch} "
+                 f"fragments={len(self.space.state.fragments)} active"
+                 if self.space.active else "idle")
+        return (f"<MemoryLayer store={self._store!r} space={self.space.space!r} "
+                f"agent={self.agent!r} {where}>")
 
     # -- identity ---------------------------------------------------------
 
@@ -670,6 +727,10 @@ class MemoryPool:
         self._agents: dict[str, MemoryLayer] = {}
         self._lock = threading.RLock()
         self.evictions = 0
+
+    def __repr__(self) -> str:
+        return (f"<MemoryPool space={self.space!r} "
+                f"resident={len(self._agents)}/{self.max_resident}>")
 
     def agent(self, name: str) -> MemoryLayer:
         with self._lock:

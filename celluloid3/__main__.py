@@ -31,21 +31,27 @@ from .ownership import Fenced, Held
 
 
 def _open(args) -> MemoryLayer:
-    # The store's own config decides the embedding dimension, so look before
-    # opening: an existing store dictates it, a fresh one gets the CLI default.
+    # The store's own config decides the dimension AND whether the built-in
+    # embedder may be attached at all.  Attaching it to a store some real
+    # model wrote would score hash vectors against model vectors and print
+    # confident nonsense, so that is the library's rule now and this only
+    # supplies what the CLI has always meant: `init --dim N` on a fresh store
+    # means the built-in at that dimension.  Every other command asks for
+    # nothing and gets the same zero-config default a library caller gets --
+    # or, for a store written by a custom embedder, the ValueError main()
+    # turns into exit 1.
     objects = open_object_store(args.store)
-    existing = objects.get(CONFIG_KEY) is not None
-    dim = getattr(args, "dim", None) or (None if existing else 256)
-    mem = MemoryLayer(
+    dim = getattr(args, "dim", None)
+    fresh = objects.get(CONFIG_KEY) is None
+    return MemoryLayer(
         objects,
         space=args.space,
         agent=args.agent,
         dim=dim,
+        embedder=HashingEmbedder(dim=dim) if fresh and dim is not None else None,
         bit_width=getattr(args, "bit_width", 4),
         ttl=args.ttl,
     )
-    mem.embedder = HashingEmbedder(dim=mem.quantizer.dim)
-    return mem
 
 
 def _kv(pairs: list[str]) -> dict:
