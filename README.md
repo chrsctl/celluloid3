@@ -129,6 +129,7 @@ in the test suite, not estimated:
 |---|---|
 | `remember()` — durable on return | **1 PUT** (the segment) + **1 GET** (the acknowledgement gate) |
 | `with mem.batch():` — N memories | **1 PUT + 1 GET**, whatever N is |
+| `mem.remember_many([...])` — N memories | **1 PUT + 1 GET**, and **1 call to the embedder** |
 | N agents writing concurrently | **N PUTs**, in parallel, contending for nothing |
 | `refresh()` with nothing new | **1 LIST** |
 | `refresh()` with new work | 1 LIST + a single fan-out GET of only what is new |
@@ -210,6 +211,21 @@ over the gap, and a lane a live session holds is never taken: that raises
 
 That GET is per *commit*, not per write, which is what makes `batch()` nearly
 free. Trade it away with `ack_verify=False` for the PUT alone.
+
+`batch()` amortizes the bucket and only the bucket — the embedder is still
+called once per memory inside it. In production that is the expensive half:
+an embeddings API charges a round trip per text. `remember_many` amortizes
+that half too:
+
+```python
+mem.remember_many([line for line in transcript])   # 1 embedder call, 1 PUT
+```
+
+One call with the whole list when the embedder offers `embed_many(texts)`,
+one call per text when it does not — the protocol is that method name and
+nothing else, so a client already shaped like its API qualifies. The built-in
+`HashingEmbedder` has it. Ids come back in input order, and each memory is
+content-addressed exactly as `remember` does it.
 
 ### 5. Restore reads the newest complete chain
 

@@ -252,6 +252,41 @@ class MemoryLayer:
             raise ValueError("no embedder configured; pass embedding= explicitly")
         return np.asarray(self.embedder(text), dtype=np.float64)
 
+    def _embed_many(self, texts: list[str]) -> list[np.ndarray]:
+        """One call for the whole list where the embedder can take one.
+
+        The protocol is a method named ``embed_many``, nothing more: no base
+        class to inherit and no isinstance check, so any embeddings client
+        already shaped like its API qualifies.  Without it this is the same
+        serial loop as before -- correct, and as expensive as it always was.
+        """
+        if self.embedder is None:
+            raise ValueError("no embedder configured; pass embeddings= explicitly")
+        embed_many = getattr(self.embedder, "embed_many", None)
+        vectors = (list(embed_many(texts)) if embed_many is not None
+                   else [self.embedder(text) for text in texts])
+        if len(vectors) != len(texts):
+            raise ValueError(
+                f"embedder returned {len(vectors)} vectors for {len(texts)} texts")
+        return [np.asarray(vector, dtype=np.float64) for vector in vectors]
+
+    @staticmethod
+    def _per_text(value, count: int, name: str) -> list:
+        """One value for every memory, or one list as long as ``texts``."""
+        if value is None or isinstance(value, dict):
+            return [value] * count
+        if isinstance(value, (str, bytes)):
+            # Zipping a string's characters against the texts is never what
+            # the caller meant, and it only shows up when the lengths happen
+            # to match.
+            raise ValueError(f"{name} must be one value for every text, "
+                             f"or a list as long as texts")
+        value = list(value)
+        if len(value) != count:
+            raise ValueError(
+                f"{name} has {len(value)} entries for {count} texts")
+        return value
+
     def remember(self, text: str, metadata: dict | None = None,
                  embedding: np.ndarray | None = None, parents: tuple = ()) -> str:
         """Store one memory in this agent's lane.  Returns its id.
@@ -295,6 +330,54 @@ class MemoryLayer:
             self.space.stage(Record.put(fragment, self.quantizer.encode(embedding)))
             self._maybe_flush()
             return fragment.id
+
+    def remember_many(self, texts, metadata=None, embeddings=None,
+                      parents: tuple = ()) -> list[str]:
+        """Store many memories as one commit and one call to the embedder.
+
+        >>> mem.remember_many(["the deploy failed", "DATABASE_URL was unset"])
+
+        ``batch()`` amortizes the *bucket*: one PUT and one ownership read
+        however many memories go in.  This amortizes the *embedder*, which is
+        the other half of the write path and the expensive half in production
+        -- an embeddings API charged one round trip per text.  One call with
+        the whole list when the embedder offers ``embed_many``, N calls when
+        it does not.
+
+        Ids come back in input order.  Everything else is what ``remember``
+        does, per text: the same content-addressed id, the same rule that a
+        tombstoned id comes back as a new revision, and the same free repeat
+        -- a text already in this lane returns the id it already has.
+
+        ``metadata`` is one dict for every memory or a list as long as
+        ``texts``; ``embeddings`` skips the embedder for callers who have
+        vectors already.  A length mismatch raises ``ValueError`` before
+        anything is staged.
+        """
+        texts = list(texts)
+        metadatas = self._per_text(metadata, len(texts), "metadata")
+        vectors = None if embeddings is None else [
+            np.asarray(vector, dtype=np.float64)
+            for vector in self._per_text(list(embeddings), len(texts), "embeddings")
+        ]
+        if not texts:
+            return []
+        if vectors is None:
+            vectors = self._embed_many(texts)   # outside the lock: it can be slow
+        with self._lock:
+            # Group-commit like batch(), but without touching the commit
+            # policy: a durable layer gets one segment for the whole list, a
+            # deferred one stays deferred, and inside a caller's batch() this
+            # commits nothing of its own.
+            self._batching += 1
+            try:
+                ids = [self.remember(text, metadata=meta, embedding=vector,
+                                     parents=parents)
+                       for text, meta, vector in zip(texts, metadatas, vectors)]
+            finally:
+                self._batching -= 1
+            self._maybe_flush()
+            return ids
 
     def forget(self, fragment_id: str) -> bool:
         """Tombstone a memory for the whole space, whoever wrote it.
