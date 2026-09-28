@@ -1,13 +1,8 @@
+<!-- Claude Code loads THIS file; a harness reading AGENTS.md natively
+     resolves no imports and never sees this body. So instruction text put
+     here reaches one reader and misses the other — it goes in AGENTS.md,
+     always. Convention, not a gate: nothing checks this file's shape.
+     (.agents/docs/handover/README.md, How a session finds this without
+     being told.) -->
+
 @AGENTS.md
-
-## Handover
-
-One workstream file per work, `docs/handover/`, on work branch. Protocol:
-[`.agents/docs/handover/README.md`](.agents/docs/handover/README.md).
-
-- Hook prints state at session start. Names file for this branch? Read whole
-  file before touching code.
-- Update file in SAME commit as change. Before ending unfinished turn.
-- Push as soon as work has name. Unpushed = invisible to other sessions.
-- Push time not liveness. Overlap flagged? `/who`. Only `RUNNING` = taken.
-- `/handover` writes file. `/who` shows live sessions.
