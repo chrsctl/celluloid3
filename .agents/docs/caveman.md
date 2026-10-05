@@ -1,7 +1,10 @@
 # Caveman style guide
 
 Rules for all instruction files and agent replies in this repo. Distilled from
-[JuliusBrussee/caveman](https://github.com/JuliusBrussee/caveman) (MIT skill).
+[JuliusBrussee/caveman](https://github.com/JuliusBrussee/caveman): rules from
+`skills/caveman/SKILL.md`, motto from its `README.md`.
+MIT License, Copyright (c) 2026 Julius Brussee — full notice at the end of
+this file, so a copy of it carries the whole condition wherever it goes.
 Motto: why use many token when few do trick.
 
 ## Core
@@ -66,9 +69,108 @@ Yes: "Bug in auth middleware. Token expiry check use `<` not `<=`. Fix:"
   messages, issue / PR / review text, third-party messages. Upstream boundary
   rule; kept here.
 
+## What it costs, counted
+
+`./joharness.sh context` counts the tax the rule above describes: every file
+a session loads before its first prompt, walked from `CLAUDE.md` through its
+`@` imports, plus the `session-start` injection for the repo's mode. `ci`
+prints the same chain without the injection — measured 2026-09-06,
+`session-start` is 3.5s against a 14.7s `ci`, and a diff rarely moves it.
+
+Why it exists: nobody held the earlier number. Counted 2026-09-06 over
+`.agents/harness/AGENTS.md`'s own history on `origin/main`, 770 words on
+2026-08-23 and 2129 on 2026-09-06 — 2.8x in 14 days, in the file that opens
+by citing ETH AGENTbench for "long context file hurt agent, cost more".
+Growth arrives one honest rule at a time, and the session adding the rule is
+the one that cannot see the total.
+
+```bash
+git log --first-parent --format='%H %ad' --date=short origin/main \
+  -- .agents/harness/AGENTS.md | tac | while read -r h d; do
+  printf '%s %s\n' "$d" "$(git show "$h:.agents/harness/AGENTS.md" | wc -w)"
+done
+```
+
+So the line that matters is the branch delta: what THIS diff adds, paid once
+per session after it merges, forever. Read it and answer the question it
+asks — is the rule already stated somewhere a session reads on demand? A
+why-explanation under `.agents/docs/` costs nothing until someone opens it;
+the same sentence in `.agents/harness/AGENTS.md` is paid by every session in
+every mode at every tier.
+
+Reports, never gates. A ceiling on prose size fires on the honest rule
+addition and buys deleted rules — `scorecard` states the doctrine and
+`churn` is the precedent for earning a gate later, on a backtest.
+
+## Controlled vocabulary: built, not invented, and not adopted
+
+`.agents/docs/glossary.md` fixes contested terms; `ci` fails on the banned
+spellings (`joharness.sh:lint_glossary`). That mechanism is not this repo's
+invention, and knowing so is the point of this section — a session that thinks
+the harness invented it will either distrust it or rebuild it.
+
+Prior art, named and in production. Vale: entries in `accept.txt` are
+"automatically added to a substitution rule (`Vale.Terms`), ensuring that any
+occurrences of these words or phrases exactly match their corresponding entry
+in `accept.txt`" ([docs.vale.sh/keys/vocabularies](https://docs.vale.sh/keys/vocabularies)).
+`textlint-rule-terminology` does the same for tech writing, `textlint --fix
+--rule terminology`. Datadog lints its docs with Vale; Elastic publishes its
+house style AS a Vale ruleset ([elastic/vale-rules](https://github.com/elastic/vale-rules)).
+
+So the choice was adopt or build, and this repo **built**. Reason, kept
+because it is the part that decides whether to re-open: `ci` here is shell and
+shellcheck, and `.agents/scripts/sync-to-consumer.sh` ships `joharness.sh` to
+every consumer — so adopting puts a Go or Node runtime in all of them. One
+table parser paid once against a runtime paid forever. Re-open only if that
+trade changes, not because the mechanism looks home-made.
+
+**A term that means different things in two layers gets NO row.** That is
+settled in `.agents/docs/glossary.md`, "One meaning, or nothing", and the
+reason is mechanical: bans are substrings, so a zoned canonical
+(`retry (harness)`) contains the bare ban (`retry`) and could never be
+written. The table cannot express a zone split and must not fake one.
+Fowler's Bounded Context is the name for the underlying thing — contexts
+"each of which can have a unified model", and "Different contexts may have
+completely different models of common concepts with mechanisms to map between
+these polysemic concepts for integration"
+([martinfowler.com/bliki/BoundedContext.html](https://martinfowler.com/bliki/BoundedContext.html)).
+The glossary's answer to it is silence, not a zone label: the term is defined
+in the file owning the zone, and silence beats a wrong global answer.
+
 ## Honest numbers (upstream's own warning)
 
 Style compresses output and re-read input. It proves nothing about quality —
 compress only where every load-bearing fact survives. When compressed text
 loses a symptom, a number, or a negation, verbose wins. Upstream:
 [HONEST-NUMBERS.md](https://github.com/JuliusBrussee/caveman/blob/main/docs/HONEST-NUMBERS.md).
+
+## Upstream license
+
+This file is a derivative of the caveman skill. MIT names two things that
+travel with every copy — the copyright notice and the permission notice — so
+both are here rather than in a neighbouring file a copy would leave behind.
+
+    MIT License
+
+    Copyright (c) 2026 Julius Brussee
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+The harness's own grant is separate and unaffected: `.agents/LICENSE`, with
+`.agents/NOTICE` beside it.

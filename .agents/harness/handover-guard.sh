@@ -140,7 +140,7 @@ fi
 # --- unsupervised boundary -------------------------------------------------
 # Under JOHARNESS_MODE=unsupervised the harness layer is off limits: an
 # unattended session may not edit the protocol that governs unattended
-# sessions (docs/product/unsupervised-mode.md, Constraints).
+# sessions (.agents/docs/unsupervised.md, Bounds).
 #
 # Detection, not prevention, and the wording says so. A Stop hook runs
 # after the commit exists, so the honest thing it can do is name a boundary
@@ -156,9 +156,11 @@ if [ -x "${PROJECT_DIR}/joharness.sh" ]; then
 else
   mode="${JOHARNESS_MODE:-}"
 fi
-[ "$mode" = "unsupervised" ] || mode="supervised"
+# Two unattended values, one boundary: orchestrated is bound exactly as
+# unsupervised is (joharness.sh:unattended).
+case "$mode" in unsupervised | orchestrated) ;; *) mode="supervised" ;; esac
 
-if [ "$mode" = "unsupervised" ]; then
+if [ "$mode" != "supervised" ]; then
   # Count only, never a path: the reason string below embeds in JSON
   # without escaping, and a file name is repo-controlled input. A count is
   # digits, and digits cannot close a JSON string.
@@ -173,22 +175,169 @@ if [ "$mode" = "unsupervised" ]; then
   # is NOT, and gating the whole check on the base was a fail-open: an
   # unattended session on a shallow checkout got no boundary at all. A
   # partial answer beats silence for a fact whose whole job is to notice.
-  harness_touched="$(
-    {
-      [ -z "$base" ] ||
-        git diff --name-only "$base" HEAD -- .agents/harness 2>/dev/null
-      git diff --name-only HEAD -- .agents/harness 2>/dev/null
-      git diff --name-only --cached -- .agents/harness 2>/dev/null
-      # Untracked too. `git diff` cannot see a file that was never added,
-      # so a new harness file read as absent until the commit that the
-      # boundary exists to prevent.
-      git ls-files --others --exclude-standard -- .agents/harness 2>/dev/null
-    } | { grep -E '^\.agents/harness/' || :; } | sort -u | grep -c . || :
-  )"
+  # Every protocol tree, not one. The list lives in joharness.sh
+  # (protocol_paths) so the banner and this guard cannot disagree about
+  # where the boundary is — issue #114 is what one hardcoded prefix cost.
+  # A checkout without the entrypoint, or an older copy with no such
+  # function, falls back to the tree that has always been named: a partial
+  # boundary beats none, the same call the base-relative half makes below.
+  trees="$("${PROJECT_DIR}/joharness.sh" protocol-paths 2>/dev/null)"
+  [ -n "$trees" ] || trees=".agents/harness"
+
+  # An ARRAY, and every path passed to git whether or not it exists here.
+  #
+  # The first version of this filtered to paths present in the worktree,
+  # reasoning that a pathspec naming an absent directory makes git exit
+  # non-zero. It does not — `git diff --name-only HEAD -- absent/path` exits
+  # 0 — and the filter cost the exact scenario this boundary exists for:
+  # DELETING a protocol tree removes it from the worktree, so the filter
+  # dropped it and the guard went silent on "retire your own reviewer".
+  # Measured against origin/main's guard on the same branch: the old code
+  # reported the deletion, this code did not. A regression, not a gap.
+  #
+  # Unquoted word-splitting was the other half of that mistake: a path with
+  # a space split into two pathspecs matching nothing, and a path that is a
+  # glob matched whatever happened to be on disk. Both silent.
+  paths=()
+  while IFS= read -r t; do
+    [ -n "$t" ] && paths+=("$t")
+  done <<EOF
+$trees
+EOF
+
+  harness_touched=0
+  if [ "${#paths[@]}" -gt 0 ]; then
+    harness_touched="$(
+      {
+        [ -z "$base" ] ||
+          git diff --name-only "$base" HEAD -- "${paths[@]}" 2>/dev/null
+        git diff --name-only HEAD -- "${paths[@]}" 2>/dev/null
+        git diff --name-only --cached -- "${paths[@]}" 2>/dev/null
+        # Untracked too. `git diff` cannot see a file that was never added,
+        # so a new protocol file read as absent until the commit that the
+        # boundary exists to prevent.
+        git ls-files --others --exclude-standard -- "${paths[@]}" 2>/dev/null
+      } | sort -u | grep -c . || :
+    )"
+  fi
   if [ -n "$harness_touched" ] && [ "$harness_touched" -gt 0 ]; then
-    add_fact "unsupervised mode, but this branch touches ${harness_touched} file(s) under .agents/harness/ — revert them"
+    # Still a count, never a path. The reason string embeds in JSON without
+    # escaping and a file name is repo-controlled input; widening the
+    # boundary widens what that input could be, so this matters more now,
+    # not less. Digits cannot close a JSON string.
+    add_fact "${mode} mode, but this branch touches ${harness_touched} file(s) of protocol text (.agents/docs/unsupervised.md, Bounds) — revert them"
   fi
 fi
+
+# --- background work still running ------------------------------------------
+# The one fact here that is not about git, and the only mechanism in the
+# harness that can see this class at all.
+#
+# Measured 2026-09-05: a background shell ran 1h 17m in one session and
+# nothing noticed. The command was
+#
+#   until ! pgrep -f "bash .agents/harness/selftest.sh" >/dev/null; do sleep 3; done
+#
+# and it could never exit — `pgrep -f` matches full command lines, and the
+# loop's OWN shell command line carries that pattern, so it matched itself
+# forever while the suite it waited for had long finished. It was found by a
+# human reading the background-tasks panel.
+#
+# `ci` cannot catch that: the command was TYPED into a tool call and never
+# committed, so there is no file to lint. The other hooks read git, and git
+# holds no processes. What is left is this hook, which already fires at the
+# moment a session abandons whatever it started.
+#
+# The signal is descendants of the AGENT process, found by climbing this
+# guard's own parent chain. That is what the incident was: a command the tool
+# runs in the background stays a child of the agent for as long as it runs.
+#
+# It is a BOUND, not a census. A job detached from a shell that then exits —
+# `foo &` inside one tool call — reparents to PID 1 and no longer answers to
+# any session, so nothing here can attribute it and this fact never will. The
+# same mechanism is what keeps the count honest downward: an environment
+# daemon from `./joharness.sh setup` reparents the same way (measured here:
+# `dockerd` ppid 1, `containerd` its child), so a session that left nothing
+# attached counts zero rather than inheriting the container's furniture. The
+# rule in the Loop is the defence; this count is the backstop for the shape
+# that bit us, and the two are not the same size.
+#
+# COUNT, never a command line — the same rule as the boundary fact above and
+# for the same reason: the reason string embeds in JSON without escaping, and
+# a process command line is input this session does not control. Digits
+# cannot close a JSON string.
+#
+# Reports, never kills. Every fact in this file reports.
+bg_running=0
+if command -v ps >/dev/null 2>&1; then
+  # ONE process-table read and ONE awk, not a `ps` per ancestor. A `ps` per
+  # level of the tree is the per-item fork the perf budget exists to catch,
+  # and it caught it while this was being written; this shape costs 21
+  # against a budget of 33 (`./joharness.sh perf`, 2026-09-05). A single
+  # snapshot is also the more correct read — a table sampled per level races
+  # with a tree that is exiting underneath it.
+  #
+  # EVERY walk below carries a visited map. A process table is a tree while
+  # it is well formed, and a racing or forged one need not be: a climb that
+  # goes round a cycle is a script that cannot finish, which is the exact
+  # thing this fact exists to report. It must not be the thing it reports.
+  bg_running="$(ps -eo pid=,ppid=,comm= 2>/dev/null | awk -v self="$$" '
+    { pid = $1; parent[pid] = $2; comm[pid] = $3
+      kids[$2] = kids[$2] " " pid }
+    END {
+      # The agent, by climbing from this guard. Not found — run by hand, an
+      # unexpected tree, a cycle — means no claim can be made, so none is.
+      p = self
+      while (p != "" && p != "1" && p != "0" && !(p in climbed)) {
+        climbed[p] = 1
+        if (comm[p] ~ /claude/) { agent = p; break }
+        p = parent[p]
+      }
+      if (agent == "") { print 0; exit }
+
+      # What is running THIS hook is not leftover work, and that is more
+      # than one process: the guard may be reached through a shell chain,
+      # and it has a `ps` of its own. Exclude the subtree of the invocation
+      # ROOT — the ancestor that is the agent own child, which at a real
+      # stop is the guard itself. Excluding only self reported the invoking
+      # pipeline as abandoned background work.
+      root = self; c = self
+      while (c != "" && c != "1" && c != "0" && !(c in walked)) {
+        walked[c] = 1
+        if (parent[c] == agent) { root = c; break }
+        c = parent[c]
+      }
+
+      n = split(kids[root], q, " "); skip[root] = 1
+      for (i = 1; i <= n; i++) { queue[++tail] = q[i] }
+      while (head < tail) {
+        cur = queue[++head]
+        if (cur in skip) continue
+        skip[cur] = 1
+        m = split(kids[cur], r, " ")
+        for (i = 1; i <= m; i++) { queue[++tail] = r[i] }
+      }
+
+      n = split(kids[agent], q2, " ")
+      qh = 0; qt = 0
+      for (i = 1; i <= n; i++) { q3[++qt] = q2[i] }
+      while (qh < qt) {
+        cur = q3[++qh]
+        if (cur in skip || cur in counted) continue
+        counted[cur] = 1
+        count++
+        m = split(kids[cur], r2, " ")
+        for (i = 1; i <= m; i++) { q3[++qt] = r2[i] }
+      }
+      print count + 0
+    }')"
+  # Digits or nothing. Anything else means the read failed or was fed a
+  # table shaped to break it, and the value is one string concatenation away
+  # from the JSON `reason` field.
+  case "$bg_running" in '' | *[!0-9]*) bg_running=0 ;; esac
+fi
+[ "$bg_running" -eq 0 ] ||
+  add_fact "${bg_running} background process(es) this session started are still running — a command that cannot finish (a wait loop whose own line matches its own pattern) runs until the container is reclaimed. Check them, and kill what is stuck"
 
 [ -n "$facts" ] || exit 0
 

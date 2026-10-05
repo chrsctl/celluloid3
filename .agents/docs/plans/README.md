@@ -1,12 +1,17 @@
 # Plan queue
 
 Pre-scoped work agents execute without human in loop. One file per plan,
-under `docs/plans/`, on `main`. Loop step 2 (.agents/harness/AGENTS.md): open
+under `docs/plans/`, on `main` (same-session plan: on its work branch —
+Lifecycle). Loop step 2 (.agents/harness/AGENTS.md): open
 GitHub issues first, then unplanned requirements
 ([`docs/product/`](../product/README.md) — decompose before executing),
 then oldest actionable plan here. Issues = human asks and bugs; plans
 = scoped work with acceptance criteria, written once, executed by any
-session.
+session. Nothing builds unplanned: an issue or direct ask decomposes into
+a plan before code, same as a requirement — the plan is where a model gets
+matched to the work. One exception, same as workstream files: copy and
+sync tasks get no plan — diff self-describing
+(`.agents/docs/handover/README.md`, "When NOT to write one").
 
 Written for agents — literal readers. Background:
 [`.agents/docs/agent-selection.md`](../agent-selection.md). A plan says scope AND
@@ -14,7 +19,7 @@ out-of-scope explicitly; agent does what plan says, nothing else.
 
 Session-start hook prints the queue — urgent first, then oldest, each with
 its `agent`/`effort` — so a session (or a user starting one from a phone)
-picks entrypoint and model tier without opening files.
+picks entrypoint and agent tier without opening files.
 
 ## Shape
 
@@ -37,7 +42,9 @@ Frontmatter: `plan`, `urgency` (`normal` | `urgent`), `agent` (`haiku` |
 (the one this plan serves — [`docs/product/`](../product/README.md)),
 optional `scope` (path prefixes the plan will touch; the queue hook proves
 parallel safety inside a wave of disjoint scopes and names the conflict
-across waves — `needs` alone cannot say two plans edit the same file). Plans get matched to
+across waves — `needs` alone cannot say two plans edit the same file. A
+prefix both plans mark `shared:` names an expected reconcile instead of
+splitting the wave). Plans get matched to
 agents, not one agent to all plans; selection rules:
 [`.agents/docs/agent-selection.md`](../agent-selection.md). Implementing session
 may escalate tier or effort, never downgrade.
@@ -66,6 +73,80 @@ a module goes in a runner list. Write the file the plan REGISTERS itself in
 into `scope`, not only the files it creates. Undeclared, the hook does not
 miss the conflict — it asserts the opposite.
 
+Some files every plan touches. A repo whose plans all edit one test file or
+one index has no disjoint pair, so every wave holds one plan and the hook
+advises serialising work that runs fine in parallel. Measured in a consumer
+at `c79dc82`, one working day (2026-08-24): four sessions
+for 12.5 hours, one 8,131-line test file named by 4 of 5 queued plans, and 2
+of 24 merged pull requests needing a reconcile. A cost, not an impossibility
+— recount it there, not here; this repo is not that queue. Mark such a path
+`shared:` inside `scope`:
+
+```yaml
+scope: src/parser.py, shared:tests/test_all.py
+```
+
+A protocol path in `scope:` — `shared:` or not — marks the plan `SUPERVISED
+ONLY` under unsupervised and ranks it out of the free list. Declare it
+anyway. Hiding the path does not make the plan unattended-doable:
+`.agents/harness/handover-guard.sh` blocks the stop on the diff, so the fleet
+spends a session reaching a hand-off (attempt two, 55 minutes) instead of
+skipping the plan. Honest declaration costs the fleet a plan it could never
+finish; the omission costs it a run.
+
+`shared:` means "a reconcile merge is expected here", so the path stops
+splitting waves and the hook names it on the wave line instead. Everything
+unmarked keeps its meaning exactly: an undeclared or unmarked overlap still
+splits, and still says which plan it collided with. Mark only a path where a
+reconcile is genuinely routine — a wave that claims a parallel safety it does
+not have is worse than one that claims none.
+
+A registry left unmarked does not just cost this plan a wave — under
+orchestrated mode it can stall the whole fleet: every plan appends to the
+same criteria index or ADR directory, so one branch in flight holds all the
+rest, and `dispatch` reads slots free with nothing to spawn. That mode has a
+repair for it — an `OVERLAP-BOUND` verdict spawns a surveyor that
+marks the registries `shared:` and narrows bare-directory claims across the
+held plans (`.agents/docs/orchestrated.md`, Concurrency). Declaring the
+registry `shared:` in the first place is what spares the fleet that pass, so
+name a bare directory (`docs/adr`) as the specific file you touch and mark a
+true registry `shared:` when you write the plan.
+
+A plan's declarations rot the way its anchors do, and a role checks them on a
+cadence in EVERY mode — `drain` names it, so `/start` reaches it: `./joharness.sh curate` reports whether each
+plan's `scope:` still covers what its `## Scope` section names, whether it
+claims a whole directory it should narrow, and whether a path enough plans
+declare is a registry nobody marked `shared:`. A curator REPAIRS those and
+deletes a plan whose work it can find in merged history; it only PROPOSES a
+decomposition or an ordering, and it never touches `urgency:` or a plan a
+manager holds (`.agents/docs/orchestrated.md`, Roles). None of that moves the
+duty: the author owns getting a plan right, and a curator is the backstop that
+says so out loud rather than a reason to declare less carefully.
+
+## Does this plan reach consumers
+
+`ci`'s ship-scope stage reads a plan's `scope:` and says whether the work
+lands in every consumer at its next sync, or stays in this repo. It matches
+each path against the sync engine's own lists
+(`.agents/scripts/sync-to-consumer.sh`) rather than a list of its own — a
+second copy of that boundary would disagree with the first the day a path
+moves between `DIRS` and `CANONICAL_ONLY`.
+
+Derived, not declared. No `ships:` field, for the reason there is no
+`status:` field either (Lifecycle below): a field is only as fresh as the
+last hurried session, and `scope` is already read by the queue hook and
+already rots visibly in review.
+
+SHIPS changes what Acceptance owes: name a check a consumer runs, not only a
+local one. A bar met only here is met in the one repo that was never the
+risk. The stage reports and never reds — `scope` is only as true as it is
+complete, so a gate built on it fires on the honest plan whose author forgot
+a path.
+
+Canonical-only in a consumer: it carries no sync engine and its plans ship
+nowhere, so the stage has nothing to say and says nothing. Whole queue at
+once, rather than the plans this branch touches: `JOHARNESS_SHIP=all`.
+
 ## Lifecycle
 
 - **Claim** = normal Loop claim: cut branch, workstream file under
@@ -78,9 +159,29 @@ miss the conflict — it asserts the opposite.
 - **Done** = implementing PR deletes plan file, same PR as code. Plan
   survives in history like workstream files do. PR = edge to main:
   in-depth review first (Loop step 5), every time.
+- **Same-session plan** = plan for an issue or direct ask the writing
+  session executes itself. Lives on the work branch, never `main`; deleted
+  in the same PR as the code, beside the workstream file. Lands on `main`
+  only when handed off instead — a PR adding only the plan puts it in the
+  queue. Same shape either way: the `agent`/`effort` match is the point,
+  not the queue position.
+- **Spawning in parallel** = the CALLER names each session's plan in its
+  prompt. Queue self-selection is for ONE session: a claim exists only after
+  the spawned session's first push (Loop step 3, "no push, no claim"), so
+  two sessions started against the same queue can both pick the top plan and
+  neither can see the other. Nothing here can fix that — every measure in
+  this harness counts from git at read time and stores nothing, so a
+  pre-push claim would need shared state the harness does not have. The
+  spawned session is behaving correctly when it self-selects; the caller is
+  the one who must not tell two of them to.
+- **Unsupervised** drains this queue and exits at its edge. Work enters
+  the queue the same three ways in every mode — an issue, a requirement, a
+  plan through a pull request — and no session in any mode writes a plan
+  from a detector. An unattended session at the edge prints DRAINED and
+  exits; the heartbeat fires the next one (`.agents/docs/unsupervised.md`).
 - **Stale plan** (code moved under it): fix plan in place on `main` via
   small PR, or delete if obsolete. Every claim in a plan = hypothesis until
-  checked against code — same staleness rule as handover files.
+  checked against code — same staleness rule as workstream files.
 
 ## Why files, not issues
 
