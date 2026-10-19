@@ -1,8 +1,8 @@
 ---
-description: Write or update this branch's handover file so the next session can pick up
+description: Write or update this branch's workstream file so the next session can pick up
 ---
 
-Update handover file for this session's work. Protocol:
+Update workstream file for this session's work. Protocol:
 `.agents/docs/handover/README.md`. Inline — no subagent.
 
 1. Find this branch's file under `docs/handover/`. None + real work done?
@@ -14,8 +14,9 @@ Update handover file for this session's work. Protocol:
    instruction to next session.
 3. Add learnings to **Decisions**, **Rejected**, **Blockers**, **Review**.
    Rejected = highest value: what tried, what exactly broke. Review = one
-   line per finding, written BEFORE its fix, marked (fixed) / (open) /
-   (wontfix + why) — `.agents/docs/handover/README.md`, Reviewing.
+   line per finding, written BEFORE its fix, as
+   `- rN: text (fixed|wontfix: why|no change)` — `ci` checks the form
+   (`.agents/docs/handover/README.md`, Reviewing).
 4. Session proved something wrong? Fix it. Dead entries: delete, not annotate.
 5. Leave out what git/GitHub already knows — diffs, counts, CI state. Claim
    goes stale after next push? Does not belong.

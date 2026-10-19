@@ -1,146 +1,105 @@
 # Harness
 
-Caveman file. Short on purpose — ETH AGENTbench (138 repos): long context file
-hurt agent, cost more. Keep only what code cannot tell you. Why-explanations
-live in `.agents/docs/` — read there before fighting a rule.
-
-House style for instructions and replies:
-[`.agents/docs/caveman.md`](../../.agents/docs/caveman.md). Write new instruction text in it; never
-let style eat a fact.
-
-Environment rules are not here. Entrypoint injects them at session start from
-the selected layer — as a read-first pointer by default, whole when md=eager
-([`.agents/env/README.md`](../env/README.md)).
+Caveman file: every line loads into every session, so rules only. Why lives in
+`.agents/docs/`, measured past in `.agents/docs/history/` — read there before
+fighting a rule. Style:
+[`.agents/docs/caveman.md`](../../.agents/docs/caveman.md). Contested terms
+have ONE spelling: [`.agents/docs/glossary.md`](../../.agents/docs/glossary.md);
+`ci` fails on the others. Docs state status quo: current rule, mechanism,
+number. Past (incidents, dates, superseded designs, rejected paths) = git
+log, not markdown ([`caveman.md`](../../.agents/docs/caveman.md), Status quo).
 
 ## Loop
 
-1. **Orient.** Hook prints handover state before first prompt. Hook names
-   workstream file for this branch? That is your job. Read whole file. Go to 4.
-2. **Pick.** Queue = open GitHub issues, then unplanned requirements
-   `docs/product/*.md` (decompose into plans = the work), then plan files
-   `docs/plans/*.md` (shape + claim rules: `.agents/docs/plans/README.md`). Hook
-   prints queue + wanted agent tier at session start. Oldest actionable
-   first, urgent first if marked. No issue, no requirement, no plan: ask
-   human. Not invent work. ONE exception, `JOHARNESS_MODE=unsupervised`
-   (session start says so): edge = generate work, never ask. Boundary holds
-   — no commit under `.agents/harness/`
-   ([`docs/product/unsupervised-mode.md`](../../docs/product/unsupervised-mode.md)).
-3. **Claim.** Cut branch from `main` (branch flow:
-   `.agents/docs/product/README.md`). Write `docs/handover/<workstream>.md`. Push
-   NOW — no push, no claim. Hook shows overlap? `/who`. Only `RUNNING`
-   session means branch taken.
-4. **Build.** Long-running? Re-check `git fetch origin main` ahead/behind
-   periodically — another PR merging mid-build is cheap to catch now, one
-   hit at step 7 after hours of work is not (`.agents/docs/product/README.md`
-   Branch flow).
-5. **Verify.** All green or not done. `./joharness.sh ci` runs exactly what
-   GitHub CI runs — run it here, before the pull request, not after.
-   `./joharness.sh verify` proves the selected environment. Trust counted
-   numbers, never written numbers — including numbers in any instruction file.
-   Edge to main = review, always; depth scales with the plan's tier
-   (`.agents/docs/agent-selection.md`, review depth): haiku one pass, sonnet
-   `/code-review` (high) on the full diff, opus adversarial with separate
-   lenses. Findings land in the workstream file's `## Review`, one line
-   each, BEFORE the fix and in the same commit as it. Fix them or record
-   why not — never drop silent. `./joharness.sh review` prints depth for
-   this branch and whether record exists; `JOHARNESS_REVIEW=on` in
-   `joharness.conf` makes `ci` fail at the edge (PR open, or status
-   review/done) without one — off by default, quiet mid-build. Clean pass
-   records one line saying clean — empty section not clean pass.
-   `review` names files in this diff that already cost other branches;
-   `./joharness.sh feedback <path>` prints what they found. File keeps
-   drawing findings = rule nobody wrote yet: graduate it
-   (`.agents/docs/feedback.md`).
-   Fix undoes earlier round's fix? Review churn: stop patching, research
-   step at raised tier or effort first (`.agents/docs/agent-selection.md`, review
-   churn rule). NEVER skip, disable, or quarantine a test to get green.
-   NEVER kick CI: no empty commit, no close-reopen.
-6. **Hand over.** Update workstream file in SAME commit as code. Before ending
-   any unfinished turn, not only at session end. `/handover` writes it.
-7. **Finish.** PR, merge to `main` — every step merges, no long-lived
-   integration branch. Session merges its OWN pull request itself, no
-   waiting on human (ratified 2026-08-23). Own = opened by this session,
-   or the human handed it to this session to drive; never any other PR.
-   Merge when ALL hold: GitHub checks green on head; branch 0 behind
-   fresh-fetched `origin/main` (behind = "Conflict at finish" reconcile
-   first — checks do NOT re-run when `main` moves); `./joharness.sh
-   verify` green when the diff touches any non-`*.md` file under
-   `joharness.sh`, `.agents/harness/`, `.agents/env/`, `scripts/` — CI cannot run it
-   (needs the sandbox); **`./joharness.sh finish` green** — the only guard
-   here that fires while the fix is still a commit; edge review recorded
-   (step 5); no unresolved human review thread. Anything less stays open. Merge-commit
-   method ONLY — squash/rebase merge breaks the merged-branch ancestry
-   filter (`.agents/docs/product/README.md` Branch flow). Human veto = revert.
-   Branch conflicts with `main` (another PR merged
-   first)? Reconcile, do not force through — `.agents/docs/product/README.md`
-   Branch flow, "Conflict at finish". Merged branch left standing =
-   cosmetic, ignore: hook filters merged branches from claims view.
-   Deleting the BRANCH = optional hygiene, human-only (mechanics:
-   `.agents/docs/product/README.md` Branch flow). Session NEVER
-   `git push --delete`.
-   Deleting the FILES is not optional and is yours: PR's final state
-   deletes workstream file + done plan file (+ requirement file when last
-   plan). Still-useful bits go to the right layer's `AGENTS.md` or `docs/`
-   first. Skip it and the base branch accretes finished workstreams that
-   later sessions read as current — measured at 23 in one consumer repo,
-   thirteen merges adding six and removing none, because "optional,
-   human-only" one sentence up reads as covering this one too.
-   Do it as the LAST COMMIT BEFORE the pull request opens, never after the
-   merge. `./joharness.sh finish` says what merging now would leave and is red
-   when that is anything; every other guard fires after the merge and bills
-   the next session. Measured, one session, eight pull requests: the three
-   that deferred the deletion each turned the base branch red within seconds,
-   and the two that did not were the two that retired first.
-   `./joharness.sh cleanup` counts what earlier merges left; `--apply`
-   stages the workstream-file deletions. Branches it only counts.
-   `ci` now GATES this, not only `finish`: a branch whose own workstream
-   file would land on the base branch is reported at the edge and RED once
-   the file says `status: done`. Two strengths because one would fight the
-   review gate, which needs that file present while the review happens —
-   `fin_strength` carries the reasoning. Another session's inherited file
-   is reported and never red; that is `cleanup`'s business, and a gate
-   that fails for somebody else's omission is one sessions route around.
+1. **Orient.** Hook prints handover state. Names a workstream file for this
+   branch? That is your job: read it whole, go to 4. Compacted? Re-read THIS
+   file and your role command, not only the workstream file. Before saying
+   what is done, read the branch's merged pull requests.
+2. **Pick.** Finishing outranks starting: edge work in flight (`pr:` set, or
+   `status:` review/done), oldest first; LIVE on another session (`/who`) =
+   not yours. Then open GitHub issues (through `/clerk` into plans), then
+   `docs/product/*.md`, then `docs/plans/*.md` and `docs/research/*.md`.
+   `dispatch` names stale claims? Prove each session gone (ARCHIVED or not
+   found), then `./joharness.sh janitor --apply <branch>...`.
+   `curate : DUE`? `/curate` first. Plan naming an open `research:` is blocked.
+   NOTHING builds unplanned — decompose into a plan first
+   (`.agents/docs/plans/README.md`); copy or sync task is the one exception.
+   Plan's `agent` tier binds: below it, record wanted tier, push, hand off
+   (`.agents/docs/agent-selection.md`). Orchestrator reads `./joharness.sh
+   dispatch` and spawns (`/orchestrate`); manager works the ONE item its
+   prompt names (`/manage`); otherwise `/start`. Nothing left: exit, say
+   DRAINED, invent nothing. Boundary:
+   no commit to a core path (`./joharness.sh protocol-paths`).
+3. **Claim.** Branch from fresh-fetched `origin/main` (`git fetch origin main && git
+   checkout -b <branch> origin/main`), never local `main`. Pushed branch =
+   shared: behind or wrong base = merge `origin/main` in; never `push -f`/`--force`
+   (`--force-with-lease` only in orchestrate GUARD, janitor), never
+   `checkout -B` over it. Write `docs/handover/<workstream>.md`. Push
+   NOW — no push, no claim. Overlap? `/who`; only `RUNNING` = taken.
+4. **Build.** Research first: every plan or issue claim is a hypothesis until
+   checked against code. `./joharness.sh feedback <path>` on files you will
+   touch. Design question open? Settle it, record it, THEN code. Does a
+   branch own a file? Diff against merge base, never read the tree.
+   Consumer product work opens no non-`.md` file under `joharness.sh`,
+   `.agents/harness/`, `.agents/scripts/`, `.agents/env/`: read `.md` docs and
+   command output. Anchor points there = anchor wrong. Exempt: canonical,
+   sync or upgrade task, verifier.
+5. **Verify.** All green or not done: `./joharness.sh ci` and
+   `./joharness.sh verify`, before the pull request. Trust counted numbers,
+   never written ones. Edge review always, depth by plan tier, plus
+   `.claude/agents/verifier.md` at the branch's tier — tag its findings
+   `(verifier)`. Findings go in the workstream file's `## Review` as
+   `- rN: text (fixed|wontfix: why|no change)`, same commit as the fix; clean
+   pass = one line saying so. `./joharness.sh review` prints depth and
+   record state. Fix undoes an earlier fix? Stop patching; research step at
+   raised tier (`.agents/docs/agent-selection.md`, review churn). Test for a
+   fix must FAIL without it. Tree holds still while your verifier lives
+   (`.agents/docs/subagents.md`). Measured number names the command and when.
+   NEVER skip, disable or quarantine a test to get green. NEVER kick CI.
+   Background command must be able to finish (bound it); never `pgrep -f`
+   a pattern your own command line carries.
+6. **Hand over.** Workstream file updated in SAME commit as code, before
+   ending any unfinished turn. `/handover` writes it.
+7. **Finish.** PR, merge to `main` yourself — own PR only (opened by this
+   session, or handed to it). Merge when ALL hold:
+   - GitHub checks green on head (`JOHARNESS_CHECKS=local`: `finish` runs
+     `ci` + `verify` instead; every other workflow step then counts for
+     nothing — `.agents/docs/consumer-repos.md`, "Local checks");
+   - branch 0 behind fresh-fetched `origin/main` — behind = reconcile first
+     (`.agents/docs/product/README.md`, "Conflict at finish");
+   - `./joharness.sh verify` green when the diff touches non-`*.md` files
+     under `joharness.sh`, `.agents/harness/`, `.agents/env/`,
+     `.agents/scripts/` — unless this head's checks verified the selected
+     layer (read the run; a skipped layer proves nothing);
+   - `./joharness.sh finish` green;
+   - edge review recorded; no unresolved human review thread;
+   - PR lacks label `human-review` (read labels at merge time).
 
-## Harness upkeep
-
-Consumer repo: harness upkeep does NOT run in a session holding product
-work. Context belongs to the claimed plan. Sync goes to `update.yml`
-(weekly cron, `workflow_dispatch` for now), else a subagent where the
-runtime offers one — it clones, syncs and pushes, only its summary returns
-— else a session of its own. The session mid-plan reviews the resulting
-pull request and nothing more.
-Routes, preference order:
-[`.agents/docs/consumer-repos.md`](../../.agents/docs/consumer-repos.md).
-
-Canonical repo (`JOHARNESS_CANONICAL=1` in `joharness.conf`): rule does not
-apply. Harness IS the product here — upkeep is the work, and `upgrade`
-refuses to run anyway.
+   Merge-commit method only. Human veto = revert. PR body carries the
+   command that recovers its workstream file. LAST commit before the PR
+   opens deletes the workstream file and done plan file (+ requirement file
+   when last plan); keepers go to `AGENTS.md` or `docs/` first. Never delete
+   branches (`git push --delete` is human-only). Merge button not yours?
+   Retire and record review BEFORE asking the human. Infrastructure state
+   is re-checked every time, never inherited. One item per session.
 
 ## Decide alone
 
 - Implementation yours. Interface signatures not yours.
 - Scope change too big to ratify alone? Decide, write down, flag for human.
   Do not stop.
-- Stop and ask ONLY for: money, credentials, hardware, product direction,
-  merge conflict into `main` that does not resolve clean.
-
-## Agent selection
-
-Plans get matched to agents: each plan's frontmatter names `agent` tier
-(`haiku` | `sonnet` | `opus`) and `effort`. Implementing session may
-escalate tier or effort, never downgrade. Write plans for literal reader:
-scope AND out-of-scope explicit. Lineup + selection rules:
-`.agents/docs/agent-selection.md`.
+- Block ONLY for money, credentials, hardware, product direction, or a
+  merge conflict into `main` that does not resolve clean. Block =
+  `status: blocked`, `next:` = `<reason>: <question>`, push, exit. Never wait in
+  session. Block also labels `human-review` on this branch's open PR and the
+  plan's `issue:`, if set; never remove it (`.agents/docs/orchestrated.md`, Bounds).
+- Consumer repo: no harness upkeep in a session holding product work; a sync
+  opens its own pull request (`.agents/docs/consumer-repos.md`).
 
 ## Handover
 
-- One file per workstream under `docs/handover/`, lives on work branch.
-  Shape: `.agents/docs/handover/TEMPLATE.md`.
-- Write only what git cannot tell next session: goal, decisions, rejected
-  paths, blockers, next step. Git knows rest.
-- Same commit as code. Push early — unpushed work invisible to other sessions.
-- Push time not liveness. Wrong both directions. `/who` = truth.
-- Copy or sync task (initial harness copy, sync from joharness): NO
-  workstream file. Diff self-describing. See protocol "When NOT to write
-  one". How to run one: `.agents/docs/consumer-repos.md`.
-- Full protocol + why: [`.agents/docs/handover/README.md`](../../.agents/docs/handover/README.md).
+- Shape: `.agents/docs/handover/TEMPLATE.md`; protocol:
+  `.agents/docs/handover/README.md`.
+- Write only what git cannot tell: goal, decisions, rejected paths,
+  blockers, next step.
+- Copy or sync task: no workstream file.

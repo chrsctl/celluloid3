@@ -2,95 +2,71 @@
 #
 # joharness.sh - the harness entrypoint.
 #
-# Two layers live side by side under .agents/ — one dotted directory any
-# tool can detect, and every path below is relative to it:
-#   .agents/harness/      agent working protocol (loop, handover, style).
-#                         Always on.
-#   .agents/env/<name>/   one sandbox environment. Selected here, not
-#                         hardcoded.
+# Two layers under .agents/:
+#   .agents/harness/      agent working protocol. Always on.
+#   .agents/env/<name>/   one sandbox environment, selected in joharness.conf.
 #
 # Subcommands:
 #   session-start   what the SessionStart hook runs (.claude/settings.json)
-#   env             print the selected layer and what else is available
-#   env <name>      select a layer (writes joharness.conf)
+#   env [<name>]    print the selected layer, or select one (writes joharness.conf)
 #   setup           provision the selected layer now
-#   ci              run what .github/workflows/ci.yml runs, here
 #   upgrade         fetch canonical and sync this repo's harness forward
-#                   (consumers only; --dry-run to preview)
 #   verify          provision, then run the layer's smoke test
-#   review          print this branch's review step: depth for its tier, and
-#                   whether its findings are recorded. Gates ci when enabled
-#   feedback        score the review loop from merged history: coverage,
-#                   recurrence, and the files that keep drawing findings
-#   feedback <path> what earlier merged edges found in that file
-#   graph           print the work graph as fenced mermaid (paste into any
-#                   GitHub comment; rendered natively)
-#   cleanup         count what the finish ritual left on the base branch:
-#                   workstream files, plans whose work merged, merged
-#                   branches. Reports only
-#   cleanup --apply also `git rm` the workstream files, staged for review.
-#                   Never branches — deleting one is human-only
-#   finish          Loop step 7 gate: what merging this branch NOW would
-#                   leave on the base branch. Red when the merge would add a
-#                   workstream file. Run it before the merge, not after
-#   mode            print the resolved autonomy mode and exit
-#   mode <value>    set it for THIS checkout only: 'supervised',
-#                   'unsupervised', or 'default' to clear. Writes the
-#                   untracked .joharness-mode marker; $JOHARNESS_MODE
-#                   still wins over it
+#   ci [-v]         run what .github/workflows/ci.yml runs, here. Prints failing
+#                   checks and one verdict line; -v (or JOHARNESS_VERBOSE=1)
+#                   prints every check
+#   review          this branch's review depth and whether findings are recorded
+#   feedback [<path>]
+#                   score the review loop from merged history, or what earlier
+#                   merged edges found in one file
+#   finish [-v]     Loop step 7 gate: what merging this branch NOW would leave
+#                   on the base branch. With JOHARNESS_CHECKS=local it also runs
+#                   `ci` (and `verify` when needed) itself
+#   dispatch        the orchestrator's one read: cap, managers in flight, spawn
+#                   order, verdict. Report-only
+#   janitor [--apply <branch>...]
+#                   stale claims whose session may be gone; --apply releases
+#                   the named ones (session proven gone) on their own branch
+#   free <branch>   merge a doc-only branch whose author is gone into this
+#                   claimed branch: drops its workstream files and done plans,
+#                   curate --apply, ci, commit. Never pushes
+#   guard janitor|kill|loop <branch> [--expect <sha>]
+#                   re-read live state right before a harness push onto a
+#                   branch the session does not own. Report-only; non-zero =
+#                   refused, do not push
+#   curate [--apply]
+#                   is the plan queue still fit; --apply makes the mechanical
+#                   repairs
+#   scout           whether a scout may run, which is in flight. Report-only
+#   clerk           whether a clerk is due, issues already planned or claimed
+#   conduct         whether a conduct reviewer is due, its sample, the ledger
+#                   tally. Report-only
+#   role <clerk|scout|curate|conduct> [--session <url>] [--agent <tier>] [--twin|--retire]
+#                   the role's prelude: authority, fetch, report, branch,
+#                   claim; last line GO <branch> or STOP: <reason>
+#   cleanup [--apply]
+#                   what merges left on the base branch; --apply stages the
+#                   workstream-file deletions (never branches)
+#   upstream [<branch>]
+#                   what a merged edge found ABOUT THE HARNESS (report-only;
+#                   /upstream-report files it, by hand)
+#   analysis [<branch> [<claim>]]
+#                   why a manager is parked: its mark, and whether the conf
+#                   moved under the cause it stated. Report-only
+#   authority       whether this checkout's rules match origin/<base>
+#   conf            every knob the script reads, its live value and where the
+#                   value came from. Report-only
+#   start           which command file a session without a role follows
 #   help            this text
 #
-# Selection lives in joharness.conf and is overridden by $JOHARNESS_ENV:
-#   JOHARNESS_ENV=k8s          layer under .agents/env/ ('none' = no
-#                              environment)
-#   JOHARNESS_ENV_SETUP=lazy   'lazy' (provision on demand) or 'eager'
-#                              (provision at session start)
-#   JOHARNESS_ENV_MD=lazy      'lazy' (inject a read-before-touching pointer
-#                              to the layer's AGENTS.md) or 'eager' (inject
-#                              the file whole)
-#   JOHARNESS_MODE=supervised  'supervised' (default) or 'unsupervised'.
-#                              Anything else reads as supervised
-#                              (docs/product/unsupervised-mode.md)
-#   JOHARNESS_REVIEW=off       'off' (default) or 'on'. 'on' makes `ci` fail
-#                              when a workstream reaches the edge (pull
-#                              request open, or status review/done) with no
-#                              review recorded, and session-start say so
-#
-# Default is env 'none', setup 'lazy', md 'lazy', review 'off': a session that
-# never asks for an environment never pays for one — not in provisioning, not
-# in context — and a repo that has not opted into the review gate sees nothing
-# of it.
+# Keys (joharness.conf, overridden by the environment of the same name): the
+# KNOBS table below holds every one the script reads, with its default, scope
+# and meaning; `conf` prints them with their live values.
 
 set -uo pipefail
 
 ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 CONF="${JOHARNESS_CONF:-${ROOT}/joharness.conf}"
-# Session-local autonomy override, kept inside the git directory. Git
-# tracks nothing in there, so the marker cannot reach a commit however
-# hard a hurried session tries — and it does not survive a clone, so
-# "session-local" holds for a fresh container too.
-#
-# The obvious spelling, ${ROOT}/.joharness-mode plus a .gitignore line,
-# looks equivalent and is not: .gitignore is consumer-own and never
-# synced (.agents/scripts/sync-to-consumer.sh), so every consumer would
-# get this toggle WITHOUT the ignore rule, and a temporary opt-in one
-# `git add -A` from becoming that repo's permanent setting. The git dir
-# needs no cooperation from a file the sync does not ship.
-#
-# Fallback for a checkout that is not a git repo at all — the selftest
-# builds those, and the .gitignore entry covers that path.
-mode_file_default() {
-  local gd
-  if gd="$(git -C "$ROOT" rev-parse --git-dir 2>/dev/null)" && [ -n "$gd" ]; then
-    case "$gd" in
-      /*) printf '%s/joharness-mode' "$gd" ;;
-      *)  printf '%s/%s/joharness-mode' "$ROOT" "$gd" ;;
-    esac
-  else
-    printf '%s/.joharness-mode' "$ROOT"
-  fi
-}
-MODE_FILE="${JOHARNESS_MODE_FILE:-$(mode_file_default)}"
 # Both layers hang off one detectable root. Nothing outside .agents/ is a
 # layer, and no layer path is spelled anywhere but here.
 AGENTS_ROOT="${ROOT}/.agents"
@@ -101,9 +77,7 @@ log()  { printf '[joharness] %s\n' "$*" >&2; }
 warn() { printf '[joharness] WARNING: %s\n' "$*" >&2; }
 die()  { printf '[joharness] ERROR: %s\n' "$*" >&2; exit 1; }
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
+# --- Configuration
 
 # Last assignment of KEY in the conf file. Inline comments and surrounding
 # whitespace are ignored; values are single tokens.
@@ -111,6 +85,69 @@ conf_get() {
   [ -r "$CONF" ] || return 0
   sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*\([^#[:space:]]*\).*/\1/p" \
     "$CONF" | tail -1
+}
+
+# --- Knobs
+
+# Every key the script reads, declared once: KEY|default|scope|meaning.
+# default is the static default, or `computed` (JOHARNESS_CHURN_LIMIT: twice
+# the threshold; JOHARNESS_CONF: a path under the checkout). num_knob reads
+# the static default from here when its caller passes none. scope:
+#   conf       a consumer's conf line answers it (also in conf-keys.sh)
+#   base-conf  as conf, but the conf layer is origin/<base>:joharness.conf
+#   dispatch   a number the orchestrated.md table documents
+#   session    env for one command, or the canonical checkout
+# `conf` prints these; the selftest knobs-declared.sh keeps them in agreement
+# with conf-keys.sh and the table. No `|` inside a meaning.
+# KNOBS-BEGIN
+KNOBS='JOHARNESS_ENV|none|conf|Directory under .agents/env/ this repo provisions; none = harness only.
+JOHARNESS_ENV_SETUP|lazy|conf|lazy = provision on demand; eager = at session start.
+JOHARNESS_ENV_MD|lazy|conf|lazy = inject a pointer to the layer rules; eager = the file whole.
+JOHARNESS_REVIEW|off|conf|off = review reports only; on = ci gates the record at the edge.
+JOHARNESS_CHECKS|github|conf|github = step 7 waits for GitHub checks; local = finish runs ci and verify here.
+JOHARNESS_MAX_MANAGERS|4|dispatch|Managers in flight at once; 0 pauses spawning.
+JOHARNESS_STALL_MINUTES|45|dispatch|No push this long = cross-check, nudge.
+JOHARNESS_HEALTH_MINUTES|10|dispatch|One orchestrator pass every this many minutes.
+JOHARNESS_RESPAWN_LIMIT|2|dispatch|Respawns per item per orchestrator run.
+JOHARNESS_ORCHESTRATOR_PASSES|6|dispatch|Orchestrator passes a session makes before it hands off at its context ceiling.
+JOHARNESS_MANAGER_HOURS|4|dispatch|Claim older than this with no pull request = CEILING? report; 0 lifts it.
+JOHARNESS_CHURN_THRESHOLD|5|dispatch|One file rewritten this often = warning.
+JOHARNESS_CHURN_LIMIT|computed|dispatch|One file rewritten this often = LOOP? and ci red; default twice the threshold; 0 lifts it.
+JOHARNESS_CURATE_PLANS|10|dispatch|Plan files changed since the last curate before one is due.
+JOHARNESS_CURATE_HOURS|168|dispatch|Hours since the last curate before one is due; 0 switches the cycle off.
+JOHARNESS_CURATE_REGISTRY|3|dispatch|Plans declaring one path before curate calls it a registry.
+JOHARNESS_CURATE_SPLIT|8|dispatch|Scope bullets before curate proposes a decompose.
+JOHARNESS_CLERK_HOURS|24|dispatch|Hours between clerk passes over the open issues; 0 switches the cycle off.
+JOHARNESS_CLERK_BATCH|3|dispatch|Open issues one clerk pass takes at most.
+JOHARNESS_CLERK_STALE_HOURS|24|dispatch|An unmerged clerk branch older than this holds nothing; 0 = every one holds.
+JOHARNESS_SCOUT_READS|12|dispatch|Outside reads one scout pass makes before it proposes from what it has.
+JOHARNESS_CONDUCT_HOURS|168|dispatch|Hours since the conduct ledger last landed before a reviewer is due; 0 = off.
+JOHARNESS_CONDUCT_SAMPLE|3|dispatch|Retired branches one conduct run samples; 0 = off.
+JOHARNESS_SCOUT_REVIEWER||base-conf|GitHub login whose approved comment gates a scout proposal; empty = none. Read from the base branch conf.
+JOHARNESS_SCOUT_RESEARCH|off|base-conf|Exactly on = a scout pass may read outside the repository. Read from the base branch conf.
+JOHARNESS_CANONICAL||session|Conf line JOHARNESS_CANONICAL=1 marks the canonical checkout; never in a consumer.
+JOHARNESS_CONF|computed|session|Path of the conf file; default joharness.conf under the checkout.
+JOHARNESS_VERBOSE|0|session|1 = ci and finish print passing checks too.
+JOHARNESS_SELFTEST||session|always = run the selftest even on a docs-only diff.
+JOHARNESS_SELFTEST_GIT_BUDGET|88960|session|Git execs the selftest may make before the ci stage reds; canonical-only.
+JOHARNESS_SESSION_SOURCE||session|The SessionStart hook source (startup, resume, clear, compact), set by session-start.
+JOHARNESS_FORCE_SETUP|0|session|1 = provision at session start outside the remote sandbox.
+JOHARNESS_SHIP||session|all = ci treats every harness file as shipping.
+JOHARNESS_UPGRADE_IN_SESSION|0|session|1 = allow upgrade in a session holding product work.
+JOHARNESS_FEEDBACK_CACHE||session|Directory feedback caches per-file scores in; empty = no cache.
+JOHARNESS_FEEDBACK_EDGES|50|session|Merged edges feedback reads; 0 reads all.
+JOHARNESS_RECURRENCE_WINDOW|8|session|Edges in feedback recurrence window; 0 = all history.
+JOHARNESS_PENDING_SPAWNS|0|session|Managers spawned this pass that have not pushed yet; dispatch counts them as slots taken.
+HANDOVER_STALE_SECONDS|518400|session|A branch idle longer than this is stale to dispatch and the hook.'
+# KNOBS-END
+
+# A key's static default, from KNOBS.
+knob_default() {
+  local k d rest
+  while IFS='|' read -r k d rest; do
+    if [ "$k" = "$1" ]; then printf '%s' "$d"; return 0; fi
+  done <<<"$KNOBS"
+  return 1
 }
 
 conf_set() {
@@ -131,9 +168,7 @@ md_mode()   { printf '%s' "${JOHARNESS_ENV_MD:-$(conf_get JOHARNESS_ENV_MD)}"; }
 review_mode() { printf '%s' "${JOHARNESS_REVIEW:-$(conf_get JOHARNESS_REVIEW)}"; }
 
 # Off unless a repo says otherwise, and only 'on' turns it on: an unreadable or
-# misspelled value must not silently arm a gate that fails ci. It must not
-# silently disarm one either — a repo that believes it opted in and typed
-# 'true' would otherwise get no gate and no signal, so the value is named.
+# misspelled value must not silently arm a gate that fails ci.
 review_on() {
   local v; v="$(review_mode)"
   case "$v" in
@@ -144,99 +179,25 @@ review_on() {
   esac
 }
 
-# Raw autonomy mode, exactly as configured — empty when unset. Only
-# run_mode() and the session-start banner read this; everything else asks
-# run_mode(), which normalises.
-# Three sources, most immediate first: the environment for one command, the
-# session-local marker for one checkout, the tracked conf for the repo.
-mode_raw() {
-  if [ -n "${JOHARNESS_MODE:-}" ]; then
-    printf '%s' "$JOHARNESS_MODE"
-  elif [ -r "$MODE_FILE" ]; then
-    # First line, trimmed. A marker written by hand can carry a newline or
-    # stray spaces and still mean what it says.
-    sed -n '1s/[[:space:]]*\([^[:space:]]*\).*/\1/p' "$MODE_FILE"
-  else
-    conf_get JOHARNESS_MODE
-  fi
-}
+# Who answers step 7's first merge condition.
+checks_mode() { printf '%s' "${JOHARNESS_CHECKS:-$(conf_get JOHARNESS_CHECKS)}"; }
 
-# Where the resolved mode came from. Only used to tell a session that its
-# autonomy is session-local and how to give it back.
-mode_source() {
-  if [ -n "${JOHARNESS_MODE:-}" ]; then printf 'environment'
-  elif [ -r "$MODE_FILE" ];      then printf 'marker'
-  else                                printf 'conf'
-  fi
-}
-
-# Resolved autonomy mode. ONE string means unsupervised; every other value
-# — a typo, an empty setting, an unreadable conf, a key that does not exist
-# because this harness copy predates the feature — resolves to supervised.
-# Fails closed on purpose: the failure mode of failing open is a fleet
-# working unattended in a repo that never asked for one, and the cost is
-# asymmetric enough that no clever parsing is worth it here.
-run_mode() {
-  case "$(mode_raw)" in
-    unsupervised) printf 'unsupervised' ;;
-    *)            printf 'supervised' ;;
+checks_local() {
+  local v; v="$(checks_mode)"
+  case "$v" in
+    local) return 0 ;;
+    '' | github) return 1 ;;
+    *) warn "ignoring JOHARNESS_CHECKS='${v}' (want 'github' or 'local'); stays 'github'"
+       return 1 ;;
   esac
 }
 
-# Name a value that was set and not understood. Silence here is how a repo
-# ends up believing it opted in: the operator typed something, the harness
-# ignored it, and nothing said so. Callers decide the channel — stderr for
-# the subcommand, session context for the banner.
-mode_unrecognised() {
-  local raw; raw="$(mode_raw)"
-  case "$raw" in
-    ''|supervised|unsupervised) return 1 ;;
-    *) printf '%s' "$raw" ;;
-  esac
-}
-mode_warn_unrecognised() {
-  local raw
-  raw="$(mode_unrecognised)" || return 0
-  warn "JOHARNESS_MODE='${raw}' not recognised; running supervised"
+# --- The core boundary
+protocol_paths() {
+  printf '%s\n' joharness.conf .claude/settings.json .github
 }
 
-# `mode` with an argument writes the session-local marker; `default` removes
-# it. Refuses to write anything but the two understood words: a marker
-# carrying a typo would resolve to supervised, which is safe, but it would
-# also read to a human as an opt-in that silently is not one.
-cmd_mode_set() {
-  local want="$1"
-  case "$want" in
-    supervised|unsupervised)
-      printf '%s\n' "$want" >"$MODE_FILE" ||
-        die "cannot write ${MODE_FILE}"
-      printf 'mode: %s (session-local marker %s)\n' "$want" "$MODE_FILE"
-      printf 'Clears with: %s mode default\n' "$0"
-      # The marker cannot narrow what the environment already widened, and
-      # a session that believes it turned autonomy off deserves to hear
-      # that it did not.
-      if [ -n "${JOHARNESS_MODE:-}" ] && [ "$JOHARNESS_MODE" != "$want" ]; then
-        warn "JOHARNESS_MODE='${JOHARNESS_MODE}' is set and wins over the marker; this session still runs $(run_mode)"
-      fi
-      ;;
-    default)
-      if [ -e "$MODE_FILE" ]; then
-        rm -f "$MODE_FILE" || die "cannot remove ${MODE_FILE}"
-        printf 'marker cleared; mode: %s (from %s)\n' "$(run_mode)" "$(mode_source)"
-      else
-        printf 'no marker set; mode: %s (from %s)\n' "$(run_mode)" "$(mode_source)"
-      fi
-      ;;
-    *)
-      die "mode takes 'supervised', 'unsupervised' or 'default' (got '${want}')"
-      ;;
-  esac
-}
-
-# Layer names are directory names under .agents/env/. Reject anything that could walk
-# out of it before it reaches a path. A whole-string case test, not a grep -qE:
-# grep matches per line, so a value carrying a newline ($'k8s\n...') slipped
-# past the anchors when any single line matched. case sees the whole string.
+# Layer names are directory names under .agents/env/.
 valid_name() {
   case "$1" in
     ''|[!a-z0-9]*|*[!a-z0-9._-]*) return 1 ;;
@@ -255,9 +216,7 @@ layers() {
   done
 }
 
-# Selected layer, falling back to 'none'. No name is special here: 'none' is an
-# ordinary layer that happens to provision nothing. Complaints go to stderr so a
-# broken conf is loud without corrupting hook output.
+# Selected layer, falling back to 'none'.
 resolve_env() {
   local name; name="$(env_name)"
   [ -n "$name" ] || name="none"
@@ -276,11 +235,7 @@ resolve_env() {
 # is what any docs-only layer gets for free.
 has_setup() { [ -f "${ENV_ROOT}/$1/setup.sh" ]; }
 
-# ---------------------------------------------------------------------------
-# Layer contract: everything under .agents/env/<name>/ is optional. setup.sh
-# provisions, smoke-test.sh verifies, AGENTS.md is injected into context. See
-# .agents/env/README.md.
-# ---------------------------------------------------------------------------
+# --- Layer contract: everything under .agents/env/<name>/ is optional. setup.sh
 
 run_setup() {
   local name="$1" script="${ENV_ROOT}/$1/setup.sh"
@@ -302,51 +257,7 @@ cmd_setup() {
   run_setup "$name" || die "environment '${name}' failed to provision"
 }
 
-cmd_verify() {
-  local name smoke
-  name="$(resolve_env)" || die "no usable environment layer under ${ENV_ROOT}"
-  smoke="${ENV_ROOT}/${name}/smoke-test.sh"
-  # Layer contract: everything under .agents/env/<name>/ is optional, so a
-  # layer shipping no smoke-test.sh has nothing to verify rather than failing
-  # to verify. `none` is that case by definition, and it is a supported
-  # choice, not a misconfiguration — bootstrap-consumer.sh hands it out when
-  # --env is omitted. Reporting it as an error also made step 7 unsatisfiable
-  # for such a repo: the merge rule asks for `verify` green whenever the diff
-  # touches harness code, and a rule that cannot be satisfied teaches the
-  # override. Same doctrine churn, review and the finish gate already follow —
-  # say so and pass, never go red on what could not be proven. has_setup()
-  # does the symmetric thing for setup.sh one screen up.
-  #
-  # A smoke-test.sh that EXISTS but is not executable is the opposite case and
-  # stays fatal: somebody meant that file to run, and passing green over it
-  # would hide a broken layer behind the sentence above.
-  if [ ! -f "$smoke" ]; then
-    log "environment '${name}' ships no smoke-test.sh — nothing to verify"
-    return 0
-  fi
-  [ -x "$smoke" ] ||
-    die ".agents/env/${name}/smoke-test.sh is not executable (chmod +x it)"
-  run_setup "$name" || die "environment '${name}' failed to provision"
-  "$smoke"
-}
-
-# ---------------------------------------------------------------------------
-# Upgrade
-#
-# A consumer no longer carries the sync engine: it refuses to run outside
-# canonical anyway (.agents/docs/consumer-repos.md). What it carries instead is
-# this command — fetch canonical, run ITS engine against this repo. One
-# command, so a repo that received a minimal harness can still take an
-# update without a recipe.
-#
-# The canonical address is read from .github/workflows/update.yml, the
-# consumer's own single source of truth for it: a fork names its fork
-# there, and a second key in joharness.conf would be a second answer.
-# ---------------------------------------------------------------------------
-
-# Set by cmd_upgrade, reaped by its EXIT trap. A global, not a local: the
-# trap fires after the function has returned, when a local is out of scope
-# and `set -u` turns the cleanup itself into the error.
+# Consumer route when update.yml cannot sync: clone canonical, run ITS engine here.
 UPGRADE_CLONE=""
 
 cmd_upgrade() {
@@ -354,27 +265,8 @@ cmd_upgrade() {
   grep -q '^JOHARNESS_CANONICAL=1' "$CONF" 2>/dev/null &&
     die "this IS the canonical harness; upgrade is for consumers (sync out with .agents/scripts/sync-to-consumer.sh)"
 
-  # Harness upkeep does not run in a session holding product work
-  # (.agents/harness/AGENTS.md, Harness upkeep). Stated as a preference it stayed
-  # the convenient path; here it is a refusal, because the convenient path
-  # is the one that gets taken.
-  #
-  # A workstream file on this branch IS the claim — the same fact the
-  # handover guard and the queue read — so the refusal fires exactly when
-  # a session has work to dilute, and never on a sync branch, which
-  # carries no workstream file by protocol.
-  #
-  # Escape is deliberate and visible, like the churn ceiling's: a genuine
-  # mid-plan sync sets JOHARNESS_UPGRADE_IN_SESSION=1 and says so in the
-  # commit. Silence is what this exists to prevent, not the act.
   if [ "${JOHARNESS_UPGRADE_IN_SESSION:-0}" != "1" ]; then
     local ws base
-    # The claim is what THIS branch introduced, not what it inherited. A
-    # base branch that accreted a finished workstream file — the failure
-    # process-scorecard exists to count — would otherwise refuse every sync
-    # branch cut from it, while the refusal told the session to do exactly
-    # what it had already done. A rule that misfires teaches the override,
-    # and an override taken reflexively is no rule.
     base="$(git -C "$ROOT" merge-base HEAD "origin/${HANDOVER_BASE_BRANCH:-main}" 2>/dev/null)" || base=""
     if [ -n "$base" ]; then
       ws="$(
@@ -384,20 +276,17 @@ cmd_upgrade() {
           git -C "$ROOT" ls-files --others --exclude-standard -- docs/handover
         } 2>/dev/null |
           { grep -E '^docs/handover/[^/]+\.md$' || :; } |
-          { grep -vE '/(TEMPLATE|README)\.md$' || :; } | sort -u | head -1
+          { grep -vE '/(TEMPLATE|README|RETIRED)\.md$' || :; } | sort -u | head -1
       )"
       [ -z "$ws" ] || ws="${ROOT}/${ws}"
     else
-      # No merge-base to compare against, so introduced-vs-inherited cannot
-      # be told apart. Refuse on presence and let the message carry the
-      # override, rather than pass a session that may be mid-plan.
       ws="$(find "${ROOT}/docs/handover" -maxdepth 1 -name '*.md' \
-        ! -name 'TEMPLATE.md' ! -name 'README.md' 2>/dev/null | head -1)"
+        ! -name 'TEMPLATE.md' ! -name 'README.md' ! -name 'RETIRED.md' 2>/dev/null | head -1)"
     fi
     if [ -n "$ws" ]; then
       log "this branch carries ${ws#"${ROOT}/"} — it holds claimed work"
       log "cheaper routes, in order: update.yml in CI, a subagent, a session of its own"
-    log "see .agents/docs/consumer-repos.md"
+      log "see .agents/docs/consumer-repos.md"
       die "upgrade refused in a session holding product work; run it from a sync branch with no workstream file, or set JOHARNESS_UPGRADE_IN_SESSION=1 to override deliberately"
     fi
   fi
@@ -405,25 +294,14 @@ cmd_upgrade() {
   local wf="${ROOT}/.github/workflows/update.yml"
   [ -r "$wf" ] ||
     die "no ${wf#"${ROOT}/"} to read the canonical address from; add it (.agents/docs/consumer-repos.md) or sync by hand"
-  # First token only: a trailing YAML comment or stray whitespace would
-  # otherwise ride into the clone URL and fail as an unresolvable host.
-  repo="$(sed -n 's/^ *CANONICAL_REPO: *//p' "$wf" | tail -1 | awk '{print $1}')"
-  [ -n "$repo" ] ||
-    die "no CANONICAL_REPO in ${wf#"${ROOT}/"}; the update workflow names the canonical this repo follows"
-  case "$repo" in
-    */*) ;;
-    *) die "CANONICAL_REPO '${repo}' is not owner/repo" ;;
-  esac
+  repo="$(upstream_canonical_repo)" ||
+    die "no usable CANONICAL_REPO in ${wf#"${ROOT}/"}; the update workflow names the canonical this repo follows, as owner/repo"
 
   have git || die "git is not installed"
-  # Outside the repo, or the clone lands in this tree and a later `git add
-  # -A` swallows it. Full clone, no --depth: stale-vs-AHEAD is decided by
-  # blob identity against canonical history, and a shallow clone reads
-  # honestly-synced files as AHEAD forever.
   UPGRADE_CLONE="$(mktemp -d)"
   trap '[ -z "${UPGRADE_CLONE:-}" ] || rm -rf "$UPGRADE_CLONE"' EXIT
   log "fetching canonical ${repo}"
-  git clone --quiet "https://github.com/${repo}.git" "${UPGRADE_CLONE}/canonical" ||
+  git clone --quiet -c core.autocrlf=false -c core.eol=lf "https://github.com/${repo}.git" "${UPGRADE_CLONE}/canonical" ||
     die "could not clone https://github.com/${repo}.git"
 
   engine="${UPGRADE_CLONE}/canonical/.agents/scripts/sync-to-consumer.sh"
@@ -445,165 +323,217 @@ cmd_upgrade() {
   return "$rc"
 }
 
-# ---------------------------------------------------------------------------
-# Checks
-#
-# ci.yml calls this rather than repeating the commands, so a green run here and
-# a green run on GitHub mean the same thing. Covers every layer, including the
-# ones this repo did not select — they still ship to consumers.
-# ---------------------------------------------------------------------------
+cmd_verify() {
+  local name smoke
+  name="$(resolve_env)" || die "no usable environment layer under ${ENV_ROOT}"
+  smoke="${ENV_ROOT}/${name}/smoke-test.sh"
+  # Layer contract: everything under .agents/env/<name>/ is optional, so a
+  # layer shipping no smoke-test.sh has nothing to verify rather than failing
+  # to verify.
+  if [ ! -f "$smoke" ]; then
+    log "environment '${name}' ships no smoke-test.sh — nothing to verify"
+    return 0
+  fi
+  [ -x "$smoke" ] ||
+    die ".agents/env/${name}/smoke-test.sh is not executable (chmod +x it)"
+  run_setup "$name" || die "environment '${name}' failed to provision"
+  "$smoke"
+}
+
+# --- Checks
+
+# Output of `ci` and `finish`: failing checks and one verdict line; every
+# check with -v or JOHARNESS_VERBOSE=1.
+CHECK_VERBOSE="${JOHARNESS_VERBOSE:-0}"
+CHECK_FAILS=0
+CHECK_SKIPPED=0
+
+# run_check <name> <function> [args]: run one check, print its output only
+# when it fails (or verbose). Status 3 = skipped, said in the verdict line.
+run_check() {
+  local name="$1" out rc
+  shift
+  out="$("$@" 2>&1)"; rc=$?
+  # A pass that carries a report about THIS branch or checkout (not
+  # measurable, edge report, ships, not covered, shallow — incl. graph reds
+  # degraded to warnings — churn warning) still prints. Plain lint warnings
+  # about other plans stay quiet: measured noise managers mis-read.
+  if { [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; } || [ "$CHECK_VERBOSE" = 1 ] ||
+     printf '%s' "$out" | grep -qE 'not measurable|Reported, not failed|SHIPS to consumers|Not covered here|SHALLOW|shallow history|commits on this branch$|Fix undoing'; then
+    printf '== %s\n' "$name"
+    [ -z "$out" ] || printf '%s\n' "$out"
+    printf '\n'
+  fi
+  case "$rc" in
+    0) ;;
+    3) CHECK_SKIPPED=1 ;;
+    *) CHECK_FAILS=$((CHECK_FAILS + 1)) ;;
+  esac
+  return 0
+}
+
+# -v / --verbose anywhere in a command's arguments.
+check_args() {
+  local a
+  for a in "$@"; do
+    case "$a" in
+      -v | --verbose) CHECK_VERBOSE=1 ;;
+      *) die "unknown argument '${a}' (try -v)" ;;
+    esac
+  done
+}
+
+ci_shellcheck() {
+  printf '%d files\n' "$#"
+  if ensure_shellcheck; then
+    shellcheck -x "$@" || return 1
+    printf '  zero findings\n'
+  elif [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+    warn "shellcheck not installed and not installable on the CI runner"
+    return 1
+  else
+    warn "shellcheck unavailable, install failed. NOT checked. Install it"
+    warn "(github.com/koalaman/shellcheck#installing) or ask human first."
+    printf '  SKIPPED\n'
+    return 3
+  fi
+}
+
+ci_syntax() {
+  local f rc=0
+  for f in "$@"; do bash -n "$f" || rc=1; done
+  [ "$rc" -eq 0 ] && printf '  clean\n'
+  return "$rc"
+}
+
+# The harness's own regression tests. Canonical-only: absent in a consumer.
+ci_selftest() {
+  if [ ! -e "${HARNESS_ROOT}/selftest.sh" ]; then
+    printf '  not here (canonical-only; this repo does not carry the harness tests)\n'
+  elif [ ! -x "${HARNESS_ROOT}/selftest.sh" ]; then
+    warn ".agents/harness/selftest.sh is not executable"
+    return 1
+  elif [ "${JOHARNESS_SELFTEST:-}" != "always" ] &&
+       selftest_inert_diff HEAD "origin/${HANDOVER_BASE_BRANCH:-main}"; then
+    printf '  skipped: nothing outside docs/ and README.md changed on this branch\n'
+    printf '  Run it anyway: JOHARNESS_SELFTEST=always %s ci\n' "$0"
+  else
+    selftest_counted
+  fi
+}
+
+# The selftest under a counting `git` first on PATH: every exec appends one
+# line, so the count is taken from OUTSIDE the suite and no topic can hide
+# from it. Over JOHARNESS_SELFTEST_GIT_BUDGET = red, like a failed case: the
+# suite's cost grows one fixture at a time and nobody sees it grow. A green
+# stage stays quiet like every other; `ci -v` prints the count. The default
+# is a count plus a tenth: `ci -v` on this repository, 2026-10-14.
+selftest_counted() {
+  local real dir rc n budget
+  budget="$(num_knob JOHARNESS_SELFTEST_GIT_BUDGET)"
+  # A path, never a name: an exported `git` function makes `command -v` say
+  # `git`, and a wrapper exec'ing that finds itself on PATH forever.
+  real="$(type -P git)"
+  case "$real" in /*) ;; *) warn "no git executable on PATH"; return 1 ;; esac
+  dir="$(mktemp -d)" || return 1
+  # Paths are baked in, never read from the environment: a nested ci (the
+  # suite runs ci in fixtures) must not point this wrapper at its own file.
+  # POSIX single quotes, not %q: the interpreter is sh, and %q may write $'…'.
+  { printf '#!/bin/sh\n'
+    printf 'echo . >>%s\n' "$(sh_squote "${dir}/count")"
+    printf 'exec %s "$@"\n' "$(sh_squote "$real")"
+  } >"${dir}/git"
+  chmod +x "${dir}/git"
+  : >"${dir}/count"
+  PATH="${dir}:${PATH}" "${HARNESS_ROOT}/selftest.sh" 2>&1
+  rc=$?
+  n="$(wc -l <"${dir}/count")"; n="${n//[!0-9]/}"
+  rm -rf "$dir"
+  printf '  selftest git execs: %s (budget %s)\n' "${n:-0}" "$budget"
+  if [ "${n:-0}" -gt "$budget" ]; then
+    printf '  Over budget: a topic re-runs work, or a new one costs more than it\n'
+    printf '  should. Find it before raising JOHARNESS_SELFTEST_GIT_BUDGET.\n'
+    return 1
+  fi
+  return "$rc"
+}
+
+# One word in POSIX single quotes, safe for any sh.
+sh_squote() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
+
+# Review churn: the session inside it is the one least able to see it.
+# Warning from the threshold, red from the ceiling (0 lifts both).
+ci_churn() {
+  local churn threshold ceiling churn_n churn_f
+  threshold="$(num_knob JOHARNESS_CHURN_THRESHOLD)"
+  ceiling="$(num_knob JOHARNESS_CHURN_LIMIT $((threshold * 2)))"
+  if ! churn="$(churn_top)"; then
+    printf '  not measurable here (no merge-base; shallow checkout or base branch)\n'
+    return 0
+  fi
+  if [ -z "$churn" ]; then
+    printf '  quiet\n'
+    return 0
+  fi
+  churn_n="${churn%%	*}" churn_f="${churn#*	}"
+  if [ "$ceiling" -gt 0 ] && [ "$churn_n" -ge "$ceiling" ]; then
+    printf '  %s rewritten in %s commits on this branch (ceiling %s)\n' \
+      "$churn_f" "$churn_n" "$ceiling"
+    printf '  Past the ceiling this is churn, not a judgment call. Stop\n'
+    printf '  patching — take the research step at a raised tier or effort\n'
+    printf '  (.agents/docs/agent-selection.md, review churn). Genuine large rework?\n'
+    printf '  JOHARNESS_CHURN_LIMIT=0 lifts the gate, on the record.\n'
+    return 1
+  elif [ "$churn_n" -ge "$threshold" ]; then
+    printf '  %s touched in %s commits on this branch\n' "$churn_f" "$churn_n"
+    printf '  Fix undoing an earlier fix? Stop patching — research step at raised\n'
+    printf '  tier or effort first (.agents/docs/agent-selection.md, review churn).\n'
+  else
+    printf '  quiet (max %s commits per file)\n' "${churn_n:-0}"
+  fi
+}
 
 cmd_ci() {
-  local rc=0 f listing
+  local f listing fs
   local -a targets=()
+  check_args "$@"
+  CHECK_FAILS=0; CHECK_SKIPPED=0
   if ! listing="$(check_targets)"; then
     warn "could not enumerate all shell scripts; a partial list is no lint bar"
-    rc=1
+    CHECK_FAILS=$((CHECK_FAILS + 1))
   fi
   while IFS= read -r f; do
     [ -n "$f" ] && targets+=("$f")
   done <<<"$listing"
+  [ "${#targets[@]}" -gt 0 ] || die "no shell scripts found under ${ROOT}"
 
-  if [ "${#targets[@]}" -eq 0 ]; then
-    die "no shell scripts found under ${ROOT}"
-  fi
+  run_check shellcheck ci_shellcheck "${targets[@]}"
+  run_check "bash syntax" ci_syntax "${targets[@]}"
+  run_check "harness selftest" ci_selftest
+  run_check glossary lint_glossary
+  run_check "graph lint" lint_graph
+  run_check "plans on this branch" lint_plans_in_diff
+  run_check "finding ids" lint_finding_ids
+  run_check "finding verdicts" lint_finding_markers
+  run_check "ship scope" lint_ship
+  run_check churn ci_churn
+  if review_on; then run_check review review_report; fi
+  fs="$(fin_strength)"
+  [ -z "$fs" ] || run_check finish fin_gate "$fs"
 
-  printf '== shellcheck (%d files)\n' "${#targets[@]}"
-  local sc_skipped=0
-  if ensure_shellcheck; then
-    shellcheck -x "${targets[@]}" && printf '  zero findings\n' || rc=1
-  elif [ "${GITHUB_ACTIONS:-}" = "true" ]; then
-    # The workflow is the gate; a gate that skips its own bar is no gate.
-    warn "shellcheck not installed and not installable on the CI runner"
-    rc=1
-  else
-    # A session's problem is the code, not the toolchain. Missing tool =
-    # loud skip, never a fake red. Human decides whether the skip stands.
-    sc_skipped=1
-    warn "shellcheck unavailable, install failed. NOT checked. Install it"
-    warn "(github.com/koalaman/shellcheck#installing) or ask human first."
-    printf '  SKIPPED\n'
-  fi
-
-  printf '\n== bash syntax\n'
-  local syntax_rc=0
-  for f in "${targets[@]}"; do
-    bash -n "$f" || { rc=1; syntax_rc=1; }
-  done
-  [ "$syntax_rc" -eq 0 ] && printf '  clean\n'
-
-  # The harness's own regression tests: git-only, so they run on GitHub
-  # runners where the environment smoke test cannot. Canonical-only — a
-  # consumer does not receive them, because they cover harness code it
-  # does not edit. Absent is therefore normal in a consumer and said once;
-  # present but not executable is a broken copy and stays red.
-  printf '\n== harness selftest\n'
-  if [ -x "${HARNESS_ROOT}/selftest.sh" ]; then
-    "${HARNESS_ROOT}/selftest.sh" || rc=1
-  elif [ -e "${HARNESS_ROOT}/selftest.sh" ]; then
-    warn ".agents/harness/selftest.sh is not executable"
-    rc=1
-  else
-    printf '  not here (canonical-only; this repo does not carry the harness tests)\n'
-  fi
-
-  # Graph edges, checked rather than trusted: a dangling frontmatter edge
-  # or out-of-vocabulary enum fails silent everywhere else — the hooks
-  # default it and the queue lies. Rules and the warn/red split: lint_graph.
-  printf '\n== graph lint\n'
-  lint_graph || rc=1
-
-  # Review churn, measured rather than noticed. The rule
-  # (.agents/docs/agent-selection.md) asks a session to see that a fix undid an
-  # earlier fix — but the session inside the churn is the one least able to
-  # see it: the sync-tool branch ran twelve "harden per review round"
-  # commits over two hours, and ci ran every round without saying so. Git
-  # held the evidence the whole time; this prints it. Two tiers, because the
-  # honest answer changes with the number. From the threshold up it is a
-  # warning: whether the churn is real is the session's judgment call, and the
-  # rule's lever (raise tier or effort) is its to pull. From the ceiling up it
-  # is no longer a call — no honest single edit rewrites one file that many
-  # times on one branch (backtest: the runaway sync branch hit 13, every other
-  # merge in this repo's history <=4). The session inside the churn is the one
-  # that cannot see it, so the one gate it cannot skip fails for it.
-  # JOHARNESS_CHURN_LIMIT overrides the ceiling; =0 lifts the gate, the
-  # deliberate and visible escape for a genuine large rework.
-  printf '\n== churn\n'
-  local churn threshold ceiling
-  threshold="${JOHARNESS_CHURN_THRESHOLD:-5}"
-  ceiling="${JOHARNESS_CHURN_LIMIT:-$((threshold * 2))}"
-  if churn="$(churn_top)"; then
-    if [ -n "$churn" ]; then
-      local churn_n="${churn%%	*}" churn_f="${churn#*	}"
-      if [ "$ceiling" -gt 0 ] && [ "$churn_n" -ge "$ceiling" ]; then
-        printf '  %s rewritten in %s commits on this branch (ceiling %s)\n' \
-          "$churn_f" "$churn_n" "$ceiling"
-        printf '  Past the ceiling this is churn, not a judgment call. Stop\n'
-        printf '  patching — take the research step at a raised tier or effort\n'
-        printf '  (.agents/docs/agent-selection.md, review churn). Genuine large rework?\n'
-        printf '  JOHARNESS_CHURN_LIMIT=0 lifts the gate, on the record.\n'
-        rc=1
-      elif [ "$churn_n" -ge "$threshold" ]; then
-        printf '  %s touched in %s commits on this branch\n' "$churn_f" "$churn_n"
-        printf '  Fix undoing an earlier fix? Stop patching — research step at raised\n'
-        printf '  tier or effort first (.agents/docs/agent-selection.md, review churn).\n'
-      else
-        printf '  quiet (max %s commits per file)\n' "${churn_n:-0}"
-      fi
-    else
-      printf '  quiet\n'
-    fi
-  else
-    printf '  not measurable here (no merge-base; shallow checkout or base branch)\n'
-  fi
-
-  # Off by default and silent while off, so a repo that never opted in gets
-  # the same ci output it got before this existed.
-  if review_on; then
-    printf '\n== review\n'
-    review_report || rc=1
-  fi
-
-  # Loop step 7's gate, enforced rather than merely available. `finish` was
-  # a correct gate nobody had to run, and step 7 kept not happening:
-  # docs/handover/joharness-minify-optimize.md sat on main from 2026-08-24
-  # through 22 merges, named correctly by the gate every time anyone ran
-  # it. Detect, Record and Generalize had all happened — the step 7 wording
-  # was strengthened after a consumer measured 23 stale files — and it
-  # recurred because stage 4 was missing (.agents/docs/feedback.md).
-  #
-  # Reported at the edge, RED once the branch says done — see
-  # fin_strength for why one trigger could not serve both this and the
-  # review gate. Not behind a flag: whether a review is deep enough is a
-  # judgment, whether a branch that calls itself finished still carries
-  # its own workstream file is not.
-  local fin_strength_now
-  fin_strength_now="$(fin_strength)"
-  if [ -n "$fin_strength_now" ]; then
-    printf '\n== finish\n'
-    fin_gate "$fin_strength_now" || rc=1
-  fi
-
-  printf '\n'
-  if [ "$rc" -ne 0 ]; then
-    printf 'ci: FAIL\n'
-  elif [ "$sc_skipped" -eq 1 ]; then
+  # The environment smoke test is not part of this: run `verify`.
+  if [ "$CHECK_FAILS" -ne 0 ]; then
+    printf 'ci: FAIL (%s)\n' "$CHECK_FAILS"
+    return 1
+  elif [ "$CHECK_SKIPPED" -eq 1 ]; then
     printf 'ci: pass (shellcheck SKIPPED — not the full bar)\n'
   else
     printf 'ci: pass\n'
   fi
-
-  # The environment smoke test is deliberately not part of this: it needs the
-  # sandbox, and GitHub runners have none. Run it with `verify`.
-  return "$rc"
+  return 0
 }
 
-# Every shell script the harness owns, in a stable order. One find root:
-# everything harness-owned lives under .agents/ (harness, env, scripts),
-# so a script added anywhere in it must not ship unlinted behind a green
-# `ci: pass`. A missing root is fine (a stripped-down consumer); a find
-# FAILURE is not — an unreadable dir would silently drop scripts from
-# the lint list, so the caller sees it and goes red.
+# Every shell script the harness owns, in a stable order.
 check_targets() {
   local listing
   printf '%s\n' "${ROOT}/joharness.sh"
@@ -615,8 +545,7 @@ check_targets() {
 have() { command -v "$1" >/dev/null 2>&1; }
 
 # The ref that stands for merged state: the remote's base branch, else a local
-# branch of the same name, else HEAD. Three callers walk merged history and all
-# three must agree on where it is, or they disagree about what has landed.
+# branch of the same name, else HEAD.
 base_ref() {
   local b="${HANDOVER_BASE_BRANCH:-main}" c
   for c in "origin/${b}" "$b" HEAD; do
@@ -629,26 +558,7 @@ base_ref() {
 }
 
 # Most-touched file on a branch since it left the base branch, as
-# "count<TAB>path". Measures $1 (default HEAD) against $2 (default
-# origin/<base branch>) — cmd_ci reads the session's own branch, cmd_graph
-# every in-flight one, and both must be the same metric or they disagree
-# about what counts as churn. Empty when the branch has no non-merge
-# commits. Returns non-zero when there is no merge-base to measure against —
-# the base branch itself, or a shallow checkout. docs/(handover|plans|
-# product)/ are excluded: the protocol requires touching the workstream file
-# in the SAME commit as every change, so counting those paths reads
-# compliance as churn (the first unfiltered backtest flagged a branch for
-# exactly that). The tab is awk's, not sed's: BSD sed emits '\t' as a
-# literal 't', which on macOS glued count to path and disarmed the ci gate.
-# awk also keeps a path with spaces whole.
-#
-# One `git log --name-only`, not a diff-tree per commit: the old shape forked
-# once per commit plus a six-stage pipeline, so the cost grew with the branch
-# it was judging — the measure that exists to notice a long branch was the
-# thing that got slow on one. --no-renames keeps it the same metric diff-tree
-# reported (rename shown as its two paths, not one); --format= leaves a blank
-# line per commit, which the awk drops with everything else it filters. Ties
-# on count go to the higher path name, as the old `sort -rn | head -1` did.
+# "count<TAB>path".
 churn_top() {
   local rev="${1:-HEAD}" over="${2:-origin/${HANDOVER_BASE_BRANCH:-main}}" base
   base="$(git -C "$ROOT" merge-base "$rev" "$over" 2>/dev/null)" || return 1
@@ -662,23 +572,148 @@ churn_top() {
       END { if (max) printf "%d\t%s\n", max, best }'
 }
 
-# ---------------------------------------------------------------------------
-# Graph lint
-#
-# Edges live in frontmatter; a typo kills one silently — a dangling `needs:`
-# reads as free and runs before its input, a workstream `plan:` typo hides
-# the claim so two fresh sessions pick the same plan, an enum outside its
-# vocabulary silently defaults. All checkable from file existence plus
-# frontmatter at read time — no stored state — and the session that wrote
-# the typo is the one that cannot see it, so the gate it cannot skip checks
-# instead (same argument as the churn ceiling). Three-way resolution per
-# name: open file in the tree = live edge; name in HEAD's history = done
-# work, edge inert by design (delete-on-merge IS the state, so `needs` on a
-# merged plan is silent, a claim on one only warns); never existed = typo,
-# red. Hard facts red, judgment calls warn — a stale `Where to look` anchor
-# is the staleness rule's territory (verify-at-read), so it warns, never
-# fails.
-# ---------------------------------------------------------------------------
+# --- Selftest scope
+selftest_inert_diff() {
+  local rev="${1:-HEAD}" over="${2:-origin/${HANDOVER_BASE_BRANCH:-main}}" base f entry seen=0
+  base="$(git -C "$ROOT" merge-base "$rev" "$over" 2>/dev/null)" || return 1
+  [ "$base" != "$(git -C "$ROOT" rev-parse "$rev" 2>/dev/null)" ] || return 1
+
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    seen=1
+    case "$f" in docs/*|README.md) ;; *) return 1 ;; esac
+  done < <(git -C "$ROOT" diff --no-renames --name-only "${base}..${rev}" 2>/dev/null)
+
+  while IFS= read -r -d '' entry; do
+    f="${entry:3}"
+    [ -n "$f" ] || continue
+    seen=1
+    case "$f" in docs/*|README.md) ;; *) return 1 ;; esac
+  done < <(git -C "$ROOT" status --porcelain -z --no-renames 2>/dev/null)
+
+  [ "$seen" -eq 1 ] || return 1
+  return 0
+}
+
+# --- Glossary lint
+GLOSSARY_REL=".agents/docs/glossary.md"
+
+# Canonical-owned paths ONLY, and every one of them synced
+# (.agents/scripts/sync-to-consumer.sh).
+GLOSSARY_PATHS=(
+  '.agents/docs/*' '.agents/harness/*' '.agents/scripts/*'
+  '.agents/env/README.md'
+  '.claude/commands/*' '.claude/skills/*'
+  'AGENTS.md' 'CLAUDE.md' 'joharness.sh'
+)
+
+# Built from the path, so the dots are escaped and the colon anchors the right
+# edge: unanchored, this also exempted glossary.mdx and glossaryXmd.
+GLOSSARY_EXEMPT_RE="^$(printf '%s' "$GLOSSARY_REL" | sed 's/[.[\*^$]/\\&/g'):"
+
+lint_glossary() {
+  local gloss="${ROOT}/${GLOSSARY_REL}" rc=0 rows hits canon bads bad gl_fail gg
+  if [ ! -r "$gloss" ]; then
+    printf '  no glossary here (%s)\n' "$GLOSSARY_REL"
+    return 0
+  fi
+
+  # Not a git repo: `git grep` cannot run, so say that instead of printing
+  # the green line for a check that never happened.
+  if ! git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+    printf '  not a git checkout here; nothing to scan\n'
+    return 0
+  fi
+
+  # ONE table, the FIRST one under the expected header, every row exactly four
+  # cells, every cell filled.
+  rows="$(awk '
+      function trim(s) { gsub(/^[`[:space:]]+|[`[:space:]]+$/, "", s); return s }
+      {
+        line = $0
+        sub(/^[[:space:]]+/, "", line); sub(/[[:space:]]+$/, "", line)
+        if (line !~ /\|/) { if (intable) { intable = 0; past = 1 } next }
+        if (line !~ /^\|/) line = "|" line
+        if (line !~ /\|$/) line = line "|"
+        n = split(line, c, "|")
+        if (!intable) {
+          if (past) next
+          if (n == 6 && trim(c[2]) == "Canonical" && trim(c[5]) == "Not this") {
+            intable = 1; header = 1
+          }
+          next
+        }
+        sep = line; gsub(/[|:[:space:]-]/, "", sep)
+        if (sep == "") next
+        if (n != 6) { print "MALFORMED\t" line; next }
+        if (trim(c[2]) == "" || trim(c[5]) == "") { print "MALFORMED\t" line; next }
+        body = 1
+        print trim(c[2]) "\t" trim(c[5])
+      }
+      END { if (!header) print "NOHEADER"; else if (!body) print "NOROWS" }
+    ' "$gloss")"
+
+  if printf '%s\n' "$rows" | grep -q '^NOHEADER$'; then
+    printf '  %s has no row table under the header this stage reads:\n' "$GLOSSARY_REL"
+    printf '    | Canonical | Means | Defined in | Not this |\n'
+    printf '  ^ without it nothing is enforced, which is a green ci and no gate\n'
+    return 1
+  fi
+  if printf '%s\n' "$rows" | grep -q '^MALFORMED'; then
+    printf '%s\n' "$rows" | sed -n 's/^MALFORMED\t/  malformed row: /p'
+    printf '  ^ a glossary row is four filled cells; a pipe inside one shifts them\n'
+    return 1
+  fi
+  if printf '%s\n' "$rows" | grep -q '^NOROWS$'; then
+    printf '  %s has the header and no rows; it enforces nothing\n' "$GLOSSARY_REL"
+    return 1
+  fi
+
+  # A gate whose rc never escapes is a gate that is always green, and the ban
+  # loop below is a pipeline, so the failure travels as a file.
+  gl_fail="$(mktemp)" || gl_fail=""
+  if [ -z "$gl_fail" ]; then
+    printf '  cannot create a temp file; refusing to report a scan that cannot fail\n'
+    return 1
+  fi
+
+  while IFS="$(printf '\t')" read -r canon bads; do
+    [ -n "$bads" ] || continue
+    # One row may ban several wordings; a comma-separated cell taken whole
+    # would be a literal search for "a, b" - a ban that looks live and is dead.
+    printf '%s\n' "$bads" | tr ',' '\n' | while IFS= read -r bad; do
+      bad="$(printf '%s' "$bad" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+      [ -n "$bad" ] || continue
+      # -F: a banned wording is a literal, never a pattern.
+      gg=0
+      hits="$(git -C "$ROOT" grep -FniI --untracked -- "$bad" \
+        -- "${GLOSSARY_PATHS[@]}" 2>&1)" || gg=$?
+      # 1 is no-match. Anything above it is git failing, and `|| :` on it
+      # would print the green line for a scan that never ran.
+      if [ "$gg" -gt 1 ]; then
+        printf '  git grep failed (rc %s) looking for "%s":\n' "$gg" "$bad"
+        printf '%s\n' "$hits" | while IFS= read -r h; do printf '    %s\n' "$h"; done
+        printf 'x' >>"$gl_fail"
+        continue
+      fi
+      [ "$gg" -eq 0 ] || continue
+      hits="$(printf '%s\n' "$hits" | grep -vE "$GLOSSARY_EXEMPT_RE" || :)"
+      [ -n "$hits" ] || continue
+      printf '%s\n' "$hits" | while IFS= read -r h; do printf '  %s\n' "$h"; done
+      printf '  ^ says "%s"; this repo says "%s" (%s)\n' "$bad" "$canon" "$GLOSSARY_REL"
+      printf 'x' >>"$gl_fail"
+    done
+  done <<EOF
+$rows
+EOF
+  if [ -s "$gl_fail" ]; then rc=1; fi
+  rm -f "$gl_fail"
+
+  [ "$rc" -eq 0 ] && printf '  every contested term spelled as the glossary fixes it\n'
+  return "$rc"
+}
+
+# --- Graph lint
 
 LINT_RC=0
 LINT_WARNED=0
@@ -686,30 +721,22 @@ LINT_WARNED=0
 lint_red()  { printf '  DEAD %s\n' "$*"; LINT_RC=1; }
 lint_warn() { printf '  warn %s\n' "$*"; LINT_WARNED=1; }
 
-# Working-tree nodes of one type, paths relative to ROOT. The tree, not a
-# ref: ci judges what this branch is about to push, uncommitted included.
+# Working-tree nodes of one type, paths relative to ROOT.
 lint_nodes() {
   [ -d "${ROOT}/$1" ] || return 0
   (cd "$ROOT" && find "$1" -maxdepth 1 -name '*.md' \
-    ! -name 'TEMPLATE.md' ! -name 'README.md' ! -name 'VISION.md' \
+    ! -name 'TEMPLATE.md' ! -name 'README.md' ! -name 'RETIRED.md' ! -name 'VISION.md' ! -name 'SCOUT.md' \
     2>/dev/null | sort)
 }
 
-# Did <rel-path> ever exist on HEAD's line? Literal pathspec: a stem
-# carrying a glob char must match itself, not a sibling (sync's lesson).
+# Did <rel-path> ever exist on HEAD's line?
 lint_existed() {
-  [ -n "$(GIT_LITERAL_PATHSPECS=1 git -C "$ROOT" log -1 --format=%H \
-    HEAD -- "$1" 2>/dev/null)" ]
+  [ -n "$(GIT_LITERAL_PATHSPECS=1 git -C "$ROOT" log -1 --full-history \
+    --format=%H HEAD -- "$1" 2>/dev/null)" ]
 }
 
-# A name neither in the tree nor in visible history is a typo only when
-# the history is whole. A shallow checkout (GitHub's default fetch-depth
-# is 1, and ci.yml on a consumer is consumer-own — no depth fix there can
-# be assumed) cannot tell a typo from a merged-and-deleted plan, and a red
-# it cannot prove would break the invariant that ci here and ci on GitHub
-# mean the same thing — in the bad direction, green locally and red
-# remotely. Degrade to a warning there; the full-history run stays the
-# gate. Same doctrine as churn's "not measurable here".
+# A name neither in the tree nor in visible history is a typo only when the
+# history is whole.
 lint_shallow() {
   [ "$(git -C "$ROOT" rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]
 }
@@ -717,9 +744,7 @@ lint_shallow() {
 lint_stem() { local s="${1##*/}"; printf '%s' "${s%.md}"; }
 
 # <file> <field> <value> <allowed...>: empty passes (hooks default it),
-# anything else outside the vocabulary is red. Whole-word compare, not a
-# substring test: 'haiku sonnet' must not pass because the vocabulary
-# happens to list those words adjacently.
+# anything else outside the vocabulary is red.
 lint_enum() {
   local f="$1" k="$2" v="$3" w; shift 3
   [ -n "$v" ] || return 0
@@ -729,51 +754,181 @@ lint_enum() {
   lint_red "${f}: ${k} '${v}' not one of: $*"
 }
 
+# <file> <scope value>: red unless every entry sits under a prose directory.
+lint_fable_bound() {
+  local f="$1" p n=0
+  local prose=$'docs\n.agents/docs\n.claude/commands'
+  [ "$2" != "none" ] || return 0
+  while IFS= read -r p; do
+    p="${p#shared:}"; p="${p#./}"
+    [ -n "$p" ] || continue
+    n=$((n + 1))
+    case "/${p}/" in
+      */../*|//*) ;;
+      *) curate_covered "$p" "$prose" && continue ;;
+    esac
+    lint_red "${f}: fable is a judgement tier: this plan builds ('${p}' in scope:)"
+    return 0
+  done < <(printf '%s\n' "$2" | scope_norm | tr -s '[:blank:];' '\n')
+  [ "$n" -gt 0 ] ||
+    lint_red "${f}: fable is a judgement tier: scope: must show this plan builds nothing"
+}
+
+# A key the node type cannot be scheduled without.
+lint_required() {
+  local f="$1" k="$2" v="$3"
+  [ -n "$v" ] && return 0
+  lint_red "${f}: no ${k}: — the queue schedules on it, and an absent key" \
+    "reads as a default rather than as a mistake"
+}
+
 # Stale anchors under '## Where to look': existence of the path half only —
-# symbols move too often to police, and the staleness rule already says
-# verify before relying. Only tokens that look like paths (a slash or a
-# dot) are anybody's business here: env vars, knobs and flags are natural
-# anchors too, and a false warning trains sessions to ignore the warn
-# channel the real findings ride on. URLs are skipped before the colon
-# strip (which would eat them); '=' marks an assignment, not a path.
-lint_anchors() {
-  local f="$1" a p
+# symbols move too often to police, and the staleness rule already says verify
+# before relying.
+section_paths() {
+  local a p
   while IFS= read -r a; do
     [ -n "$a" ] || continue
     case "$a" in *'://'* | *'='*) continue ;; esac
-    p="${a%%:*}"; p="${p%% *}"
-    case "$p" in '' | *'*'* | '<'*) continue ;; esac
+    p="${a%%:*}"; p="${p%% *}"; p="${p#./}"
+    case "$p" in '' | '.' | '..' | *'*'* | '<'*) continue ;; esac
     case "$p" in */* | *.*) ;; *) continue ;; esac
-    [ -e "${ROOT}/${p}" ] ||
-      lint_warn "${f}: anchor '${p}' not in tree — verify, fix in place"
-  done < <(awk '/^## Where to look/ { s = 1; next }
+    printf '%s\n' "$p"
+    # PREFIX match on the heading, not equality.
+  done < <(awk -v want="## $2" '
+    index($0, want) == 1 { s = 1; next }
     /^## / { s = 0 }
     s && /^- `/ { if (match($0, /`[^`]+`/))
-      print substr($0, RSTART + 1, RLENGTH - 2) }' "${ROOT}/${f}")
+      print substr($0, RSTART + 1, RLENGTH - 2) }' "${ROOT}/$1")
+}
+
+anchor_paths() { section_paths "$1" 'Where to look'; }
+
+lint_anchors() {
+  local f="$1" p
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    [ -e "${ROOT}/${p}" ] ||
+      lint_warn "${f}: anchor '${p}' not in tree — verify, fix in place"
+  done < <(anchor_paths "$f")
+}
+
+# Node files of a type the harness does not implement.
+lint_unknown_types() {
+  local d name f l1 l2 k v stem n keys phrase
+  [ -d "${ROOT}/docs" ] || return 0
+  # Only where the harness's own docs are present.
+  [ -d "${ROOT}/.agents/docs" ] || return 0
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    name="${d##*/}"
+    [ -n "$name" ] || continue
+    [ -d "${ROOT}/.agents/docs/${name}" ] && continue
+    n=0
+    keys=""
+    # Two builtin reads per file, no forks and no awk.
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      l1=""
+      l2=""
+      { IFS= read -r l1; IFS= read -r l2; } <"${ROOT}/${f}" 2>/dev/null || :
+      # A CRLF checkout is a checkout, not a different repo: Git for Windows
+      # defaults to core.autocrlf=true, and `---\r` is not `---`.
+      l1="${l1%$'\r'}"
+      l2="${l2%$'\r'}"
+      [ "$l1" = "---" ] || continue
+      case "$l2" in *:*) ;; *) continue ;; esac
+      k="${l2%%:*}"
+      v="${l2#*:}"
+      v="${v#"${v%%[![:space:]]*}"}"
+      v="${v%"${v##*[![:space:]]}"}"
+      case "$k" in [a-z]*) ;; *) continue ;; esac
+      case "$k" in *[!a-z_-]*) continue ;; esac
+      stem="${f##*/}"
+      stem="${stem%.md}"
+      [ "$v" = "$stem" ] || continue
+      n=$((n + 1))
+      case " ${keys} " in *" ${k} "*) ;; *) keys="${keys:+${keys} }${k}" ;; esac
+      # -type f: a DIRECTORY named `something.md` was read as a file and took
+      # the whole directory's answer down with it.
+    done < <(cd "$ROOT" && find "docs/${name}" -maxdepth 1 -type f -name '*.md' \
+      ! -name 'TEMPLATE.md' ! -name 'README.md' ! -name 'RETIRED.md' ! -name 'VISION.md' ! -name 'SCOUT.md' \
+      2>/dev/null | sort)
+    [ "$n" -gt 0 ] || continue
+    # Every key seen, not the last one. Naming one key over a count that
+    # covers two makes the sentence false for the other file.
+    phrase="a '${keys}:' field"
+    case "$keys" in
+      *' '*) phrase="'$(printf '%s' "$keys" | sed "s/ /:'\/'/g"):' fields" ;;
+    esac
+    lint_warn "docs/${name}/: ${n} file(s) name themselves in ${phrase}," \
+      "but no .agents/docs/${name}/ defines that type"
+  done < <(cd "$ROOT" && find docs -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
+}
+
+# One validator of the `issue:` format, for every reader in this file: the
+# workstream claim, the plan's `issue:` (the clerk's PLANNED edge) and the
+# clerk's two lists.
+issue_verdict() {
+  local iss="$1"
+  case "$iss" in
+    '' | none) printf 'none'; return 0 ;;
+    '#'[0-9]* | [0-9]*) ;;
+    *) printf 'bad not a number'; return 0 ;;
+  esac
+  case "${iss#\#}" in
+    *[!0-9]*) printf 'bad not a number' ;;
+    0) printf 'bad there is no issue #0' ;;
+    0*) printf 'bad leading zero; #%s is not #%s, so a reader scanning for their own number misses it' \
+          "${iss#\#}" "${iss##*0}" ;;
+    *) printf 'ok %s' "${iss#\#}" ;;
+  esac
+}
+
+# `issue_verdict` as a lint finding. `<consequence>` is what a dropped value
+# costs at that field's reader — the hook for a claim, the clerk for a plan.
+lint_issue() {
+  local rel="$1" iss="$2" consequence="$3" v
+  v="$(issue_verdict "$iss")"
+  case "$v" in
+    bad\ *) lint_red "${rel}: issue '${iss}' — ${v#bad }; ${consequence}" ;;
+  esac
 }
 
 lint_graph() {
   LINT_RC=0
   LINT_WARNED=0
-  local rel val n p r urgency agent effort
+  local rel val n p r urgency agent effort iss rq grad pstem rstem fstem piss
   local -a need_list
-  local plans=0 workstreams=0 reqs=0
+  local plans=0 workstreams=0 reqs=0 research=0 rdocs=0
+  # Stems the open plans' `research:` edges name, one per line.
+  local rrefs=""
 
   # One read of the file, one pass over its frontmatter. The older shape cost
   # a `cat` plus an awk per field, on every plan, on every ci.
   while IFS= read -r rel; do
     [ -n "$rel" ] || continue
     plans=$((plans + 1))
-    { read -r urgency; read -r agent; read -r effort; read -r val; read -r r; } \
-      <<<"$(gr_fields urgency agent effort needs requirement <"${ROOT}/${rel}")"
+    { read -r urgency; read -r agent; read -r effort; read -r val; read -r r
+      read -r rq; read -r pstem; read -r pscope; read -r piss; } \
+      <<<"$(gr_fields urgency agent effort needs requirement research plan scope issue <"${ROOT}/${rel}")"
+    lint_required "$rel" plan "$pstem"
+    # Optional: the issue a clerk turned into this plan.
+    lint_issue "$rel" "$piss" "the clerk drops it and the issue reads as unplanned"
+    lint_required "$rel" urgency "$urgency"
+    lint_required "$rel" agent "$agent"
+    lint_required "$rel" effort "$effort"
     lint_enum "$rel" urgency "$urgency" normal urgent
-    lint_enum "$rel" agent "$agent" haiku sonnet opus
+    lint_enum "$rel" agent "$agent" haiku sonnet opus fable
     lint_enum "$rel" effort "$effort" low medium high xhigh
+    # fable is a judgement tier, never a build (.agents/docs/agent-
+    # selection.md, Lineup).
+    [ "$agent" != "fable" ] || lint_fable_bound "$rel" "$pscope"
     if [ -n "$val" ] && [ "$val" != "none" ]; then
       read -ra need_list <<<"${val//,/ }"
-      # Guarded like cmd_ci's targets: a separators-only value leaves the
-      # array empty, and expanding an empty array under set -u is fatal on
-      # macOS system bash 3.2.
+      # Guarded like cmd_ci's targets: a separators-only value leaves the array
+      # empty, and expanding an empty array under set -u is fatal on macOS
+      # system bash 3.2.
       [ "${#need_list[@]}" -gt 0 ] || need_list=("")
       for n in "${need_list[@]}"; do
         n="$(lint_stem "$n")"
@@ -786,6 +941,21 @@ lint_graph() {
           lint_red "${rel}: needs '${n}' — no such plan, never existed. Typo?"
         fi
       done
+    fi
+    # The `research:` edge (.agents/docs/research/README.md).
+    if [ -n "$rq" ] && [ "$rq" != "none" ]; then
+      while IFS= read -r n; do
+        [ -n "$n" ] || continue
+        rrefs="${rrefs}${n}
+"
+        [ -f "${ROOT}/docs/research/${n}.md" ] && continue
+        lint_existed "docs/research/${n}.md" && continue
+        if lint_shallow; then
+          lint_warn "${rel}: research '${n}' unknown here (shallow history) — typo or answered, cannot tell"
+        else
+          lint_red "${rel}: research '${n}' — no such question, never existed. Plan reads as unblocked; typo?"
+        fi
+      done < <(gr_edge_stems "$rq")
     fi
     r="$(lint_stem "$r")"
     if [ -n "$r" ] && [ "$r" != "none" ] &&
@@ -801,28 +971,87 @@ lint_graph() {
     lint_anchors "$rel"
   done < <(lint_nodes docs/plans)
 
+  # Research nodes.
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    { read -r urgency; read -r agent; read -r effort; read -r grad
+      read -r rstem; } \
+      <<<"$(gr_fields urgency agent effort graduates research <"${ROOT}/${rel}")"
+    fstem="$(lint_stem "$rel")"
+    if [ -z "$rstem" ] &&
+       ! printf '%s' "$rrefs" | grep -qxF -- "$fstem"; then
+      if ! grep -qE "^research:[[:space:]]*${fstem//./\\.}[[:space:]]*(#.*)?$" \
+           "${ROOT}/${rel}" 2>/dev/null &&
+         [ -n "$(GIT_LITERAL_PATHSPECS=1 git -C "$ROOT" log -1 --format=%H \
+           -G"^research:[[:space:]]*${fstem//./\\.}[[:space:]]*$" HEAD -- "$rel" \
+           2>/dev/null)" ]; then
+        lint_red "${rel}: was a node — this history carried 'research: ${fstem}'" \
+          "and the file no longer does. Restore the frontmatter or delete the" \
+          "file; dropping the block is not how a node leaves the queue"
+      elif grep -q '^JOHARNESS_CANONICAL=1' "$CONF" 2>/dev/null; then
+        # Silent in a consumer, where the document is the legitimate case.
+        lint_warn "${rel}: a document, not a node — no research: key and no" \
+          "plan routes to it. A consumer keeps documents here; canonical does not"
+      else
+        rdocs=$((rdocs + 1))
+      fi
+      continue
+    fi
+    research=$((research + 1))
+    # Same gap, same fix, one type over: a research node the queue lists is
+    # scheduled on these too.
+    lint_required "$rel" research "$rstem"
+    [ -z "$rstem" ] || [ "$(lint_stem "$rstem")" = "$fstem" ] ||
+      lint_red "${rel}: research '${rstem}' — does not name this file. A node" \
+        "names itself; the queue reads this one as '${fstem}' and nothing reads it as '${rstem}'"
+    lint_required "$rel" urgency "$urgency"
+    lint_required "$rel" agent "$agent"
+    lint_required "$rel" effort "$effort"
+    lint_enum "$rel" urgency "$urgency" normal urgent
+    lint_enum "$rel" agent "$agent" haiku sonnet opus fable
+    lint_enum "$rel" effort "$effort" low medium high xhigh
+    if [ -z "$grad" ] || [ "$grad" = "none" ]; then
+      lint_red "${rel}: no graduates: — an answer with nowhere to land does not survive the session that found it"
+    elif [ ! -d "${ROOT}/$(case "$grad" in */*) printf '%s' "${grad%/*}" ;; *) printf '.' ;; esac)" ]; then
+      # The DIRECTORY, not the file.
+      lint_red "${rel}: graduates '${grad}' — its directory is not in this tree; typo?"
+    elif [ ! -e "${ROOT}/${grad}" ]; then
+      lint_warn "${rel}: graduates '${grad}' — not in the tree yet; the graduating pull request creates it"
+    fi
+    lint_anchors "$rel"
+  done < <(lint_nodes docs/research)
+
   while IFS= read -r rel; do
     [ -n "$rel" ] || continue
     workstreams=$((workstreams + 1))
-    { read -r val; read -r agent; read -r p; } \
-      <<<"$(gr_fields status agent plan <"${ROOT}/${rel}")"
+    { read -r val; read -r agent; read -r p; read -r iss; } \
+      <<<"$(gr_fields status agent plan issue <"${ROOT}/${rel}")"
     if [ -z "$val" ]; then
       lint_warn "${rel}: no status — hooks read '?'"
     else
-      lint_enum "$rel" status "$val" in-progress blocked review "done"
+      lint_enum "$rel" status "$val" in-progress blocked review "done" abandoned
     fi
-    lint_enum "$rel" agent "$agent" haiku sonnet opus
+    lint_enum "$rel" agent "$agent" haiku sonnet opus fable
     p="$(lint_stem "$p")"
     if [ -n "$p" ] && [ "$p" != "none" ] &&
+       { [ -f "${ROOT}/docs/research/${p}.md" ] ||
+         [ -f "${ROOT}/docs/product/${p}.md" ]; }; then
+      :
+    elif [ -n "$p" ] && [ "$p" != "none" ] &&
        [ ! -f "${ROOT}/docs/plans/${p}.md" ]; then
-      if lint_existed "docs/plans/${p}.md"; then
+      if lint_existed "docs/research/${p}.md"; then
+        lint_warn "${rel}: claims research '${p}' gone from tree (answered?) — claim reads as none"
+      elif lint_existed "docs/plans/${p}.md"; then
         lint_warn "${rel}: claims plan '${p}' gone from tree (merged?) — claim reads as none"
+      elif lint_existed "docs/product/${p}.md"; then
+        lint_warn "${rel}: claims requirement '${p}' gone from tree (served?) — claim reads as none"
       elif lint_shallow; then
         lint_warn "${rel}: plan '${p}' unknown here (shallow history) — typo or merged, cannot tell"
       else
-        lint_red "${rel}: plan '${p}' — no such plan, never existed. Claim invisible; typo?"
+        lint_red "${rel}: plan '${p}' — no such plan, question or requirement, never existed. Claim invisible; typo?"
       fi
     fi
+    lint_issue "$rel" "$iss" "the hook drops it and the issue reads as unclaimed"
     lint_anchors "$rel"
   done < <(lint_nodes docs/handover)
 
@@ -833,16 +1062,168 @@ lint_graph() {
       "$(gr_field priority <"${ROOT}/${rel}")" normal urgent
   done < <(lint_nodes docs/product)
 
+  lint_unknown_types
+
   if [ "$LINT_RC" -eq 0 ] && [ "$LINT_WARNED" -eq 0 ]; then
-    printf '  edges sound (%d plans, %d workstreams, %d requirements)\n' \
-      "$plans" "$workstreams" "$reqs"
+    printf '  edges sound (%d plans, %d research, %d workstreams, %d requirements)\n' \
+      "$plans" "$research" "$workstreams" "$reqs"
+    # Counted here, in the run that skipped them, so the skip stays visible
+    # without a warning a consumer could never act on.
+    [ "$rdocs" -eq 0 ] ||
+      printf '  %d document(s) under docs/research/ — not nodes, never scheduled (.agents/docs/research/README.md)\n' \
+        "$rdocs"
   fi
   return "$LINT_RC"
 }
 
+# --- Ship scope: does a plan's work reach consumers?
+SHIP_ENGINE=".agents/scripts/sync-to-consumer.sh"
+SHIP_FILES=()
+SHIP_DIRS=()
+SHIP_CANON=()
+SHIP_CANON_DIRS=()
+SHIP_LOADED=0
+
+# One array literal out of the engine.
+ship_array() {
+  awk -v name="$1" '
+    index($0, name "=(") == 1 {
+      # A one-line declaration closes on its own line — NAME=() most of all.
+      rest = substr($0, length(name) + 3)
+      if (index(rest, ")") > 0) {
+        sub(/\).*$/, "", rest)
+        sub(/#.*$/, "", rest)
+        n = split(rest, parts, /[ \t]+/)
+        for (i = 1; i <= n; i++) if (parts[i] != "") print parts[i]
+        exit
+      }
+      inside = 1; next
+    }
+    inside && index($0, ")") == 1 { exit }
+    inside { sub(/#.*$/, ""); for (i = 1; i <= NF; i++) print $i }
+  ' "${ROOT}/${SHIP_ENGINE}" 2>/dev/null
+}
+
+# Non-zero = no verdict is available here.
+ship_load() {
+  [ "$SHIP_LOADED" -eq 0 ] || return 0
+  [ -r "${ROOT}/${SHIP_ENGINE}" ] || return 1
+  grep -q '^JOHARNESS_CANONICAL=1' "$CONF" 2>/dev/null || return 1
+  local x
+  SHIP_FILES=(); SHIP_DIRS=(); SHIP_CANON=(); SHIP_CANON_DIRS=()
+  while IFS= read -r x; do [ -n "$x" ] && SHIP_FILES+=("$x"); done < <(ship_array FILES)
+  while IFS= read -r x; do [ -n "$x" ] && SHIP_DIRS+=("$x"); done < <(ship_array DIRS)
+  while IFS= read -r x; do [ -n "$x" ] && SHIP_CANON+=("$x"); done < <(ship_array CANONICAL_ONLY)
+  while IFS= read -r x; do [ -n "$x" ] && SHIP_CANON_DIRS+=("$x"); done < <(ship_array CANONICAL_ONLY_DIRS)
+  # An engine whose lists this parser cannot see would label every path
+  # canonical-only — confidently, and wrongly. Say nothing instead.
+  { [ "${#SHIP_FILES[@]}" -gt 0 ] && [ "${#SHIP_DIRS[@]}" -gt 0 ]; } || return 1
+  # A path is a path.
+  for x in ${SHIP_FILES[@]+"${SHIP_FILES[@]}"} ${SHIP_DIRS[@]+"${SHIP_DIRS[@]}"} \
+    ${SHIP_CANON[@]+"${SHIP_CANON[@]}"} ${SHIP_CANON_DIRS[@]+"${SHIP_CANON_DIRS[@]}"}; do
+    case "$x" in *'('* | *'='* | *')'*) return 1 ;; esac
+  done
+  SHIP_LOADED=1
+}
+
+# 0 = this path reaches consumers.
+ship_path_ships() {
+  local p="${1#shared:}" c
+  p="${p%/}"
+  if [ "${#SHIP_CANON[@]}" -gt 0 ]; then
+    for c in "${SHIP_CANON[@]}"; do [ "$p" = "$c" ] && return 1; done
+  fi
+  if [ "${#SHIP_CANON_DIRS[@]}" -gt 0 ]; then
+    for c in "${SHIP_CANON_DIRS[@]}"; do
+      case "$p" in "$c" | "$c"/*) return 1 ;; esac
+    done
+  fi
+  for c in "${SHIP_FILES[@]}"; do [ "$p" = "$c" ] && return 0; done
+  for c in "${SHIP_DIRS[@]}"; do
+    case "$p" in "$c" | "$c"/*) return 0 ;; esac
+  done
+  # Two paths the engine ships by logic, not by array membership, so the arrays
+  # alone call them canonical-only — wrongly, and confidently.
+  case "$p" in .agents/env/*) return 0 ;; esac
+  # AGENTS.md is spliced, not copied: everything above the Part 2 marker
+  # reaches every consumer. It is absent from FILES on purpose.
+  [ "$p" = "AGENTS.md" ] && return 0
+  return 1
+}
+
+# Plans this branch adds or changes, working tree included.
+ship_changed_plans() {
+  local base entry f
+  base="$(git -C "$ROOT" merge-base HEAD \
+    "origin/${HANDOVER_BASE_BRANCH:-main}" 2>/dev/null)" || base=""
+  {
+    [ -n "$base" ] && git -C "$ROOT" diff --no-renames --name-only \
+      "${base}..HEAD" 2>/dev/null
+    while IFS= read -r -d '' entry; do
+      printf '%s\n' "${entry:3}"
+    done < <(git -C "$ROOT" status --porcelain -z --no-renames 2>/dev/null)
+  } | awk '/^docs\/plans\/[^\/]+\.md$/ { print }' | gr_docs | sort -u
+}
+
+# Report only.
+lint_ship() {
+  local rel stem scope p shipping ships=0 seen=0
+  local -a ship_plans=()
+  local -a ship_paths=()
+
+  ship_load || return 0
+
+  if [ "${JOHARNESS_SHIP:-}" = "all" ]; then
+    while IFS= read -r rel; do
+      [ -n "$rel" ] && ship_plans+=("$rel")
+    done < <(lint_nodes docs/plans)
+  else
+    while IFS= read -r rel; do
+      [ -n "$rel" ] && ship_plans+=("$rel")
+    done < <(ship_changed_plans)
+  fi
+
+  if [ "${#ship_plans[@]}" -eq 0 ]; then
+    printf '  no plan added or changed on this branch\n'
+    return 0
+  fi
+
+  for rel in "${ship_plans[@]}"; do
+    # A deleted plan is a merged plan. Nothing to advise.
+    [ -f "${ROOT}/${rel}" ] || continue
+    seen=$((seen + 1))
+    stem="$(lint_stem "$rel")"
+    scope="$(gr_field scope <"${ROOT}/${rel}")"
+    if [ -z "$scope" ] || [ "$scope" = "none" ]; then
+      printf '  %s: no scope declared — no verdict\n' "$stem"
+      continue
+    fi
+    shipping=""
+    read -ra ship_paths <<<"${scope//,/ }"
+    if [ "${#ship_paths[@]}" -gt 0 ]; then
+      for p in "${ship_paths[@]}"; do
+        [ -n "$p" ] || continue
+        ship_path_ships "$p" && shipping="${shipping}${shipping:+, }${p}"
+      done
+    fi
+    if [ -n "$shipping" ]; then
+      ships=$((ships + 1))
+      printf '  %s: SHIPS to consumers — %s\n' "$stem" "$shipping"
+    else
+      printf '  %s: canonical-only\n' "$stem"
+    fi
+  done
+
+  [ "$seen" -gt 0 ] || printf '  no plan added or changed on this branch\n'
+  if [ "$ships" -gt 0 ]; then
+    printf '  A shipping plan lands in every consumer at its next sync. Its\n'
+    printf '  Acceptance names the consumer-side check (.agents/docs/plans/README.md).\n'
+  fi
+  return 0
+}
+
 # The shellcheck binary is the acceptance bar, but its absence is an
-# environment problem, not a code problem. Best effort: install quietly,
-# succeed = have it.
+# environment problem, not a code problem.
 ensure_shellcheck() {
   have shellcheck && return 0
   if have apt-get; then
@@ -857,37 +1238,12 @@ ensure_shellcheck() {
   have shellcheck
 }
 
-# ---------------------------------------------------------------------------
-# Review step
-#
-# The harness has ordered a review at every edge into main since the loop was
-# written (.agents/harness/AGENTS.md step 5, depth by tier in
-# .agents/docs/agent-selection.md). Nothing checked that one happened. The record
-# is the workstream file's `## Review` section, and only a human reading hook
-# output ever noticed it empty — "a branch visibly churning with an empty
-# Review section is the human's cue" (.agents/docs/handover/README.md,
-# Reviewing) is the whole of today's enforcement, and it needs a human looking.
-#
-# Off by default, and silent while off: a repo that has not opted in sees no
-# output and no gate, so `ci` here means exactly what it meant before. On, the
-# check rides in `ci` — the one gate a session cannot skip, same argument the
-# churn ceiling and the graph lint already rest on: the session that skipped
-# its own review is the one that cannot see it skipped.
-#
-# What it checks is the RECORD, never the finding count. Counts carry no
-# signal in either direction (.agents/docs/agent-selection.md, review churn:
-# "Finding counts no signal, false both ways"), so a gate on N>0 findings buys
-# invented findings and nothing else. A clean pass records one line saying it
-# was clean; an empty section is not a clean pass, it is no pass.
-# ---------------------------------------------------------------------------
+# --- Review step
 
 # Tier the review depth scales with: the workstream file's own `agent:`, else
 # the tier of the plan it claims, else the default from the selection rules.
-# One vocabulary, read where the protocol already writes it — no second field
-# to keep in sync.
 review_tier() {
-  local doc="$1" tier plan
-  tier="$(printf '%s\n' "$doc" | gr_field agent)"
+  local doc="$1" tier="$2" plan
   if [ -z "$tier" ]; then
     plan="$(lint_stem "$(printf '%s\n' "$doc" | gr_field plan)")"
     if [ -n "$plan" ] && [ "$plan" != "none" ] &&
@@ -904,7 +1260,7 @@ review_recipe() {
   case "$1" in
     haiku)
       printf 'one /code-review pass at default effort — one pass, never zero' ;;
-    opus)
+    opus|fable)
       printf 'adversarial: correctness, security, does-it-reproduce as separate passes' ;;
     *)
       printf '/code-review (high) on the full diff' ;;
@@ -918,20 +1274,170 @@ review_count() {
     /^## Review[[:space:]]*$/ { in_r = 1; next }
     /^## /                    { in_r = 0 }
     in_r && /^- /             { n++ }
-    END { print n + 0 }' "${ROOT}/$1"
+    END { print n + 0 }'
+}
+
+# Findings this branch recorded that nothing can ever serve back.
+lint_ws_in_diff() {
+  git -C "$ROOT" log --format= --name-only --diff-filter=ACMRT \
+    "${1}..HEAD" -- docs/handover 2>/dev/null | sort -u | gr_docs
+}
+
+# From git, not the working tree. HEAD first; for a file this branch retired,
+# the commit before the one that removed it.
+lint_ws_content() {
+  local ws="$1" content c
+  content="$(git -C "$ROOT" show "HEAD:${ws}" 2>/dev/null)" || content=""
+  if [ -z "$content" ]; then
+    c="$(git -C "$ROOT" rev-list -1 HEAD -- "$ws" 2>/dev/null)"
+    if [ -n "$c" ]; then
+      content="$(git -C "$ROOT" show "${c}^:${ws}" 2>/dev/null)" || content=""
+    fi
+  fi
+  printf '%s' "$content"
+}
+
+# Every `## Review` bullet in one workstream file, as "<indented>\t<text>".
+lint_review_bullets() {
+  printf '%s\n' "$1" | awk '
+    /^## Review[[:space:]]*$/ { r = 1; next }
+    /^## /                    { r = 0 }
+    r && /^- /                { print "0\t" substr($0, 3); next }
+    r && /^[ \t]+- /          { t = $0; sub(/^[ \t]+- /, "", t); print "1\t" t }'
+}
+
+# Findings in this branch's OWN workstream files (fin_own_ws) with no verdict
+# (fb_marker).
+lint_finding_markers() {
+  local over="origin/${HANDOVER_BASE_BRANCH:-main}" base ws content text
+  local unmarked=0 seen=0 here short
+  base="$(git -C "$ROOT" merge-base HEAD "$over" 2>/dev/null)"
+  if [ -z "$base" ]; then
+    printf '  not measurable here (no merge-base with %s; unrelated history)\n' "$over"
+    return 0
+  fi
+  while IFS= read -r ws; do
+    [ -n "$ws" ] || continue
+    content="$(lint_ws_content "$ws")"
+    [ -n "$content" ] || continue
+    seen=$((seen + 1))
+    here=0
+    # fb_findings, which FOLDS continuation lines into the bullet above — not
+    # lint_review_bullets, which does not.
+    while IFS= read -r text; do
+      [ -n "$text" ] || continue
+      [ "$(fb_marker "$text")" = "unmarked" ] || continue
+      unmarked=$((unmarked + 1))
+      [ "$here" -eq 1 ] || { here=1; printf '  %s\n' "$ws"; }
+      # Cut at a SPACE, which is ASCII and so can never land inside a multibyte
+      # character — the same reason lint_finding_ids does, and findings here
+      # carry em dashes constantly.
+      short=""
+      if [ "${#text}" -gt 76 ]; then
+        short="${text:0:72}"
+        case "$short" in
+          *' '*) short="${short% *}" ;;
+          *) short="" ;;
+        esac
+      fi
+      if [ -n "$short" ]; then printf '    %s …\n' "$short"
+      else printf '    %s\n' "$text"; fi
+    done <<<"$(printf '%s\n' "$content" | fb_findings)"
+  done <<<"$(fin_own_ws "$base")"
+
+  if [ "$seen" -eq 0 ]; then
+    printf '  no workstream file in this branch'"'"'s diff\n'
+    return 0
+  fi
+  if [ "$unmarked" -eq 0 ]; then
+    printf '  every finding on this branch says what came of it\n'
+    return 0
+  fi
+  printf '\n  %d finding(s) with no verdict. End each with one of (joharness.sh:fb_marker):\n' "$unmarked"
+  printf '    - r1: <finding> (fixed in <file or commit>)\n'
+  printf '    - r2: <finding> — wontfix: <why>\n'
+  printf '    - r3: <finding> — no change: <why>\n'
+  return 1
+}
+
+lint_finding_ids() {
+  local over="origin/${HANDOVER_BASE_BRANCH:-main}" base ws content c line
+  local flag text short bad=0 seen=0 here
+  base="$(git -C "$ROOT" merge-base HEAD "$over" 2>/dev/null)"
+  if [ -z "$base" ]; then
+    # Churn's doctrine: a check that cannot see the history it needs says so
+    # and passes, rather than going red on what it cannot prove.
+    printf '  not measurable here (no merge-base with %s; unrelated history)\n' "$over"
+    return 0
+  fi
+  # The DIFF, never the tree.
+  while IFS= read -r ws; do
+    [ -n "$ws" ] || continue
+    # From git, not from the working tree.
+    content="$(lint_ws_content "$ws")"
+    [ -n "$content" ] || continue
+    seen=$((seen + 1))
+    here=0
+    # Each bullet'"'"'s FIRST line, and indented bullets separately.
+    while IFS="$(printf '\t')" read -r flag text; do
+      [ -n "$text" ] || continue
+      if [ "$flag" = "0" ] && fb_keyable "$text"; then
+        continue
+      fi
+      bad=$((bad + 1))
+      # The file once, then its bullets. Repeating the path per finding is
+      # what a reader skips, and this stage runs on every ci.
+      [ "$here" -eq 1 ] || { here=1; printf '  %s\n' "$ws"; }
+      # Cut at a SPACE, which is ASCII and so can never land inside a multibyte
+      # character.
+      short=""
+      if [ "${#text}" -gt 76 ]; then
+        short="${text:0:72}"
+        case "$short" in
+          *' '*) short="${short% *}" ;;
+          *) short="" ;;
+        esac
+      fi
+      if [ -n "$short" ]; then
+        printf '    %s …\n' "$short"
+      else
+        printf '    %s\n' "$text"
+      fi
+      [ "$flag" = "1" ] && printf '      ^ indented; the map keys a bullet at column 0 only\n'
+    done <<<"$(lint_review_bullets "$content")"
+  done <<<"$(fin_own_ws "$base")"
+
+  if [ "$seen" -eq 0 ]; then
+    printf '  no workstream file in this branch'"'"'s diff\n'
+    return 0
+  fi
+  if [ "$bad" -eq 0 ]; then
+    printf '  every finding on this branch carries an id the fix map can key on\n'
+    return 0
+  fi
+  printf '\n  %d finding(s) nothing can key on (joharness.sh:fb_fix_map). Write each\n' "$bad"
+  printf '  as a top-level bullet with an id and a colon, for example:\n'
+  printf '    - r1: <finding> (fixed in <file or commit>)\n'
+  return 1
 }
 
 # At the edge = this workstream is being handed to `main`: it has a pull
-# request, or its own status says the work is over. Below the edge the review
-# has not come due yet — the loop puts it at step 5, after the build — so the
-# gate warns there and fails here. Two tiers for the same reason churn has
-# them: `ci` runs all through the build, and a check that reds from the claim
-# commit onward makes red the normal state of a working branch, which is how a
-# gate stops being read at all.
+# request, or its own status says the work is over.
+review_marks() {
+  awk '
+    function tagged(s) { return match(s, /\(verifier[,)]/) > 0 }
+    /^## Review[[:space:]]*$/ { in_r = 1; next }
+    /^## /                    { if (in_r && tagged(buf)) t = 1
+                                buf = ""; in_r = 0 }
+    in_r && /^- /             { if (tagged(buf)) t = 1
+                                buf = substr($0, 3); n++; next }
+    in_r && /^  [^ ]/         { buf = buf " " $0 }
+    END                       { if (in_r && tagged(buf)) t = 1
+                                print (n + 0) " " (t + 0) }'
+}
+
 review_at_edge() {
-  local doc="$1" pr status
-  pr="$(printf '%s\n' "$doc" | gr_field pr)"
-  status="$(printf '%s\n' "$doc" | gr_field status)"
+  local pr="$1" status="$2"
   if [ -n "$pr" ] && [ "$pr" != "none" ]; then
     printf 'pr %s' "$pr"
     return 0
@@ -943,14 +1449,10 @@ review_at_edge() {
 }
 
 # Prints the step, two-space indented like every other `ci` section, and
-# returns non-zero only when this branch owes a review record. Reads the
-# working tree, not a ref: `ci` judges what the branch is about to push.
-# Every workstream file on the branch, not the first: a branch carrying two
-# workstreams owes two records, and checking one of them would pass the
-# branch on a review that never covered the other half of its diff.
+# returns non-zero only when this branch owes a review record.
 review_report() {
   local over="origin/${HANDOVER_BASE_BRANCH:-main}" base head ws doc tier n
-  local edge rc=0 seen=0
+  local edge rc=0 seen=0 marks tagged agent pr status own mine
   base="$(git -C "$ROOT" merge-base HEAD "$over" 2>/dev/null)"
   head="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)"
   if [ -z "$base" ]; then
@@ -964,18 +1466,50 @@ review_report() {
     return 0
   fi
 
+  # Files THIS branch wrote, for the tag gate below.
+  own="$(lint_ws_in_diff "$base")"
+
   while IFS= read -r ws; do
     [ -n "$ws" ] || continue
     seen=1
+    case $'\n'"${own}"$'\n' in
+      *$'\n'"${ws}"$'\n'*) mine=1 ;;
+      *) mine=0 ;;
+    esac
     doc="$(cat "${ROOT}/${ws}" 2>/dev/null)"
-    tier="$(review_tier "$doc")"
-    n="$(review_count "$ws")"
+    # ONE frontmatter pass and ONE section pass per file, both feeding
+    # everything below.
+    { read -r agent; read -r pr; read -r status; } < <(
+      printf '%s\n' "$doc" | gr_fields agent pr status)
+    tier="$(review_tier "$doc" "$agent")"
+    marks="$(review_marks <"${ROOT}/${ws}")"
+    n="${marks%% *}"; tagged="${marks##* }"
+    edge="$(review_at_edge "$pr" "$status")" || edge=""
     printf '  %s [%s — %s]\n' "$ws" "$tier" "$(review_recipe "$tier")"
+    # The independent reader, printed where the depth is already printed.
+    printf '    verifier: spawn .claude/agents/verifier.md at %s — it did not\n' "$tier"
+    printf '    write this diff, which is the whole property. Tag what it\n'
+    printf '    returns (verifier).\n'
     if [ "${n:-0}" -gt 0 ]; then
       printf '    %s finding(s) recorded\n' "$n"
+      [ "$tagged" = 1 ] && continue
+      if [ "$mine" = 0 ]; then
+        printf '    none tagged (verifier) — inherited from %s, not this\n' "$over"
+        printf '    branch to answer for\n'
+        continue
+      fi
+      # Mid-build stays exactly as silent as the zero-findings case: one line,
+      # the count, no gate output.
+      [ -n "$edge" ] || continue
+      printf '    none of them tagged (verifier), and this is the edge (%s)\n' "$edge"
+      printf '    The independent reader is step 5 at EVERY depth, and this gate\n'
+      printf '    can only read what got written. Spawn the agent at the depth\n'
+      printf '    above, then tag what it returns — one finding carrying\n'
+      printf '    (verifier) is the bar, not every line.\n'
+      rc=1
       continue
     fi
-    if ! edge="$(review_at_edge "$doc")"; then
+    if [ -z "$edge" ]; then
       printf '    no record yet — gate fires at the edge (pr set, or status review/done)\n'
       continue
     fi
@@ -988,10 +1522,6 @@ review_report() {
   done < <(lint_nodes docs/handover)
 
   if [ "$seen" -eq 0 ]; then
-    # Not a hole to paper over: copy, sync and plan-queue branches carry no
-    # workstream file BY protocol (.agents/docs/handover/README.md, "When NOT to
-    # write one"), so a record the protocol forbids cannot be the bar. Says
-    # what it did not check instead of passing quietly.
     printf '  no workstream file on this branch — no record to check\n'
     printf '  (copy, sync and plan-queue branches carry none by protocol)\n'
   fi
@@ -999,16 +1529,7 @@ review_report() {
 }
 
 # Standalone, the step runs whether or not the gate is armed — the recipe on
-# demand costs nothing, and a session may want it before ci ever runs. The
-# knob decides only whether `ci` fails for a missing record, so the header
-# says which of the two this run is.
-# What the files in this diff have already cost other branches. The review
-# step is the moment this pays: the reviewer is about to look at exactly these
-# files, and merged history knows which of them keep drawing findings.
-#
-# Standalone `review` only, never the `ci` gate: this walks all of merged
-# history (seconds, not milliseconds), and the gate runs on every ci. A
-# session that wants the whole picture runs `feedback`.
+# demand costs nothing, and a session may want it before ci ever runs.
 review_prior() {
   local over="origin/${HANDOVER_BASE_BRANCH:-main}" base hot f count shown=0
   base="$(git -C "$ROOT" merge-base HEAD "$over" 2>/dev/null)"
@@ -1016,16 +1537,28 @@ review_prior() {
   fb_collect || return 0
   hot="$(fb_hotspots)"
   [ -n "$hot" ] || return 0
-  while IFS= read -r f; do
+  # ONE awk over both lists, not one per changed file.
+  local rows
+  rows="$(
+    {
+      printf '%s\n' "$hot"
+      printf '\034\n'
+      git -C "$ROOT" diff --name-only "$base" HEAD 2>/dev/null
+    } | awk -F'\t' '
+      $0 == "\034" { d = 1; next }
+      !d { c[$2] = $1; next }
+      $0 != "" && ($0 in c) { printf "%s\t%s\n", $0, c[$0] }
+    '
+  )"
+  [ -n "$rows" ] || return 0
+  while IFS="$(printf '\t')" read -r f count; do
     [ -n "$f" ] || continue
-    count="$(printf '%s\n' "$hot" | awk -F'\t' -v p="$f" '$2 == p { print $1 }')"
-    [ -n "$count" ] || continue
     if [ "$shown" -eq 0 ]; then
       shown=1
       printf '\n  already cost other branches — read before reviewing:\n'
     fi
     printf '    %s (%s edges)  ./joharness.sh feedback %s\n' "$f" "$count" "$f"
-  done <<<"$(git -C "$ROOT" diff --name-only "$base" HEAD 2>/dev/null)"
+  done <<<"$rows"
 }
 
 cmd_review() {
@@ -1040,74 +1573,46 @@ cmd_review() {
   return "$rc"
 }
 
-# ---------------------------------------------------------------------------
-# Feedback
-#
-# The review step (above) makes a branch record what its review found. The
-# record then dies: the finish ritual deletes the workstream file, by design —
-# a file left on `main` reads as current (.agents/docs/handover/README.md,
-# Graduation). So every finding this repo ever recorded is in merge history and
-# nowhere a session looks, and the next branch re-finds it.
-#
-# Measured on this repo's own history at the time this was written: 41 findings
-# across 8 merged edges, and 9 of 24 file-level fixes (38%) landed on a file an
-# earlier merged branch had already recorded a finding against. `AGENTS.md`
-# under the harness drew findings on 5 of those 8 edges. A file that keeps
-# drawing findings is a rule nobody has written yet.
-#
-# So this is two things, and the second is why the first exists:
-#   feedback          the scorecard — does the loop run, does its output
-#                     survive, does the same file keep coming back
-#   feedback <path>   what earlier merged branches found in that file
-#
-# Nothing is stored. Every number is counted from git at read time, so it
-# cannot rot and cannot be written wrong (the doctrine the churn measure and
-# the graph lint already run on). What it cannot count, it says: finding
-# volume is NOT a quality signal here — the review-churn rule already
-# establishes counts are false in both directions — so the number to watch is
-# recurrence, and the direction to want is down.
-# ---------------------------------------------------------------------------
+# --- Feedback
 
-# Every edge into the base branch: "<merge-sha> <branch-tip-sha>". Any merge
-# with two parents, no subject parsing — GitHub's "Merge pull request" wording
-# is one host's, and a consumer merging by hand makes the same edge.
-#
-# --first-parent is load bearing: without it the walk also descends into the
-# branches themselves, and a branch that merged main in mid-flight (the
-# protocol tells long-running ones to) contributes its own merge as a second
-# edge carrying the same workstream file. Measured while writing this: 51
-# "edges" and 42 findings against a true 37 and 41.
+# Every edge into the base branch: "<merge-sha> <branch-tip-sha>".
 fb_edges() {
-  git -C "$ROOT" log --first-parent --format='%H %P' --merges "$1" 2>/dev/null |
-    awk 'NF >= 3 { print $1, $3 }'
+  git -C "$ROOT" log --first-parent --format='%H %P%x09%s' --merges "$1" 2>/dev/null |
+    awk -F'\t' '{
+      n = split($1, a, " ")
+      if (n < 3) next
+      i = index($0, "\t")
+      print a[1], a[3], (i ? substr($0, i + 1) : "")
+    }'
 }
 
 # Every edge costs a git show per commit, so a repo with thousands of them
-# would make this measure something nobody runs twice. Newest first, bounded,
-# and the bound is printed when it bites — a window nobody was told about is
-# how a measure starts lying. 0 lifts it.
+# would make this measure something nobody runs twice.
 FB_LIMIT="${JOHARNESS_FEEDBACK_EDGES:-50}"
+# Recurrence is scored over a SLIDING window, not all of history.
+case "${JOHARNESS_RECURRENCE_WINDOW-8}" in
+  '' | *[!0-9]*)
+    FB_WINDOW=8 ;;
+  *) FB_WINDOW="${JOHARNESS_RECURRENCE_WINDOW-8}" ;;
+esac
 FB_TOTAL=0
 FB_CAPPED=0
 
 # Pull request number from a merge subject, else the short sha: the identifier
 # is for a human to go read the branch with, so any stable handle will do.
 fb_label() {
-  local subj n
-  subj="$(git -C "$ROOT" log -1 --format='%s' "$1" 2>/dev/null)"
-  n="$(printf '%s' "$subj" | sed -n 's/.*[Mm]erge pull request #\([0-9][0-9]*\).*/\1/p')"
-  [ -n "$n" ] && { printf 'PR%s' "$n"; return 0; }
+  local subj="$2" n
+  case "$subj" in
+    *[Mm]"erge pull request #"*)
+      n="${subj##*erge pull request #}"
+      n="${n%%[!0-9]*}"
+      [ -n "$n" ] && { printf 'PR%s' "$n"; return 0; }
+      ;;
+  esac
   printf '%s' "${1:0:7}"
 }
 
-# Last surviving version of the branch's workstream file. The ritual deletes
-# it in the final commit, so the newest commit that still HAS it is the one
-# carrying everything the branch learned — and that is the newest commit that
-# ADDED or MODIFIED it, which git will name directly. Asking for it beats the
-# older walk (a diff-tree per commit to list the files, then a cat-file per
-# commit per file to find one that still resolves) by the length of the branch.
-# `while read`, not `for f in $(...)`: an unquoted expansion splits a path with
-# a space in it into two paths that resolve to nothing.
+# Last surviving version of the branch's workstream file.
 fb_workstream() {
   local base="$1" tip="$2" f c
   while IFS= read -r f; do
@@ -1118,13 +1623,10 @@ fb_workstream() {
     git -C "$ROOT" show "${c}:${f}" 2>/dev/null && return 0
   done <<<"$(git -C "$ROOT" log --format='' --name-only "${base}..${tip}" \
     -- docs/handover 2>/dev/null |
-    awk 'NF && /\.md$/ && !/\/(TEMPLATE|README)\.md$/' | sort -u)"
+    awk 'NF && /\.md$/ && !/\/(TEMPLATE|README|RETIRED)\.md$/' | sort -u)"
   return 1
 }
 
-# One line per finding, wrapped continuations folded back in: a finding's
-# disposition usually sits at the end of its last line, so a reader that stops
-# at the first newline reads every finding as unmarked.
 fb_findings() {
   awk '
     /^## Review[[:space:]]*$/ { r = 1; next }
@@ -1134,40 +1636,33 @@ fb_findings() {
     END                       { if (r && buf != "") print buf }'
 }
 
-# wontfix and no-change are decisions, not defects, and they are decided in
-# the finding's own last clause — so the marker is read with wontfix first,
-# and a finding that says both "fixed" and "wontfix" is the compound one it
-# looks like, counted where the human put the verdict.
 fb_marker() {
   case "$1" in
     *wontfix*)                 printf 'wontfix' ;;
     *"no change"* | *"No change"*) printf 'no-change' ;;
     *'(fixed'*)                printf 'fixed' ;;
+    *"clean pass"* | *"Clean pass"*) printf 'no-change' ;;
     *)                         printf 'unmarked' ;;
   esac
 }
 
-# Commits that ADD a finding bullet to a workstream file, paired with the
-# other paths that same commit touched. The protocol puts a finding in the
-# same commit as its fix, so that commit's non-protocol paths are where the
-# finding landed — no parsing of prose, and no new field for a session to
-# fill in wrong.
-#
-# Per commit, not per branch: an edge that fixed nine findings across five
-# commits knows which of them touched which file, and rolling that up to the
-# branch would answer "what did this edge find" when the question a reader
-# asks is "what did anyone find HERE".
-#
-# Emits "<finding-id>\t<path>". The id, not the text: the bullet as committed
-# may predate its own disposition marker, so the text is taken later from the
-# file's final version and joined on the id, which is stable within an edge.
-#
-# One walk, not five processes per commit. `--raw -p` carries both halves in
-# one stream — the commit's changed paths as ':'-prefixed raw lines, then its
-# patch — and a marker line separates commits. Neither marker nor raw line can
-# collide with patch text: every line of a patch body carries a '+', '-' or
-# ' ' prefix. `tformat:` and not a bare string, which git reads as the name of
-# a built-in pretty format and rejects.
+# ONE definition of the form fb_fix_map can key on: an `r`, one or more digits,
+# then a COLON, read off a bullet fb_findings has already stripped.
+fb_keyable() {
+  local id="${1%%:*}" rest
+  # No colon at all and `%%:*` hands the whole line back — the `- rN text`
+  # shape, fourteen of which sat in one file.
+  [ "$id" != "$1" ] || return 1
+  rest="${id#r}"
+  [ "$rest" != "$id" ] || return 1
+  case "$rest" in
+    '' | *[!0-9]*) return 1 ;;
+  esac
+  return 0
+}
+
+# Commits that ADD a finding bullet to a workstream file, paired with the other
+# paths that same commit touched.
 fb_fix_map() {
   local base="$1" tip="$2"
   git -C "$ROOT" log --no-merges --format=tformat:'@@joharness-commit@@' \
@@ -1196,31 +1691,32 @@ fb_fix_map() {
     sort -u
 }
 
-# A path recorded before a directory move no longer resolves, and reading it
-# as a different file splits one hot spot into two cold ones (this repo's own
-# .agents/ move did exactly that: 3 branches at one spelling, 2 at the other).
-# Unique-suffix match repairs the prefixed-directory case and refuses to guess
-# anywhere else: no match or several, the path stands as recorded.
+FB_LS=""
+FB_LS_READ=0
+FB_CUR=""
+
 fb_current_path() {
-  local p="$1" hits
+  local p="$1" f hit="" n=0
+  FB_CUR="$p"
   [ -e "${ROOT}/${p}" ] && { printf '%s' "$p"; return 0; }
-  # String suffix on a path boundary, not a regex: a path carrying `+`, `(`
-  # or `{` must match itself and not its siblings (the literal-pathspec
-  # lesson the sync engine already learned the hard way).
-  hits="$(git -C "$ROOT" ls-files 2>/dev/null | awk -v p="$p" '
-    length($0) >= length(p) &&
-    substr($0, length($0) - length(p) + 1) == p &&
-    (length($0) == length(p) || substr($0, length($0) - length(p), 1) == "/")')"
-  if [ "$(printf '%s\n' "$hits" | grep -c .)" = "1" ]; then
-    printf '%s' "$hits"
-  else
-    printf '%s' "$p"
+  if [ "$FB_LS_READ" -eq 0 ]; then
+    FB_LS="$(git -C "$ROOT" ls-files 2>/dev/null)"
+    FB_LS_READ=1
   fi
+  while IFS= read -r f; do
+    case "$f" in
+      "$p" | *"/$p") ;;
+      *) continue ;;
+    esac
+    n=$((n + 1))
+    hit="$f"
+  done <<<"$FB_LS"
+  # Exactly one match resolves; none or several leave the path as recorded,
+  # because guessing between siblings is how one hot spot became two.
+  [ "$n" -eq 1 ] && FB_CUR="$hit"
+  printf '%s' "$FB_CUR"
 }
 
-# One walk of merged history, into globals, because two callers need it and
-# it costs a couple of seconds: cmd_feedback prints it, and cmd_review asks
-# it what the files in this branch's diff have already cost other branches.
 FB_REF=""
 FB_PAIRS=""
 FB_HIST=""
@@ -1236,6 +1732,7 @@ FB_NOID=0
 
 fb_collect() {
   FB_REF="$(base_ref)" || return 1
+  fb_cache_load && return 0
 
   local m tip base doc label line marker n all
   FB_PAIRS=""; FB_HIST=""
@@ -1250,14 +1747,14 @@ fb_collect() {
     FB_CAPPED=1
   fi
 
-  while read -r m tip; do
+  while read -r m tip subj; do
     [ -n "$tip" ] || continue
     base="$(git -C "$ROOT" merge-base "${m}^1" "$tip" 2>/dev/null)" || continue
     doc="$(fb_workstream "$base" "$tip")" || doc=""
     FB_EDGES=$((FB_EDGES + 1))
     [ -n "$doc" ] || continue
     FB_WITHWS=$((FB_WITHWS + 1))
-    label="$(fb_label "$m")"
+    label="$(fb_label "$m" "$subj")"
 
     n=0
     while IFS= read -r line; do
@@ -1271,14 +1768,8 @@ fb_collect() {
         *) FB_UNMARKED=$((FB_UNMARKED + 1)) ;;
       esac
       # Keyed by the finding's own id so the commit-level map below can say
-      # which file this one landed on. A bullet written without the
-      # TEMPLATE's `r1:` id is still a finding — the handover hook counts it,
-      # and so does the volume above — but nothing can link it to a file, so
-      # it is counted as exactly that rather than quietly dropped.
-      case "${line%%:*}" in
-        r[0-9] | r[0-9][0-9]) ;;
-        *) FB_NOID=$((FB_NOID + 1)) ;;
-      esac
+      # which file this one landed on.
+      fb_keyable "$line" || FB_NOID=$((FB_NOID + 1))
       FB_HIST="${FB_HIST}${label}"$'\t'"${line%%:*}"$'\t'"${line}"$'\n'
     done <<<"$(printf '%s\n' "$doc" | fb_findings)"
 
@@ -1287,9 +1778,13 @@ fb_collect() {
 
     while IFS= read -r line; do
       [ -n "$line" ] || continue
-      FB_PAIRS="${FB_PAIRS}${label}"$'\t'"$(fb_current_path "${line#*	}")"$'\t'"${line%%	*}"$'\n'
+      # Plain call, not `$( )`: the substitution would fork a subshell per
+      # pair and throw away the ls-files cache with it (see fb_current_path).
+      fb_current_path "${line#*	}" >/dev/null
+      FB_PAIRS="${FB_PAIRS}${label}"$'\t'"${FB_CUR}"$'\t'"${line%%	*}"$'\n'
     done <<<"$(fb_fix_map "$base" "$tip")"
   done <<<"$all"
+  fb_cache_save
   return 0
 }
 
@@ -1302,7 +1797,24 @@ fb_hotspots() {
 }
 
 cmd_feedback() {
-  local want="${1:-}" line
+  local want="${1:-}" quiet=0 line
+  [ "$#" -le 2 ] || die "usage: $0 feedback [<path>] [--quiet]"
+  # --quiet in either position. `feedback --quiet` used to be read as a
+  # request for a file named --quiet, which printed the full banner for it.
+  case "$want" in
+    --quiet) quiet=1; want="${2:-}" ;;
+    *) case "${2:-}" in
+         --quiet) quiet=1 ;;
+         '') ;;
+         *) die "usage: $0 feedback [<path>] [--quiet]" ;;
+       esac ;;
+  esac
+  if [ "$quiet" -eq 1 ]; then
+    [ -n "$want" ] || die "feedback --quiet needs a path"
+    fb_collect || return 0
+    fb_report_path "$want" "$FB_HIST" "$FB_PAIRS" 1
+    return 0
+  fi
   fb_collect || die "no base branch to read merged history from"
   local ref="$FB_REF" edges="$FB_EDGES" withws="$FB_WITHWS"
   local recorded="$FB_RECORDED" findings="$FB_FINDINGS"
@@ -1338,27 +1850,31 @@ cmd_feedback() {
     printf '             but nothing links them to the files they landed on\n'
   fi
 
-  # Recurrence, the one number worth watching, and the only one whose
-  # direction is unambiguous: a file drawing a finding an earlier edge already
-  # drew one against is a rediscovery, and the loop's job is to make those
-  # stop. Volume is deliberately not scored (review-churn rule: counts false
-  # in both directions).
-  local total_pairs repeat_pairs edge_paths
+  local total_pairs repeat_pairs edge_paths counted win_edges
   edge_paths="$(printf '%s' "$pairs" | awk -F'\t' 'NF >= 2 { print $1 "\t" $2 }' | awk '!s[$0]++')"
-  total_pairs="$(printf '%s' "$edge_paths" | grep -c . || :)"
+  # Scored over the newest FB_WINDOW fix-carrying edges, both sides of the
+  # ratio.
+  counted="$(printf '%s' "$edge_paths" | awk -F'\t' -v w="$FB_WINDOW" '
+    NF >= 2 {
+      if (!($1 in ei)) { nd++; ei[$1] = nd }
+      if (w > 0 && ei[$1] > w) next
+      n++; line[n] = $2
+      if (ei[$1] > seen_edges) seen_edges = ei[$1]
+    }
+    END { for (i = n; i >= 1; i--) if (s[line[i]]) r++; else s[line[i]] = 1
+          print (r + 0), (n + 0), (seen_edges + 0) }')"
+  read -r repeat_pairs total_pairs win_edges <<EOF
+$counted
+EOF
   if [ "${total_pairs:-0}" -gt 0 ]; then
-    # Oldest edge first, because "already fixed there" is a question about
-    # what came BEFORE. git log hands them newest first; awk reverses without
-    # tac, which is GNU-only and absent on the macOS machines the harness also
-    # runs on.
-    repeat_pairs="$(printf '%s' "$edge_paths" | awk -F'\t' '
-      { line[NR] = $2 }
-      END { for (i = NR; i >= 1; i--) if (seen[line[i]]) r++; else seen[line[i]] = 1
-            print r + 0 }')"
-    printf 'recurrence : %d/%d file-level fixes landed where an earlier edge\n' \
-      "$repeat_pairs" "$total_pairs"
-    printf '             already fixed a finding (%d%%) — want this falling\n' \
-      $(( repeat_pairs * 100 / total_pairs ))
+    printf 'recurrence : %d/%d (%d%%) over the newest %d recorded edges — fixes\n' \
+      "$repeat_pairs" "$total_pairs" \
+      $(( repeat_pairs * 100 / total_pairs )) "$win_edges"
+    printf '             landing where another edge in the window already fixed\n'
+    printf '             that file. Want this falling. Compare only same window\n'
+    printf '             (JOHARNESS_RECURRENCE_WINDOW=%s; 0 = all history, which\n' \
+      "$FB_WINDOW"
+    printf '             cannot fall)\n'
   fi
 
   printf '\nhot spots — a file that keeps drawing findings is a rule nobody\n'
@@ -1380,27 +1896,45 @@ cmd_feedback() {
 }
 
 # Every finding from merged history whose own fix commit touched this path.
-# The point of the whole file: before editing a file that has cost other
-# branches, read what it cost them.
 fb_report_path() {
-  local want="$1" hist="$2" pairs="$3" resolved keys line key n=0 edges
+  local want="$1" hist="$2" pairs="$3" quiet="${4:-0}"
+  local resolved keys line key n=0 edges
   resolved="$(fb_current_path "$want")"
   # <edge>\t<finding-id> for this path, the join key into hist.
   keys="$(printf '%s' "$pairs" | awk -F'\t' -v p="$resolved" \
     'NF >= 3 && $2 == p { print $1 "\t" $3 }' | sort -u)"
 
-  printf '== feedback: %s\n\n' "$resolved"
   if [ -z "$keys" ]; then
+    [ "$quiet" -eq 1 ] && return 0
+    printf '== feedback: %s\n\n' "$resolved"
     printf '  no merged edge recorded a finding whose fix touched this file\n'
     return 0
   fi
+  [ "$quiet" -eq 1 ] || printf '== feedback: %s\n\n' "$resolved"
+  # ONE awk over both lists.
+  local matched
+  matched="$(
+    { printf '%s\n' "$keys"; printf '\034\n'; printf '%s' "$hist"; } |
+      awk -F'\t' '
+        $0 == "\034" { h = 1; next }
+        !h { k[$1 "\t" $2] = 1; next }
+        NF >= 3 && (($1 "\t" $2) in k) {
+          rest = $3
+          for (i = 4; i <= NF; i++) rest = rest "\t" $i
+          printf "%s\t%s\n", $1, rest
+        }'
+  )"
+  # The banner waits for a match.
+  [ -n "$matched" ] || { [ "$quiet" -eq 1 ] && return 0; }
+  if [ "$quiet" -eq 1 ]; then
+    printf 'This file has drawn review findings before. They are attributed by\n'
+    printf 'COMMIT, so some may concern another file the same fix touched:\n\n'
+  fi
   while IFS= read -r line; do
     [ -n "$line" ] || continue
-    key="${line%%	*}"$'\t'"$(printf '%s' "$line" | cut -f2)"
-    printf '%s\n' "$keys" | grep -qxF "$key" || continue
     n=$((n + 1))
-    printf '  %s  %s\n\n' "${line%%	*}" "$(printf '%s' "$line" | cut -f3-)"
-  done <<<"$hist"
+    printf '  %s  %s\n\n' "${line%%	*}" "${line#*	}"
+  done <<<"$matched"
   edges="$(printf '%s\n' "$keys" | cut -f1 | sort -u | grep -c .)"
   printf '  %d findings from %d merged edges\n' "$n" "$edges"
   printf '  Link is finding-to-commit, not finding-to-file: one commit\n'
@@ -1408,75 +1942,713 @@ fb_report_path() {
   printf '  it touched.\n'
 }
 
+# --- fb_collect's cache
+fb_cache_key() {
+  local tip
+  tip="$(git -C "$ROOT" rev-parse --verify --quiet "$FB_REF" 2>/dev/null)" || return 1
+  [ -n "$tip" ] || return 1
+  printf '%s-%s' "$tip" "${FB_LIMIT:-0}"
+}
 
-# ---------------------------------------------------------------------------
-# Cleanup
-#
-# Step 7 ends with the pull request's final state deleting the workstream file,
-# the done plan file, and the requirement file when its last plan lands. It is
-# the step that goes missing, and it goes missing structurally: the session
-# that merged is finished, and a leftover on `main` reads to it as somebody
-# else's. So the base branch accretes files a later session opens and believes
-# are current — measured at 23 in one consumer repo, thirteen merges adding six
-# and removing none.
-#
-# Counted from git at read time, nothing stored, same doctrine as the churn
-# measure and the graph lint. It removes exactly one kind of leftover, the one
-# the protocol already assigns to a session: the workstream file. Branches are
-# NOT its business — deleting one is human-only (.agents/docs/product/README.md,
-# Branch flow) and a session never pushes a delete — so they are counted and
-# named for a human to act on, never touched. Plans are a question it asks and
-# does not answer: only the reader knows whether a plan that outlived its merge
-# is finished or came back.
-# ---------------------------------------------------------------------------
+FB_CACHE_VARS="FB_EDGES FB_WITHWS FB_RECORDED FB_FINDINGS FB_FIXED FB_WONTFIX \
+FB_NOCHANGE FB_UNMARKED FB_NOID FB_TOTAL FB_CAPPED"
+
+fb_cache_load() {
+  local dir="${JOHARNESS_FEEDBACK_CACHE:-}" key f k v ok
+  [ -n "$dir" ] && [ -d "$dir" ] || return 1
+  key="$(fb_cache_key)" || return 1
+  f="${dir}/fb-${key}"
+  # ALL THREE, not just .vars.
+  [ -f "${f}.vars" ] && [ -f "${f}.hist" ] && [ -f "${f}.pairs" ] || return 1
+
+  # NO eval, and no `case` glob standing in for validation.
+  while IFS='=' read -r k v; do
+    case "$v" in '' | *[!0-9]*) return 1 ;; esac
+    ok=1
+    case "$k" in
+      FB_EDGES)    FB_EDGES="$v" ;;
+      FB_WITHWS)   FB_WITHWS="$v" ;;
+      FB_RECORDED) FB_RECORDED="$v" ;;
+      FB_FINDINGS) FB_FINDINGS="$v" ;;
+      FB_FIXED)    FB_FIXED="$v" ;;
+      FB_WONTFIX)  FB_WONTFIX="$v" ;;
+      FB_NOCHANGE) FB_NOCHANGE="$v" ;;
+      FB_UNMARKED) FB_UNMARKED="$v" ;;
+      FB_NOID)     FB_NOID="$v" ;;
+      FB_TOTAL)    FB_TOTAL="$v" ;;
+      FB_CAPPED)   FB_CAPPED="$v" ;;
+      *) ok=0 ;;
+    esac
+    [ "$ok" -eq 1 ] || return 1
+  done <"${f}.vars"
+  FB_HIST="$(cat "${f}.hist" 2>/dev/null)" || return 1
+  FB_PAIRS="$(cat "${f}.pairs" 2>/dev/null)" || return 1
+  # Command substitution eats trailing newlines; both readers split on them.
+  [ -z "$FB_HIST" ] || FB_HIST="${FB_HIST}"$'\n'
+  [ -z "$FB_PAIRS" ] || FB_PAIRS="${FB_PAIRS}"$'\n'
+  return 0
+}
+
+fb_cache_save() {
+  local dir="${JOHARNESS_FEEDBACK_CACHE:-}" key f v
+  [ -n "$dir" ] && [ -d "$dir" ] || return 0
+  key="$(fb_cache_key)" || return 0
+  f="${dir}/fb-${key}"
+  # Write then rename: two hooks firing at once must never read half a cache.
+  {
+    for v in $FB_CACHE_VARS; do
+      eval "printf '%s=%s\n' \"\$v\" \"\${$v}\""
+    done
+  } >"${f}.vars.$$" 2>/dev/null || return 0
+  printf '%s' "$FB_HIST" >"${f}.hist.$$" 2>/dev/null || return 0
+  printf '%s' "$FB_PAIRS" >"${f}.pairs.$$" 2>/dev/null || return 0
+  # .vars LAST, because the loader gates on all three and this is the one it
+  # checks first.
+  mv -f "${f}.hist.$$" "${f}.hist" 2>/dev/null || return 0
+  mv -f "${f}.pairs.$$" "${f}.pairs" 2>/dev/null || return 0
+  mv -f "${f}.vars.$$" "${f}.vars" 2>/dev/null || :
+  return 0
+}
+
+# --- Cleanup
+
+# --- upstream: what a merged edge found ABOUT THE HARNESS, and where it goes
+
+# Paths canonical owns in EVERY repo that runs this harness.
+upstream_harness_path() {
+  local p="${1%/}" t hit=0
+  while :; do
+    case "$p" in
+      ./*) p="${p#./}" ;;
+      /*) p="${p#/}" ;;
+      *) break ;;
+    esac
+  done
+  case "$p" in
+    joharness.sh | CLAUDE.md | .gitattributes) return 0 ;;
+    AGENTS.md) return 0 ;;
+    .agents | .agents/*) return 0 ;;
+    .claude/commands | .claude/commands/* | .claude/skills | .claude/skills/*) return 0 ;;
+    .claude/agents | .claude/agents/* | .claude/settings.json) return 0 ;;
+    */* | '') return 1 ;;
+  esac
+  while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    # A root file reaching here matched none of the owned names above, so it
+    # is not canonical's (the root README.md); a nested one recurses once.
+    case "$t" in
+      */*) upstream_harness_path "$t" || return 1 ;;
+      *) return 1 ;;
+    esac
+    hit=1
+  done <<<"$(git -C "$ROOT" ls-files </dev/null 2>/dev/null |
+    awk -F/ -v b="$p" '$NF == b')"
+  [ "$hit" -eq 1 ]
+}
+
+# One line of caution per path whose ownership is not clean, printed beside the
+# finding rather than resolved here.
+upstream_path_note() {
+  case "${1%/}" in
+    AGENTS.md)
+      printf 'spliced — everything above "# Part 2" is canonical'"'"'s, below is this repo'"'"'s' ;;
+    .agents/env/*)
+      printf 'a layer this repo wrote itself is not canonical'"'"'s — check before filing' ;;
+  esac
+}
+
+upstream_canonical_repo() {
+  local wf="${ROOT}/.github/workflows/update.yml" repo
+  [ -r "$wf" ] || return 1
+  repo="$(sed -n 's/^ *CANONICAL_REPO: *//p' "$wf" | tail -1 | awk '{print $1}')"
+  case "$repo" in
+    */*) printf '%s' "$repo" ;;
+    *) return 1 ;;
+  esac
+}
+
+# A revision as a human reads it.
+upstream_short() {
+  git -C "$ROOT" rev-parse --short "$1" 2>/dev/null || printf '%s' "${1##*/}"
+}
+
+# The edge to read: a merge commit and the branch tip it brought in.
+upstream_edge() {
+  local want="$1" base_branch="origin/${HANDOVER_BASE_BRANCH:-main}"
+  local line sha tip subj ref merge mb above
+
+  # The base branch itself, before anything is read off it.
+  git -C "$ROOT" rev-parse --verify -q "${base_branch}^{commit}" >/dev/null 2>&1 || {
+    log "no ${base_branch} here: fetch it, or set HANDOVER_BASE_BRANCH to the branch this repo merges into"
+    return 1
+  }
+
+  if [ -z "$want" ]; then
+    line="$(fb_edges "$base_branch" | head -1)"
+    [ -n "$line" ] || { log "no merge on ${base_branch} to read"; return 1; }
+    read -r sha tip subj <<<"$line"
+    # Commits sitting ABOVE the newest merge.
+    above="$(git -C "$ROOT" rev-list --count "${sha}..${base_branch}" 2>/dev/null)"
+    case "$above" in ''|*[!0-9]*) above=0 ;; esac
+    [ "$above" -eq 0 ] ||
+      log "${above} commit(s) on ${base_branch} are newer than this merge; a squash-merged edge is not a merge commit and is not read here — name its branch to read it"
+    printf '%s\t%s\t%s\n' "$(fb_label "$sha" "$subj")" "${sha}^1" "$tip"
+    return 0
+  fi
+
+  # A BRANCH first, and only real branch refs count as one.
+  for ref in "refs/remotes/origin/${want#origin/}" "refs/heads/${want}"; do
+    git -C "$ROOT" rev-parse --verify -q "${ref}^{commit}" >/dev/null 2>&1 || continue
+    sha="$(git -C "$ROOT" rev-parse "$ref")"
+    # ALREADY MERGED is the normal case here, not the exotic one: the
+    # orchestrator names a branch precisely because its pull request just
+    # merged.
+    merge="$(fb_edges "$base_branch" | awk -v t="$sha" '$2 == t { print $1; exit }')"
+    if [ -n "$merge" ]; then
+      printf '%s\t%s\t%s\n' "${want#origin/}" "${merge}^1" "${merge}^2"
+      return 0
+    fi
+    mb="$(git -C "$ROOT" merge-base "$ref" "$base_branch" 2>/dev/null)"
+    [ -n "$mb" ] || continue
+    # Contained in the base branch with no first-parent merge naming it — a
+    # squash or a fast-forward.
+    if [ "$mb" = "$sha" ]; then
+      log "'${want}' is already contained in ${base_branch} with no merge commit naming it (squash or fast-forward): there is no edge to read"
+      return 1
+    fi
+    printf '%s\t%s\t%s\n' "${want#origin/}" "$mb" "$ref"
+    return 0
+  done
+
+  # Not a branch. A merge commit names its own edge: second parent is the
+  # branch tip, first is where the base branch stood.
+  if git -C "$ROOT" rev-parse --verify -q "${want}^{commit}" >/dev/null 2>&1 &&
+     [ -n "$(git -C "$ROOT" rev-parse -q --verify "${want}^2" 2>/dev/null)" ]; then
+    sha="$(git -C "$ROOT" rev-parse "$want")"
+    subj="$(git -C "$ROOT" log -1 --format=%s "$sha" 2>/dev/null)"
+    printf '%s\t%s\t%s\n' "$(fb_label "$sha" "$subj")" "${sha}^1" "${sha}^2"
+    return 0
+  fi
+  log "'${want}' is neither a merge commit nor a branch with a merge-base against ${base_branch}"
+  return 1
+}
+
+# Finding ids whose fix commit carried MORE THAN ONE finding.
+upstream_multi_ids() {
+  git -C "$ROOT" log --no-merges --format=tformat:'@@joharness-commit@@' \
+    --unified=0 -p "${1}..${2}" 2>/dev/null |
+    awk '
+      function flush(   i, n) {
+        n = 0; for (i in id) n++
+        if (n > 1) for (i in id) print i
+      }
+      $0 == "@@joharness-commit@@" { flush(); split("", id); next }
+      /^\+\+\+ / { hand = ($0 ~ /^\+\+\+ b\/docs\/handover\//); next }
+      hand && match($0, /^\+- r[0-9]+:/) { id[substr($0, 4, RLENGTH - 4)] = 1 }
+      END { flush() }' |
+    sort -u
+}
+
+# Path-shaped tokens in a finding's own prose.
+upstream_text_paths() {
+  printf '%s\n' "$1" | tr -s ' \t' '\n' |
+    awk '{
+      t = $0
+      sub(/^[`("\047[]+/, "", t)
+      sub(/[`)"\047\],.:;]+$/, "", t)
+      if (t ~ /:\/\//) next
+      sub(/:.*$/, "", t)
+      if (t == "") next
+      if (t ~ /\// || t ~ /\.(sh|md|json|yml|yaml)$/) print t
+    }' | sort -u
+}
+
+cmd_upstream() {
+  local want="${1:-}" edge label base tip doc repo canon
+  local ids multi paths from_text p f id marker note flag kept keep="" noid=""
+  local n_keep=0 n_drop=0 n_noid=0 n_prose=0 prose=""
+
+  [ "$#" -le 1 ] || die "usage: $0 upstream [<branch>|<merge>]"
+
+  printf '== upstream\n\n'
+
+  # Canonical stops here, and it is not a courtesy.
+  if grep -q '^JOHARNESS_CANONICAL=1' "$CONF" 2>/dev/null; then
+    printf 'CANONICAL — this repo IS the harness. A finding here is already where\n'
+    printf 'its fix lands (.agents/docs/consumer-repos.md, Direction rule): record it\n'
+    printf 'under ## Review and fix it on the branch. Nothing to route.\n'
+    return 0
+  fi
+
+  edge="$(upstream_edge "$want")" || return 1
+  IFS=$'\t' read -r label base tip <<<"$edge"
+  printf 'edge      : %s (%s..%s)\n' "$label" \
+    "$(upstream_short "$base")" "$(upstream_short "$tip")"
+
+  if canon="$(upstream_canonical_repo)"; then
+    repo="$canon"
+    printf 'canonical : %s (CANONICAL_REPO in .github/workflows/update.yml)\n' "$repo"
+  else
+    printf 'canonical : UNKNOWN — no CANONICAL_REPO in .github/workflows/update.yml.\n'
+    printf '            A report has nowhere to go until that file names one\n'
+    printf '            (.agents/docs/consumer-repos.md).\n'
+  fi
+  printf '\n'
+
+  # The retired file, recovered from the commit that last still had it —
+  # exactly the walk .agents/docs/handover/README.md calls "Survives PR".
+  doc="$(fb_workstream "$base" "$tip")" || doc=""
+  if [ -z "$doc" ]; then
+    printf 'no workstream file on this edge: nothing was recorded, so there is\n'
+    printf 'nothing to route. A sync or copy edge carries none by protocol\n'
+    printf '(.agents/docs/handover/README.md, When NOT to write one).\n\n'
+    printf 'verdict   : NOTHING TO REPORT\n'
+    return 0
+  fi
+
+  # Finding id to the paths its own fix commit touched — the protocol's own
+  # attribution (same commit as the fix), not prose parsing.
+  ids="$(fb_fix_map "$base" "$tip")"
+  multi="$(upstream_multi_ids "$base" "$tip")"
+
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    marker="$(fb_marker "$f")"
+    paths=""
+    if fb_keyable "$f"; then
+      id="${f%%:*}"
+      paths="$(printf '%s\n' "$ids" | awk -F'\t' -v i="$id" '$1 == i { print $2 }')"
+    else
+      id=""
+    fi
+    # No fix path: fall back to the paths the finding's OWN TEXT names.
+    from_text=0
+    if [ -z "$paths" ]; then
+      paths="$(upstream_text_paths "$f")"
+      from_text=1
+    fi
+    # Two kinds of caveat, and they belong at two different levels.
+    flag=""
+    [ "$from_text" -eq 0 ] ||
+      flag="named in this finding's own text, not by a fix commit"
+    [ -z "$id" ] || [ -z "$(printf '%s\n' "$multi" | grep -Fx "$id" || :)" ] ||
+      flag="its fix commit carried other findings too, so these paths may be theirs${flag:+; $flag}"
+    kept=""
+    while IFS= read -r p; do
+      [ -n "$p" ] || continue
+      upstream_harness_path "$p" || continue
+      note="$(upstream_path_note "${p#./}")"
+      kept="${kept}      ${p}$([ -z "$note" ] || printf ' (%s)' "$note")"$'\n'
+    done <<<"$paths"
+    if [ -n "$kept" ]; then
+      n_keep=$((n_keep + 1))
+      keep="${keep}  - [${marker}] ${f}"$'\n'
+      [ -z "$flag" ] || keep="${keep}    (${flag})"$'\n'
+      keep="${keep}${kept}"
+    elif [ -n "$paths" ] && [ "$from_text" -eq 0 ]; then
+      n_drop=$((n_drop + 1))
+    elif [ -n "$paths" ]; then
+      # Prose named paths, and none is canonical's: not "no path at all".
+      n_prose=$((n_prose + 1))
+      prose="${prose}  - [${marker}] ${f}"$'\n'
+    else
+      n_noid=$((n_noid + 1))
+      noid="${noid}  - [${marker}] ${f}"$'\n'
+    fi
+  done <<<"$(printf '%s\n' "$doc" | fb_findings)"
+
+  if [ "$n_keep" -gt 0 ]; then
+    printf 'harness findings (on a path canonical owns):\n%s\n' "$keep"
+  fi
+  if [ "$n_prose" -gt 0 ]; then
+    printf 'named paths in prose, none of them canonical'"'"'s (read from the text, not a fix commit):\n%s\n' "$prose"
+  fi
+  if [ "$n_noid" -gt 0 ]; then
+    printf 'unplaceable (no fix path, and no path token in the text — read the edge):\n%s\n' "$noid"
+  fi
+  if [ "$n_drop" -gt 0 ]; then
+    printf '%d finding(s) landed on this repo'"'"'s own files: not canonical'"'"'s.\n\n' "$n_drop"
+  fi
+
+  case "$keep" in
+    *'[wontfix]'*) printf 'at least one is [wontfix] on a harness path: it could not have been\n'
+                   printf 'fixed here — the next sync overwrites that file.\n\n' ;;
+  esac
+
+  # An unplaceable finding NEVER flips this on its own.
+  if [ "$n_keep" -eq 0 ]; then
+    printf 'verdict   : NOTHING TO REPORT — nothing on this edge is placed on a path canonical owns\n'
+    [ "$n_prose" -eq 0 ] ||
+      printf '            %d finding(s) named only non-canonical paths in prose: not guessed at\n' "$n_prose"
+    [ "$n_noid" -eq 0 ] ||
+      printf '            %d unplaceable finding(s) above: a human or a reporter reading\n            the edge can place them; this command will not guess\n' "$n_noid"
+    return 0
+  fi
+
+  printf 'verdict   : REPORT — %d harness finding(s)%s on %s\n' \
+    "$n_keep" \
+    "$([ "$n_noid" -eq 0 ] || printf ' (+%d unplaceable)' "$n_noid")" "$label"
+  printf '            File it by hand: /upstream-report %s, as ONE research node\n' "$label"
+  printf '            on %s (.agents/docs/feedback.md).\n' "${repo:-the canonical}"
+  return 0
+}
+
+# --- Idle analysis — why a manager is parked, read mechanically
+
+# Every JOHARNESS_ assignment a ref's conf carries: `<KEY>\t<VALUE>`, read the
+# way conf_get reads one — last assignment wins, inline comment dropped, value
+# a single token.
+analysis_conf_pairs() {
+  git -C "$ROOT" show "${1}:joharness.conf" </dev/null 2>/dev/null |
+    awk '{ line = $0
+           sub(/#.*$/, "", line)
+           if (!match(line, /^[[:space:]]*JOHARNESS_[A-Z0-9_]*[[:space:]]*=/)) next
+           eq = index(line, "=")
+           key = substr(line, 1, eq - 1); val = substr(line, eq + 1)
+           gsub(/[[:space:]]/, "", key)
+           sub(/^[[:space:]]+/, "", val); sub(/[[:space:]].*$/, "", val)
+           if (!(key in v)) k[++n] = key
+           v[key] = val }
+         END { for (i = 1; i <= n; i++) printf "%s\t%s\n", k[i], v[k[i]] }'
+}
+
+# Two pair lists compared, `<KEY>\t<LEFT>\t<RIGHT>` for every key whose value
+# differs, `(absent)` for a side that does not carry it.
+analysis_conf_diff() {
+  { printf '%s\n' "$1"; printf '%s\n' '--'; printf '%s\n' "$2"; } |
+    awk -F'\t' '
+      $1 == "--" { half = 1; next }
+      NF != 2 { next }
+      { if (!($1 in seen)) { seen[$1] = 1; k[++n] = $1 }
+        if (half == 0) a[$1] = $2; else b[$1] = $2 }
+      END { for (i = 1; i <= n; i++) {
+              key = k[i]
+              av = (key in a) ? a[key] : "(absent)"
+              bv = (key in b) ? b[key] : "(absent)"
+              if (av != bv) printf "%s\t%s\t%s\n", key, av, bv } }'
+}
+
+# Keys whose value changed in one commit against its first parent, as `<KEY>
+# <before> to <after>`, comma separated.
+analysis_conf_keys_changed() {
+  analysis_conf_diff "$(analysis_conf_pairs "${1}^")" "$(analysis_conf_pairs "$1")" |
+    awk -F'\t' '{ out = out (out == "" ? "" : ", ") $1 " " $2 " to " $3 }
+                END { print out }'
+}
+
+# Commits on <ref> newer than <since> that CHANGED a key, newest first: `<date>
+# <sha> <subject>\t<keys>`.
+analysis_conf_moves() {
+  local ref="$1" since="$2" scan="${ANALYSIS_CONF_SCAN:-20}" sha line keys
+  git -C "$ROOT" log --format='%ct%x09%H%x09%cs %h %s' "$ref" -- joharness.conf \
+    </dev/null 2>/dev/null |
+    awk -F'\t' -v since="$since" '$1 > since { print $2 "\t" $3 }' |
+    head -n "$scan" |
+    while IFS=$'\t' read -r sha line; do
+      keys="$(analysis_conf_keys_changed "$sha")"
+      [ -n "$keys" ] || continue
+      printf '%s\t%s\n' "$line" "$keys"
+    done
+}
+
+# One claim's reading.
+analysis_one() {
+  local branch="$1" path="$2" stall="$3" churnl="$4" all="$5"
+  local base_branch="${HANDOVER_BASE_BRANCH:-main}"
+  local doc status next age agetext churn churn_n churn_f out="" first=1
+  local cond="" restated restated_text moves moves_n key bval mval
+  local bpairs mpairs delta line
+
+  doc="$(git -C "$ROOT" show "refs/remotes/origin/${branch}:${path}" \
+    </dev/null 2>/dev/null)" || doc=""
+  out="branch    : ${branch}"$'\n'"claim     : ${path}"$'\n'
+  if [ -z "$doc" ]; then
+    # Always printed, whatever `all` says: the claim came out of the diff and
+    # the ref does not carry it, which is a defect in the reading and not a
+    # manager at work.
+    printf '%s' "$out"
+    printf 'verdict   : NOT ANALYSABLE — no workstream file at origin/%s:%s.\n' \
+      "$branch" "$path"
+    printf '            Fetch, then read again.\n\n'
+    return 0
+  fi
+
+  { read -r status; read -r next; } \
+    <<<"$(printf '%s\n' "$doc" | gr_fields status next)"
+  case "$status" in
+    in-progress | blocked | review | done | abandoned | '') ;;
+    *) status="unreadable" ;;
+  esac
+  age="$(dispatch_age_min "$branch")"
+  agetext="$(dispatch_age_text "$age")"
+  churn_n=0
+  churn="$(churn_top "refs/remotes/origin/${branch}" 2>/dev/null)" || churn=""
+  churn_f="${churn#*	}"; churn_n="${churn%%	*}"
+  case "$churn_n" in '' | *[!0-9]*) churn_n=0 ;; esac
+
+  out="${out}status    : ${status:-?}, pushed ${agetext}"$'\n'
+  [ -z "$next" ] || out="${out}next      : ${next}"$'\n'
+
+  # The three marks dispatch already computes, and no fourth threshold: a knob
+  # nobody has counted is a written number (.agents/harness/AGENTS.md, step 5).
+  if [ "$status" = "abandoned" ]; then
+    # Released: its session is provably gone, so it will never push again and a
+    # stall mark on it is a clock nobody is watching.
+    out="${out}condition : none — this claim was RELEASED (status: abandoned). Its"$'\n'
+    out="${out}            plan is free; the branch is the human's to delete"$'\n'
+  elif [ "$status" = "blocked" ]; then
+    cond="BLOCKED"
+    out="${out}condition : BLOCKED — a human's. dispatch relays this row every pass and"$'\n'
+    out="${out}            never asks whether its cause still holds"$'\n'
+    block_reason_ok "$next" ||
+      out="${out}condition : INVALID BLOCK? — next: opens with no reason word (manage.md §3); asks, orders nothing"$'\n'
+  fi
+  if [ "$status" != "blocked" ] && [ "$status" != "abandoned" ] &&
+     [ -n "$age" ] && [ "$age" -ge "$stall" ]; then
+    cond="${cond:+${cond}+}STALL?"
+    out="${out}condition : STALL? — no push for ${agetext} (>= ${stall}m)"$'\n'
+  fi
+  if [ "$status" != "blocked" ] && [ "$status" != "abandoned" ] &&
+     [ "$churnl" -gt 0 ] && [ "$churn_n" -ge "$churnl" ]; then
+    cond="${cond:+${cond}+}LOOP?"
+    out="${out}condition : LOOP? — ${churn_f} rewritten ${churn_n} times (>= ${churnl})"$'\n'
+  fi
+
+  if [ -z "$cond" ] && [ "$all" != 1 ]; then
+    return 1
+  fi
+
+  restated="$(git -C "$ROOT" log -1 --format=%ct "refs/remotes/origin/${branch}" \
+    -- "$path" </dev/null 2>/dev/null)"
+  restated_text="$(git -C "$ROOT" log -1 --format=%ci "refs/remotes/origin/${branch}" \
+    -- "$path" </dev/null 2>/dev/null)"
+  [ -z "$restated_text" ] ||
+    out="${out}restated  : ${restated_text} — the commit that last changed this file"$'\n'
+
+  if [ -z "$cond" ]; then
+    printf '%s' "$out"
+    if [ "$status" = "abandoned" ]; then
+      # Not "a manager at work": there is no manager. Saying so would send an
+      # analyst looking for a session that the janitor already proved gone.
+      printf 'verdict   : NO CONDITION — the claim was released and its plan is back in\n'
+      printf '            the queue. Nothing to explain, and nobody to explain it to.\n\n'
+    else
+      printf 'verdict   : NO CONDITION — not blocked, not stalled, not looping. This row\n'
+      printf '            is a manager at work, and there is nothing to explain. A\n'
+      printf '            condition that cleared between the pass and this read looks\n'
+      printf '            exactly like this.\n\n'
+    fi
+    return 0
+  fi
+
+  bpairs="$(analysis_conf_pairs "refs/remotes/origin/${branch}")"
+  mpairs="$(analysis_conf_pairs "refs/remotes/origin/${base_branch}")"
+  if [ -z "$bpairs" ] && [ -z "$mpairs" ]; then
+    printf '%s' "$out"
+    printf 'verdict   : NOT ANALYSABLE — neither origin/%s nor origin/%s carries a\n' \
+      "$branch" "$base_branch"
+    printf '            readable joharness.conf, so the stated cause has nothing to be\n'
+    printf '            compared against.\n\n'
+    return 0
+  fi
+
+  # The repo's CURRENT answers, in full, for every row carrying a condition —
+  # not only the ones that differ.
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    if [ "$first" = 1 ]; then out="${out}conf now  : ${line}"$'\n'; first=0
+    else out="${out}            ${line}"$'\n'; fi
+  done <<<"$(printf '%s\n' "$mpairs" |
+    awk -F'\t' -v w=62 '
+      NF == 2 { p = $1 "=" $2
+                if (line != "" && length(line) + length(p) + 1 > w) { print line; line = "" }
+                line = (line == "" ? p : line " " p) }
+      END { if (line != "") print line }')"
+  [ "$first" = 0 ] ||
+    out="${out}conf now  : origin/${base_branch} carries no JOHARNESS_ assignment"$'\n'
+
+  delta="$(analysis_conf_diff "$bpairs" "$mpairs")"
+  while IFS=$'\t' read -r key bval mval; do
+    [ -n "$key" ] || continue
+    out="${out}conf diff : ${key} — this branch ${bval}, origin/${base_branch} ${mval}"$'\n'
+  done <<<"$delta"
+
+  moves=""; moves_n=0
+  if [ -n "$restated" ]; then
+    moves="$(analysis_conf_moves "refs/remotes/origin/${base_branch}" "$restated")"
+    moves_n="$(printf '%s' "$moves" | grep -c . || true)"
+  fi
+  case "$moves_n" in '' | *[!0-9]*) moves_n=0 ;; esac
+  if [ "$moves_n" -gt 0 ]; then
+    # Newest three and a count, never the whole list.
+    while IFS=$'\t' read -r line key; do
+      [ -n "$line" ] || continue
+      out="${out}conf moved: ${line} — ${key}"$'\n'
+    done <<<"$(printf '%s\n' "$moves" | head -3)"
+    [ "$moves_n" -le 3 ] ||
+      out="${out}conf moved: (+$((moves_n - 3)) older key change(s) since — git log origin/${base_branch} -- joharness.conf)"$'\n'
+  fi
+
+  printf '%s' "$out"
+  # MAY BE, never LIFTED.
+  if [ -n "$delta" ] || [ "$moves_n" -gt 0 ]; then
+    printf 'verdict   : CAUSE MAY BE LIFTED — a key differs, or changed after this claim\n'
+    printf '            was restated. Read the keys above against the next: line; one\n'
+    printf '            that answers it means this %s waits on a decision the repo\n' "$cond"
+    printf '            already made.\n\n'
+  else
+    printf 'verdict   : NO CONFIG MOVEMENT — no key differs from origin/%s, and none\n' \
+      "$base_branch"
+    printf '            changed after this claim was restated. NOT the same as "the\n'
+    printf '            cause is live": #266 named a condition the conf had answered\n'
+    printf '            BEFORE the claim was written, so nothing moved and the cause\n'
+    printf '            was already gone. Read next: against conf now.\n\n'
+  fi
+  return 0
+}
+
+cmd_analysis() {
+  local want="${1:-}" stem="${2:-}" base_branch canon repo stall churnl
+  local branch path claims n_rows=0 n_quiet=0
+
+  [ "$#" -le 2 ] || die "usage: $0 analysis [<branch> [<claim stem>]]"
+
+  printf '== analysis (a read for a human; nothing files it)\n\n'
+
+  if grep -q '^JOHARNESS_CANONICAL=1' "$CONF" 2>/dev/null; then
+    printf 'CANONICAL — this repo IS the harness. A condition measured here is already\n'
+    printf 'where its fix lands (.agents/docs/consumer-repos.md, Direction rule):\n'
+    printf 'record it under ## Review and fix it on the branch. Nothing to route.\n'
+    return 0
+  fi
+
+  base_branch="${HANDOVER_BASE_BRANCH:-main}"
+  stall="$(num_knob JOHARNESS_STALL_MINUTES)"
+  churnl="$(num_knob JOHARNESS_CHURN_LIMIT "$(( $(num_knob JOHARNESS_CHURN_THRESHOLD) * 2 ))")"
+
+  # A stale clone reads a manager that pushed as stalled, and this command is
+  # run by a session spawned into a fresh container minutes after the pass that
+  # named the branch.
+  if [ "${ANALYSIS_FETCH:-1}" != 0 ]; then
+    git -C "$ROOT" fetch -q --prune origin 2>/dev/null ||
+      warn "fetch failed; push ages below are from the last fetch"
+  fi
+
+  if canon="$(upstream_canonical_repo)"; then
+    repo="$canon"
+    printf 'canonical : %s (CANONICAL_REPO in .github/workflows/update.yml)\n' "$repo"
+  else
+    printf 'canonical : UNKNOWN — no CANONICAL_REPO in .github/workflows/update.yml.\n'
+    printf '            An issue has nowhere to go until that file names one\n'
+    printf '            (.agents/docs/consumer-repos.md).\n'
+  fi
+  printf 'marks     : BLOCKED from the claim'"'"'s own status; STALL? at %sm without a push\n' "$stall"
+  printf '            (JOHARNESS_STALL_MINUTES); LOOP? at %s rewrites of one file\n' "$churnl"
+  printf '            (JOHARNESS_CHURN_LIMIT). No threshold of its own.\n\n'
+
+  claims="$(claim_branches)"
+  while IFS=$'\t' read -r branch path; do
+    [ -n "$branch" ] || continue
+    [ -z "$want" ] || [ "$branch" = "$want" ] || [ "$branch" = "${want#origin/}" ] || continue
+    [ -z "$stem" ] || [ "$(basename "$path" .md)" = "$stem" ] || continue
+    n_rows=$((n_rows + 1))
+    # A named branch prints whatever it is; a sweep prints the rows carrying a
+    # condition and counts the rest.
+    analysis_one "$branch" "$path" "$stall" "$churnl" \
+      "$([ -n "$want" ] && printf 1 || printf 0)" || n_quiet=$((n_quiet + 1))
+  done <<<"$claims"
+
+  [ "$n_quiet" -eq 0 ] ||
+    printf '%s other claim(s) carry no condition: managers at work, nothing to explain.\n\n' \
+      "$n_quiet"
+
+  if [ "$n_rows" -eq 0 ]; then
+    if [ -n "$want" ]; then
+      printf 'NOT ANALYSABLE — origin/%s owns no workstream file%s. Unmerged branches\n' \
+        "$want" "$([ -z "$stem" ] || printf " named %s" "$stem")"
+      printf 'that own one are what this command reads; a branch past its retire commit\n'
+      printf 'owns none, and its record is recoverable with ./joharness.sh upstream %s.\n\n' "$want"
+    else
+      printf 'NOTHING IN FLIGHT — no unmerged branch owns a workstream file.\n\n'
+    fi
+  fi
+
+  return 0
+}
+
+# Origin refs NOT merged into every ref given, in ONE call: a
+# `merge-base --is-ancestor` per ref cost a walk per merged branch, and merged
+# branches are never deleted. A ref that does not resolve judges nothing
+# merged (what the per-ref test did: it failed), and `--no-merged=<missing>` is
+# fatal, so a missing FIRST ref lists every origin ref; a later one is skipped.
+# No ref given lists them all.
+refs_unmerged() {
+  local ref first=1 flags=()
+  for ref in "$@"; do
+    if git -C "$ROOT" rev-parse --verify -q "${ref}^{commit}" </dev/null >/dev/null 2>&1; then
+      flags+=("--no-merged=${ref}")
+    elif [ "$first" -eq 1 ]; then
+      flags=(); break      # the base is missing: nothing is merged
+    fi                     # a later ref that is missing filters nothing
+    first=0
+  done
+  git -C "$ROOT" for-each-ref ${flags[@]+"${flags[@]}"} --format='%(refname)' \
+    refs/remotes/origin </dev/null 2>/dev/null
+}
+
+# Origin refs merged into $1, in ONE call. $1 unresolvable = none merged.
+refs_merged() {
+  git -C "$ROOT" rev-parse --verify -q "${1}^{commit}" </dev/null >/dev/null 2>&1 || return 0
+  git -C "$ROOT" for-each-ref --merged="$1" --format='%(refname)' \
+    refs/remotes/origin </dev/null 2>/dev/null
+}
+
+# Unmerged origin branches that OWN a workstream file: `<branch>\t<path>`.
+claim_branches() {
+  local base_branch="${HANDOVER_BASE_BRANCH:-main}" r name base f
+  refs_unmerged "refs/remotes/origin/${base_branch}" |
+    while IFS= read -r r; do
+      name="${r#refs/remotes/origin/}"
+      { [ "$name" = "HEAD" ] || [ "$name" = "$base_branch" ]; } && continue
+      base="$(git -C "$ROOT" merge-base "$r" \
+        "refs/remotes/origin/${base_branch}" </dev/null 2>/dev/null)" || continue
+      [ -n "$base" ] || continue
+      while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        printf '%s\t%s\n' "$name" "$f"
+      done <<<"$(git -C "$ROOT" diff --name-only --diff-filter=ACMRT "$base" "$r" \
+        -- docs/handover </dev/null 2>/dev/null | gr_docs)"
+    done
+}
 
 # Workstream paths an unmerged origin branch is WRITING: paths it changed since
-# it left the base branch, not paths its tree happens to hold. Work in flight —
-# its own step 7 has not come due, and removing its file from the base branch
-# would hand it a delete/modify conflict over a file it is still writing.
-#
-# Changed, not carried, because every branch cut from the base branch inherits
-# the base branch's leftovers. Reading the tree protected exactly the files
-# this command exists to remove: the first run here reported both of them as
-# in flight, on the strength of the branch running the command.
+# it left the base branch, not paths its tree happens to hold.
 cl_inflight() {
   local ref="$1" r base
-  git -C "$ROOT" for-each-ref --format='%(refname)' refs/remotes/origin 2>/dev/null |
+  refs_unmerged "$ref" |
     while IFS= read -r r; do
       [ "${r##*/}" = "HEAD" ] && continue
-      git -C "$ROOT" merge-base --is-ancestor "$r" "$ref" 2>/dev/null && continue
       base="$(git -C "$ROOT" merge-base "$r" "$ref" 2>/dev/null)" || continue
       [ -n "$base" ] || continue
-      # Files the branch still HAS, not files it touched. --name-only alone
-      # lists deletions too, so a branch that ran the finishing ritual —
-      # deleting its workstream file, the thing this command exists to
-      # complete — read as still carrying it, and the file was protected
-      # from removal forever. Exactly backwards for the one case cleanup is
-      # for.
+      # Files the branch still HAS, not files it touched.
       git -C "$ROOT" diff --name-only --diff-filter=ACMRT "$base" "$r" \
         -- docs/handover 2>/dev/null |
         gr_docs
     done | sort -u
 }
 
-# Origin branches already merged into $1, base branch itself excluded. Merged
-# and standing is cosmetic — the handover hook filters them out of its claims
-# view — so this is a list for a human with an idle minute, not a chore.
+# Origin branches already merged into $1, base branch itself excluded.
 cl_merged_branches() {
   local ref="$1" base_branch="${HANDOVER_BASE_BRANCH:-main}" r name
-  git -C "$ROOT" for-each-ref --format='%(refname)' refs/remotes/origin 2>/dev/null |
+  refs_merged "$ref" |
     while IFS= read -r r; do
       name="${r#refs/remotes/origin/}"
       { [ "$name" = "HEAD" ] || [ "$name" = "$base_branch" ]; } && continue
-      git -C "$ROOT" merge-base --is-ancestor "$r" "$ref" 2>/dev/null || continue
       printf '%s\n' "$name"
     done
 }
 
-# Plan stems claimed by a workstream file that has already merged. The claim is
-# the workstream's own `plan:` field, read from the last version the edge
-# carried — the same walk `feedback` makes, under the same edge cap, because an
-# unbounded walk is a measure nobody runs twice.
+# Plan stems claimed by a workstream file that has already merged.
 cl_merged_claims() {
   local ref="$1" all m tip base doc p
   all="$(fb_edges "$ref")"
@@ -1484,7 +2656,7 @@ cl_merged_claims() {
     all="$(printf '%s\n' "$all" | head -n "$FB_LIMIT")"
   fi
   printf '%s\n' "$all" |
-    while read -r m tip; do
+    while read -r m tip _; do
       [ -n "$tip" ] || continue
       base="$(git -C "$ROOT" merge-base "${m}^1" "$tip" 2>/dev/null)" || continue
       doc="$(fb_workstream "$base" "$tip")" || continue
@@ -1492,6 +2664,1641 @@ cl_merged_claims() {
       { [ -n "$p" ] && [ "$p" != "none" ]; } || continue
       printf '%s\n' "$p"
     done | sort -u
+}
+
+# Stale, unreleased claims with no pull request: `<branch>\t<path>`. The ones
+# `janitor --apply` may release; the caller proves each session gone first.
+janitor_candidates() {
+  local stale_s branch path age doc status pr
+  stale_s="$(num_knob HANDOVER_STALE_SECONDS)"
+  while IFS=$'\t' read -r branch path; do
+    [ -n "$branch" ] || continue
+    age="$(dispatch_age_min "$branch")"
+    [ -n "$age" ] || continue
+    [ $((age * 60)) -ge "$stale_s" ] || continue
+    doc="$(git -C "$ROOT" show "refs/remotes/origin/${branch}:${path}" \
+      </dev/null 2>/dev/null)" || continue
+    { read -r status; read -r pr; } <<<"$(printf '%s\n' "$doc" | gr_fields status pr)"
+    [ "$status" != abandoned ] || continue
+    case "$pr" in '' | none) ;; *) continue ;; esac
+    printf '%s\t%s\n' "$branch" "$path"
+  done <<<"$(claim_branches)"
+}
+
+# --- Guard: re-read live state right before a push onto a branch not ours
+
+# Workstream files <sha> wrote since it left the base branch (all of them
+# when there is no merge base to read from).
+guard_workstreams() {
+  local sha="$1" base
+  base="$(git -C "$ROOT" merge-base "$sha" \
+    "refs/remotes/origin/${HANDOVER_BASE_BRANCH:-main}" </dev/null 2>/dev/null)" || base=""
+  if [ -n "$base" ]; then
+    git -C "$ROOT" diff --name-only --diff-filter=ACMRT "$base" "$sha" \
+      -- docs/handover </dev/null 2>/dev/null | gr_docs
+  else
+    git -C "$ROOT" ls-tree -r --name-only "$sha" -- docs/handover 2>/dev/null | gr_docs
+  fi
+}
+
+# `guard <verb> <branch> [--expect <sha>]`: the checks a harness write onto a
+# branch it does not own must pass, read live, right before its push. Prints
+# one line per check run, first refusal stops. Exit 0 = all pass, 2 = gone on
+# origin (released already: nothing to write), 1 = any other refusal. Writes
+# nothing: the one fetch moves FETCH_HEAD only.
+cmd_guard() {
+  local verb="${1:-}" branch="${2:-}" expect="" base_branch="${HANDOVER_BASE_BRANCH:-main}"
+  local live rc f doc pr s_was t_was s_now t_now files raw=""
+  local usage="usage: $0 guard janitor|kill|loop <branch> [--expect <sha>]"
+  case "$verb" in janitor | kill | loop) ;; *) die "$usage" ;; esac
+  [ -n "$branch" ] || die "$usage"
+  shift 2
+  if [ "$#" -gt 0 ]; then
+    { [ "$1" = "--expect" ] && [ "$#" -eq 2 ] && [ -n "$2" ]; } || die "$usage"
+    case "$2" in -*) die "$usage" ;; esac
+    expect="$2"; raw="$2"
+  fi
+
+  # 1. Base branch by name, before any network read: no ref can move it.
+  if [ "$branch" = "$base_branch" ]; then
+    printf 'protected : REFUSED — %s is the base branch; never a harness write\n' "$branch"
+    return 1
+  fi
+  printf 'protected : pass — %s is not the base branch (%s)\n' "$branch" "$base_branch"
+
+  # 2. Live: origin itself, not the remote-tracking ref a narrow refspec keeps.
+  live="$(git -C "$ROOT" ls-remote -q --exit-code --heads origin "refs/heads/${branch}" \
+    </dev/null 2>/dev/null)"
+  rc=$?
+  live="$(printf '%s\n' "$live" | awk -v r="refs/heads/${branch}" '$2 == r { print $1; exit }')"
+  if [ "$rc" -eq 2 ] || { [ "$rc" -eq 0 ] && [ -z "$live" ]; }; then
+    printf 'live      : REFUSED — %s gone on origin: already released\n' "$branch"
+    return 2
+  elif [ "$rc" -ne 0 ]; then
+    printf 'live      : REFUSED — %s: cannot ask origin whether the branch exists\n' "$branch"
+    return 1
+  fi
+  printf 'live      : pass — origin has %s at %s\n' "$branch" "${live:0:12}"
+
+  # 3. Head: live vs the read the decision was made on.
+  if [ -z "$expect" ]; then
+    expect="$(git -C "$ROOT" rev-parse -q --verify "refs/remotes/origin/${branch}^{commit}" \
+      2>/dev/null)" || {
+      printf 'head      : REFUSED — no decision read: no --expect and no refs/remotes/origin/%s\n' "$branch"
+      return 1; }
+  else
+    # A read this checkout cannot open is no read: never compare or show it raw.
+    expect="$(git -C "$ROOT" rev-parse -q --verify "${expect}^{commit}" 2>/dev/null)" || {
+      printf 'head      : REFUSED — decision read %s is not a commit here: fetch, re-decide\n' "$raw"
+      return 1; }
+  fi
+  if [ "$live" != "$expect" ]; then
+    printf 'head      : REFUSED — live %s, decision read %s: re-decide\n' "${live:0:12}" "${expect:0:12}"
+    # 4. Claim: what moved, both sides. One ref fetched into FETCH_HEAD only
+    # (empty --refmap): moving the remote-tracking ref would make a bare re-run
+    # read the live head as its decision and pass without a re-decide.
+    git -C "$ROOT" fetch -q --refmap= origin "refs/heads/${branch}" \
+      </dev/null 2>/dev/null || :
+    files="$( { guard_workstreams "$live"; guard_workstreams "$expect"; } | sort -u)"
+    [ -n "$files" ] || printf 'claim     : no workstream file on either side\n'
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      { read -r s_was; read -r t_was; } < <(git -C "$ROOT" show "${expect}:${f}" \
+        </dev/null 2>/dev/null | gr_fields session status)
+      { read -r s_now; read -r t_now; } < <(git -C "$ROOT" show "${live}:${f}" \
+        </dev/null 2>/dev/null | gr_fields session status)
+      printf 'claim     : %s — read: session %s status %s; live: session %s status %s\n' \
+        "$f" "${s_was:--}" "${t_was:--}" "${s_now:--}" "${t_now:--}"
+    done < <(printf '%s\n' "$files")
+    return 1
+  fi
+  printf 'head      : pass — live %s = decision read\n' "${live:0:12}"
+
+  # 5. A claim at the edge (pr: set) is never released. kill/loop skip it: a
+  # stalled manager with an open pull request stays killable, and its record
+  # is a handover, not a release.
+  if [ "$verb" = janitor ]; then
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      doc="$(git -C "$ROOT" show "${live}:${f}" </dev/null 2>/dev/null)" || {
+        printf 'protected : REFUSED — cannot read %s at live head\n' "$f"; return 1; }
+      pr="$(printf '%s\n' "$doc" | gr_field pr)"
+      case "$pr" in '' | none) ;; *)
+        printf 'protected : REFUSED — %s names pr: %s at live head; never released\n' "$f" "$pr"
+        return 1 ;;
+      esac
+    done < <(guard_workstreams "$live")
+    printf 'protected : pass — no workstream file names a pr: at live head\n'
+  fi
+  printf 'guard     : pass — %s may push %s onto %s\n' "$verb" "${live:0:12}" "$branch"
+  return 0
+}
+
+# Release named claims: write `status: abandoned` into each candidate claim on
+# its own branch and push.
+janitor_apply() {
+  local want b path tip blob newblob tree commit idx today why rc=0 n=0 cands
+  [ "$#" -gt 0 ] || die "usage: $0 janitor --apply <branch>... (each session proven ARCHIVED or not found)"
+  # --prune: under the default refspec a branch deleted on origin loses its
+  # remote-tracking ref here and takes the `no such branch` skip below.
+  git -C "$ROOT" fetch -q --prune origin 2>/dev/null || warn "fetch failed; using the last fetched refs"
+  # The decision read, per named branch, whatever the refspec maps: a narrow
+  # one leaves the tracking ref stale, and guard (which never moves it) would
+  # refuse a moved branch on every run. A gone branch fails this fetch and
+  # keeps its stale ref for guard to call gone.
+  for want in "$@"; do
+    git -C "$ROOT" fetch -q origin "+refs/heads/${want}:refs/remotes/origin/${want}" \
+      </dev/null 2>/dev/null || :
+  done
+  cands="$(janitor_candidates)"
+  today="$(date -u +%Y-%m-%d)"
+  # A branch whose own joharness.sh predates `abandoned` reds `ci` on the word
+  # (#279); say why on the line it reads first.
+  why="ci reds on status 'abandoned' (not one of: ...) until this branch reconciles with its base; that reconcile clears it"
+  for want in "$@"; do
+    tip="$(git -C "$ROOT" rev-parse -q --verify "refs/remotes/origin/${want}^{commit}" 2>/dev/null)" || {
+      printf 'skip      : %s — no such branch on origin\n' "$want"; rc=1; continue; }
+    # Re-read live before anything is built (#397): a remote-tracking ref
+    # outlives a deletion whose refspec --prune does not map. Building is
+    # local; the lease below covers the rest of the window.
+    cmd_guard janitor "$want" --expect "$tip"
+    case $? in
+      0) ;;
+      2) # Released already. Drop the local ref a narrow refspec never prunes,
+         # or every dispatch names the branch again. Local only.
+         git -C "$ROOT" update-ref -d "refs/remotes/origin/${want}" 2>/dev/null || :
+         continue ;;
+      *) printf 'skip      : %s — guard refused; nothing released\n' "$want"
+         rc=1; continue ;;
+    esac
+    idx="$(mktemp)"
+    GIT_INDEX_FILE="$idx" git -C "$ROOT" read-tree "$tip" || { rm -f "$idx"; rc=1; continue; }
+    n=0
+    while IFS=$'\t' read -r b path; do
+      [ "$b" = "$want" ] || continue
+      blob="$(git -C "$ROOT" show "${tip}:${path}" 2>/dev/null)" || continue
+      newblob="$(printf '%s\n' "$blob" | awk -v d="$today" -v w="$why" '
+        NR == 1 && $0 == "---" { fm = 1; print; next }
+        fm && $0 == "---" { if (!ns) print "next: Pick this up from the plan; the claim was released " d "; " w
+                            fm = 0; print; next }
+        fm && /^status:/ { print "status: abandoned"; next }
+        fm && /^next:/   { print "next: Pick this up from the plan; the claim was released " d "; " w; ns = 1; next }
+        { print }' | git -C "$ROOT" hash-object -w --stdin)" || continue
+      GIT_INDEX_FILE="$idx" git -C "$ROOT" update-index --cacheinfo "100644,${newblob},${path}" || continue
+      n=$((n + 1))
+      printf 'release   : %s  %s\n' "$want" "$path"
+    done <<<"$cands"
+    if [ "$n" -eq 0 ]; then
+      printf 'skip      : %s — not a candidate (pushed recently, already released, or names a pr:)\n' "$want"
+      rm -f "$idx"; rc=1; continue
+    fi
+    tree="$(GIT_INDEX_FILE="$idx" git -C "$ROOT" write-tree)"
+    rm -f "$idx"
+    commit="$(git -C "$ROOT" commit-tree "$tree" -p "$tip" \
+      -m "janitor: release the claim, session gone (${today})")" || { rc=1; continue; }
+    # The lease refuses a branch deleted or moved since the guard read.
+    if git -C "$ROOT" push -q --force-with-lease="refs/heads/${want}:${tip}" \
+      origin "${commit}:refs/heads/${want}" 2>/dev/null; then
+      printf 'pushed    : %s %s\n' "$want" "${commit:0:12}"
+    else
+      printf 'FAILED    : %s — push refused (the branch moved?); nothing released\n' "$want"
+      rc=1
+    fi
+  done
+  return "$rc"
+}
+
+cmd_janitor() {
+  local base_branch="${HANDOVER_BASE_BRANCH:-main}" ref stale_s
+  local claims branch path doc plan status pr session age agetext n_cand=0
+  local n_young=0 n_released=0
+  local held onbranch cand had_plan
+  local f n_left=0 n_merged=0 merged="" carried="" cands=""
+
+  if [ "${1:-}" = "--apply" ]; then
+    shift
+    janitor_apply "$@"
+    return $?
+  fi
+  [ "$#" -eq 0 ] || die "usage: $0 janitor [--apply <branch>...]"
+
+  stale_s="$(num_knob HANDOVER_STALE_SECONDS)"
+  printf '== janitor\n\n'
+
+  printf 'candidates (push age only — LIVENESS IS NOT IN THIS OUTPUT):\n'
+  claims="$(claim_branches)"
+  while IFS=$'\t' read -r branch path; do
+    [ -n "$branch" ] || continue
+    age="$(dispatch_age_min "$branch")"
+    [ -n "$age" ] || continue
+    [ $((age * 60)) -ge "$stale_s" ] || { n_young=$((n_young + 1)); continue; }
+    doc="$(git -C "$ROOT" show "refs/remotes/origin/${branch}:${path}" \
+      </dev/null 2>/dev/null)" || continue
+    { read -r status; read -r plan; read -r pr; read -r session; } \
+      <<<"$(printf '%s\n' "$doc" | gr_fields status plan pr session)"
+    case "$status" in
+      in-progress | blocked | review | done | abandoned | '') ;;
+      *) status="unreadable" ;;
+    esac
+    # Already released: not a candidate, and saying so is what stops a second
+    # janitor rewriting a file the first one settled.
+    [ "$status" = abandoned ] && { n_released=$((n_released + 1)); continue; }
+    n_cand=$((n_cand + 1))
+    case "$pr" in '' | none) cands="${cands} ${branch}" ;; esac
+    agetext="$(dispatch_age_text "$age")"
+    printf '  %s  %s  %s  pushed %s\n' "$branch" "$path" "${status:-?}" "$agetext"
+    # A stem, never the raw field: a workstream file may spell its claim as a
+    # path, and `docs/plans/docs/plans/x.md.md` is what printing it raw gets.
+    plan="$(lint_stem "$plan")"
+    # SANITISED, like `workstream:` and `status:` in the in-flight walk above
+    # and for the same reason: these are branch-controlled frontmatter printed
+    # straight out.
+    had_plan=""; [ -z "$plan" ] || had_plan=1
+    plan="$(printf '%s' "$plan" | tr -cd 'A-Za-z0-9._-')"
+    pr="$(printf '%s' "$pr" | tr -cd 'A-Za-z0-9._#-')"
+    session="$(printf '%s' "$session" | tr -cd 'A-Za-z0-9._:/#?=&%-')"
+    # WHICH path, then WHERE it is.
+    held="" onbranch=""
+    if [ -n "$plan" ] && [ "$plan" != none ]; then
+      for cand in "docs/plans/${plan}.md" "docs/research/${plan}.md" "docs/product/${plan}.md"; do
+        git -C "$ROOT" cat-file -e "refs/remotes/origin/${base_branch}:${cand}" \
+          </dev/null 2>/dev/null || continue
+        held="$cand"; break
+      done
+      [ -n "$held" ] || for cand in "docs/plans/${plan}.md" "docs/research/${plan}.md" "docs/product/${plan}.md"; do
+        git -C "$ROOT" cat-file -e "refs/remotes/origin/${branch}:${cand}" \
+          </dev/null 2>/dev/null || continue
+        onbranch="$cand"; break
+      done
+    fi
+    if [ -n "$had_plan" ] && [ -z "$plan" ]; then
+      printf '    holds: a plan: field this reader cannot print — resolve it\n'
+      printf '      by hand, and do not read "no plan" into this line\n'
+    elif [ -z "$plan" ] || [ "$plan" = none ]; then
+      printf '    holds: no plan — this claim holds nothing but its branch\n'
+    elif [ -n "$held" ]; then
+      printf '    holds: %s, out of the queue while this claim stands\n' "$held"
+    elif [ -n "$onbranch" ]; then
+      printf '    holds: %s, which %s does not carry —\n' "$onbranch" "$base_branch"
+      printf '      so releasing this claim frees nothing in %s\n' "$base_branch"
+    else
+      printf '    holds: %s named, which neither %s nor this\n' \
+        "docs/plans/${plan}.md" "$base_branch"
+      printf '      branch carries — a typo, a rename, or a plan on some other\n'
+      printf '      branch: resolve it by hand\n'
+    fi
+    # The `pr:` field is a number in a file.
+    if [ -n "$pr" ] && [ "$pr" != none ]; then
+      printf '    pull request %s — exempt whatever its state, which this\n' "$pr"
+      printf '      reader cannot see: finishing it is Loop step 2, not a sweep\n'
+    fi
+    [ -z "$session" ] || [ "$session" = none ] ||
+      printf '    session: %s\n' "$session"
+  done <<<"$claims"
+  if [ "$n_cand" -eq 0 ]; then
+    if [ "$n_released" -eq 0 ]; then
+      printf '  none — every claim pushed inside %sh\n' "$((stale_s / 3600))"
+    elif [ "$n_young" -eq 0 ]; then
+      printf '  none — %d claim(s) older than %sh, every one already released (status: abandoned)\n' \
+        "$n_released" "$((stale_s / 3600))"
+    else
+      printf '  none — %d claim(s) pushed inside %sh; %d older, already released (status: abandoned)\n' \
+        "$n_young" "$((stale_s / 3600))" "$n_released"
+    fi
+  else
+    printf '\n  %d candidate(s). A candidate is NOT a verdict: read the control\n' "$n_cand"
+    printf '  plane per session — ARCHIVED or not found = gone; anything else =\n'
+    printf '  leave it alone. Never a claim naming pr:.\n'
+    [ -z "$cands" ] ||
+      printf '  Release the gone ones: ./joharness.sh janitor --apply <branch>...\n  (candidates:%s)\n' "$cands"
+  fi
+  printf '\n'
+
+  # --- what merges left behind ---------------------------------------------
+  ref="$(decide_ref)" || ref=""
+  if [ -n "$ref" ]; then
+    carried="$(cl_inflight "$ref")"
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      printf '%s\n' "$carried" | grep -qxF -- "$f" && continue
+      n_left=$((n_left + 1))
+    done <<<"$(git -C "$ROOT" ls-tree -r --name-only "$ref" -- docs/handover \
+      </dev/null 2>/dev/null | gr_docs)"
+  fi
+  if [ "$n_left" -gt 0 ]; then
+    printf 'leftovers : %s workstream file(s) on %s no unmerged branch carries —\n' \
+      "$n_left" "${ref:-the base branch}"
+    printf '            the finish ritual should have deleted them. Stage with\n'
+    printf '            ./joharness.sh cleanup --apply on YOUR branch.\n'
+  else
+    printf 'leftovers : none — the finish ritual ran\n'
+  fi
+
+  while IFS= read -r branch; do
+    [ -n "$branch" ] || continue
+    n_merged=$((n_merged + 1))
+    [ "$n_merged" -gt 5 ] || merged="${merged}            ${branch}\n"
+  done <<<"$(cl_merged_branches "refs/remotes/origin/${base_branch}" 2>/dev/null)"
+  if [ "$n_merged" -gt 0 ]; then
+    printf 'merged    : %s branch(es) merged and still standing — cosmetic, and the\n' "$n_merged"
+    printf '            human deletes them: a session never git push --delete\n'
+    printf '%b' "$merged"
+    [ "$n_merged" -le 5 ] || printf '            (+%s more)\n' "$((n_merged - 5))"
+  fi
+  printf '\n'
+
+  return 0
+}
+
+# --- free: bring an unmerged doc-only branch to the base, by merge -----------
+# Two shapes nobody else closes (#423): a plan filed on a branch whose author
+# is gone, and a branch whose only diff is a `status: done, pr: none`
+# workstream file. A copy task, never a build: the plans land in the queue,
+# where lint and curate read them. Runs on the CURRENT branch, which the
+# manager already cut from fresh origin/<base> and claimed. Commits; never
+# pushes, never touches the owner's branch.
+
+# The key a `free <branch>` claim carries: workstream `free-<key>`.
+free_key() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '-'; }
+
+# The paths a freeable branch may touch: the harness's own doc trees. A
+# consumer's own index files are refused, never guessed at.
+free_path_ok() {
+  case "$1" in
+    docs/plans/?* | docs/product/?* | docs/research/?* | docs/handover/?*) return 0 ;;
+  esac
+  return 1
+}
+
+# Does <ref> carry, since <base>, a workstream file a human or a pull request
+# still holds (status blocked or review, or a pr: set)? Prints the first.
+# Such a branch is waiting on someone: freeing it would erase the question or
+# merge past a label only a human removes.
+free_owner_held() {
+  local ref="$1" base="$2" f doc st pr
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    doc="$(git -C "$ROOT" show "${ref}:${f}" </dev/null 2>/dev/null)" || continue
+    { read -r st; read -r pr; } <<<"$(printf '%s\n' "$doc" | gr_fields status pr)"
+    case "$st" in blocked | review) printf '%s (status: %s)' "$f" "$st"; return 0 ;; esac
+    case "$pr" in '' | none) ;; *) printf '%s (pr: %s)' "$f" "$(printf '%s' "$pr" | tr -cd 'A-Za-z0-9._#-')"; return 0 ;; esac
+  done <<<"$(git -c core.quotePath=false -C "$ROOT" diff --name-only \
+    --diff-filter=ACMRT "$base" "$ref" -- docs/handover </dev/null 2>/dev/null | gr_docs)"
+  return 1
+}
+
+# Is <stem> held by a live claim (not done, not abandoned) on an unmerged
+# branch other than <owner>? Prints that branch.
+free_plan_claimed() {
+  local stem="$1" owner="$2" b f doc wp st
+  while IFS=$'\t' read -r b f; do
+    { [ -n "$b" ] && [ "$b" != "$owner" ]; } || continue
+    doc="$(git -C "$ROOT" show "refs/remotes/origin/${b}:${f}" </dev/null 2>/dev/null)" || continue
+    { read -r wp; read -r st; } <<<"$(printf '%s\n' "$doc" | gr_fields plan status)"
+    [ "$(lint_stem "$wp" | tr -cd 'A-Za-z0-9._-')" = "$stem" ] || continue
+    case "$st" in done | abandoned) continue ;; esac
+    printf '%s' "$b"; return 0
+  done <<<"$(claim_branches)"
+  return 1
+}
+
+cmd_free() {
+  local base_branch="${HANDOVER_BASE_BRANCH:-main}" owner="${1:-}" usage
+  local cur tip mb paths p bad="" n_bad=0 behind pre f kind stem
+  local added_wf added_plans rows dropped="" retired="" keep out rc applied held wplan wst hb
+
+  usage="usage: $0 free <branch> — run on your own claimed branch, cut from fresh origin/${base_branch}"
+  { [ "$#" -eq 1 ] && [ -n "$owner" ]; } || die "$usage"
+  case "$owner" in -*) die "$usage" ;; esac
+  printf '== free %s\n\n' "$owner"
+
+  # --- refusals: each one before anything is written ---
+  cur="$(git -C "$ROOT" symbolic-ref -q --short HEAD 2>/dev/null)" || cur=""
+  if [ -z "$cur" ]; then
+    printf 'refused   : detached HEAD — run on your own claimed branch\n'; return 1
+  fi
+  if [ "$owner" = "$base_branch" ] || [ "$owner" = "$cur" ]; then
+    printf 'refused   : %s is the base branch or this branch — free takes another branch\n' "$owner"
+    return 1
+  fi
+  if [ "$cur" = "$base_branch" ]; then
+    printf 'refused   : on %s itself — free commits onto your own claimed branch only\n' "$base_branch"
+    return 1
+  fi
+  # The claim first (manage.md §0): a free nobody claimed is invisible to
+  # dispatch, and a second manager frees the same branch.
+  if ! git -C "$ROOT" cat-file -e "HEAD:docs/handover/free-$(free_key "$owner").md" 2>/dev/null; then
+    printf 'refused   : %s carries no docs/handover/free-%s.md — claim it and push the claim first\n' \
+      "$cur" "$(free_key "$owner")"
+    return 1
+  fi
+  # Untracked files too: one in the way of the merge reads as a conflict.
+  if git -C "$ROOT" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1 ||
+     [ -n "$(git -C "$ROOT" status --porcelain 2>/dev/null)" ]; then
+    printf 'refused   : uncommitted or untracked changes, or a merge in progress — commit or clean first\n'
+    return 1
+  fi
+  # The two reads every refusal below stands on, fresh: a stale base would
+  # pass the behind check, a stale owner ref would merge the wrong tip.
+  if ! git -C "$ROOT" fetch -q origin \
+       "+refs/heads/${base_branch}:refs/remotes/origin/${base_branch}" </dev/null 2>/dev/null; then
+    printf 'refused   : cannot fetch origin/%s — 0 behind is unprovable\n' "$base_branch"
+    return 1
+  fi
+  # Gone (exit 2) and unreachable are different answers: one frees nothing,
+  # the other is a rerun.
+  git -C "$ROOT" ls-remote -q --exit-code --heads origin "refs/heads/${owner}" \
+    </dev/null >/dev/null 2>&1
+  case $? in
+    0) ;;
+    2) printf 'refused   : %s — no such branch on origin\n' "$owner"; return 1 ;;
+    *) printf 'refused   : cannot ask origin for %s — rerun\n' "$owner"; return 1 ;;
+  esac
+  if ! git -C "$ROOT" fetch -q origin \
+       "+refs/heads/${owner}:refs/remotes/origin/${owner}" </dev/null 2>/dev/null ||
+     ! tip="$(git -C "$ROOT" rev-parse -q --verify "refs/remotes/origin/${owner}^{commit}" 2>/dev/null)"; then
+    printf 'refused   : cannot fetch origin/%s — rerun\n' "$owner"
+    return 1
+  fi
+  if git -C "$ROOT" merge-base --is-ancestor "$tip" \
+       "refs/remotes/origin/${base_branch}" </dev/null 2>/dev/null; then
+    printf 'refused   : %s is already merged into %s — nothing to free\n' "$owner" "$base_branch"
+    return 1
+  fi
+  if git -C "$ROOT" merge-base --is-ancestor "$tip" HEAD </dev/null 2>/dev/null; then
+    printf 'refused   : %s is already merged into %s — push it and open the pull request\n' \
+      "$owner" "$cur"
+    return 1
+  fi
+  behind="$(git -C "$ROOT" rev-list --count "HEAD..refs/remotes/origin/${base_branch}" 2>/dev/null)"
+  if [ "${behind:-1}" != 0 ]; then
+    printf 'refused   : %s is %s behind origin/%s — cut it from fresh origin/%s\n' \
+      "$cur" "${behind:-?}" "$base_branch" "$base_branch"
+    return 1
+  fi
+  mb="$(git -C "$ROOT" merge-base "$tip" "refs/remotes/origin/${base_branch}" 2>/dev/null)" || mb=""
+  if [ -z "$mb" ]; then
+    printf 'refused   : %s shares no history with %s\n' "$owner" "$base_branch"
+    return 1
+  fi
+  # Both sides of a rename: a code file moved under docs/ is still code.
+  paths="$(git -c core.quotePath=false -C "$ROOT" diff --no-renames --name-only \
+    "$mb" "$tip" </dev/null 2>/dev/null)"
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    free_path_ok "$p" && continue
+    n_bad=$((n_bad + 1))
+    [ "$n_bad" -gt 5 ] || bad="${bad}            ${p}"$'\n'
+  done <<<"$paths"
+  if [ "$n_bad" -gt 0 ]; then
+    printf 'refused   : %s touches %s path(s) outside docs/plans, docs/product, docs/research, docs/handover — not a copy task:\n%s' \
+      "$owner" "$n_bad" "$bad"
+    return 1
+  fi
+  if held="$(free_owner_held "$tip" "$mb")"; then
+    printf 'refused   : %s holds %s — someone still owes it an answer; never freed\n' "$owner" "$held"
+    return 1
+  fi
+  printf 'owner     : %s at %s, %s path(s) since %s\n' "$owner" "${tip:0:12}" \
+    "$(printf '%s\n' "$paths" | grep -c .)" "${mb:0:12}"
+
+  # What the owner ADDED, read before the merge moves anything.
+  added_wf="$(git -c core.quotePath=false -C "$ROOT" diff --no-renames --name-only \
+    --diff-filter=A "$mb" "$tip" -- docs/handover </dev/null 2>/dev/null)"
+  added_plans="$(git -c core.quotePath=false -C "$ROOT" diff --no-renames --name-only \
+    --diff-filter=A "$mb" "$tip" -- docs/plans </dev/null 2>/dev/null)"
+  # DONE ON MAIN (ledger included) and leftover, as dispatch reads them.
+  rows="$(dispatch_branch_plans "$owner" | awk -F'\t' '$1 == "done" || $1 == "leftover" { print $1 "\t" $3 }')"
+  pre="$(git -C "$ROOT" rev-parse HEAD)"
+
+  # 1. Merge. Nothing committed until every step below has passed.
+  if ! git -C "$ROOT" merge -q --no-ff --no-commit "$tip" </dev/null >/dev/null 2>&1; then
+    printf 'conflict  : merging %s:\n' "$owner"
+    git -c core.quotePath=false -C "$ROOT" diff --name-only --diff-filter=U 2>/dev/null |
+      sed 's/^/            /'
+    git -C "$ROOT" merge --abort 2>/dev/null || git -C "$ROOT" reset -q --hard "$pre"
+    printf 'FAILED    : merge aborted, nothing committed — resolve by hand inside a plan-only diff, or block with conflict:\n'
+    return 1
+  fi
+
+  # 2. The owner's workstream files go; this branch's own stays.
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    git -C "$ROOT" cat-file -e "${pre}:${f}" 2>/dev/null && continue
+    { read -r wst; read -r wplan; } <<<"$(git -C "$ROOT" show "${tip}:${f}" \
+      </dev/null 2>/dev/null | gr_fields status plan)"
+    git -C "$ROOT" rm -q -f -- "$f" >/dev/null 2>&1 || continue
+    dropped="${dropped}${f}"$'\n'
+    printf 'drop      : %s — the owner'"'"'s workstream file\n' "$f"
+    # A done record the owner never retired: its item is finished, and
+    # deleting the record alone hands it back to the queue. Retire it here.
+    [ "$wst" = "done" ] || continue
+    wplan="$(lint_stem "$wplan" | tr -cd 'A-Za-z0-9._-')"
+    case "$wplan" in '' | none) continue ;; esac
+    # A live claim on another branch is building it: that manager retires it.
+    if hb="$(free_plan_claimed "$wplan" "$owner")"; then
+      printf 'keep      : %s item — %s holds a live claim on it\n' "$wplan" "$hb"
+      continue
+    fi
+    for p in "docs/plans/${wplan}.md" "docs/research/${wplan}.md"; do
+      git -C "$ROOT" ls-files --error-unmatch -- "$p" >/dev/null 2>&1 || continue
+      # The version deleted is the merge's: the base's when the merge kept
+      # it, else the owner's.
+      if [ "$(git -C "$ROOT" rev-parse -q --verify ":${p}" 2>/dev/null)" = \
+           "$(git -C "$ROOT" rev-parse -q --verify "${pre}:${p}" 2>/dev/null)" ]; then
+        hb="$pre"
+      else
+        hb="$tip"
+      fi
+      git -C "$ROOT" rm -q -f -- "$p" >/dev/null 2>&1 || continue
+      printf 'retire    : %s — %s reads status: done\n' "$p" "$f"
+      retired="${retired}${hb:0:12}:${p}"$'\n'
+      break
+    done
+  done <<<"$added_wf"
+
+  # 3. A stem retired elsewhere never re-enters the queue.
+  while IFS=$'\t' read -r kind stem; do
+    [ -n "$stem" ] || continue
+    f="docs/plans/${stem}.md"
+    git -C "$ROOT" cat-file -e "${pre}:${f}" 2>/dev/null && continue
+    git -C "$ROOT" ls-files --error-unmatch -- "$f" >/dev/null 2>&1 || continue
+    git -C "$ROOT" rm -q -f -- "$f" >/dev/null 2>&1 || continue
+    dropped="${dropped}${f}"$'\n'
+    if [ "$kind" = "done" ]; then
+      printf 'drop      : %s — DONE ON MAIN\n' "$f"
+    else
+      printf 'drop      : %s — leftover: %s added and retired it\n' "$f" "$base_branch"
+    fi
+  done <<<"$rows"
+
+  # 4. curate --apply, on the plans this free brings in and on nothing else.
+  keep=" "
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    case $'\n'"$dropped" in *$'\n'"${f}"$'\n'*) continue ;; esac
+    keep="${keep}${f} "
+  done <<<"$added_plans"
+  out="$("${ROOT}/joharness.sh" curate --apply 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    printf '%s\n' "$out"
+    git -C "$ROOT" merge --abort 2>/dev/null || git -C "$ROOT" reset -q --hard "$pre"
+    printf 'FAILED    : curate --apply exited %s — merge aborted, nothing committed\n' "$rc"
+    return 1
+  fi
+  applied="$(printf '%s\n' "$out" | sed -n 's/^applied   : //p')"
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    if [ "${keep#* "${f}" }" != "$keep" ]; then
+      git -C "$ROOT" add -- "$f"
+      printf 'curate    : %s\n' "$(printf '%s\n' "$applied" | grep -F -- "$f" | head -1 |
+        grep . || printf '%s scope: rewritten' "$f")"
+    else
+      git -C "$ROOT" checkout -q -- "$f"
+      printf 'curate    : %s restored — not a plan this free brings in\n' "$f"
+    fi
+  done < <(git -c core.quotePath=false -C "$ROOT" diff --name-only 2>/dev/null)
+
+  if ! git -C "$ROOT" commit -q --no-edit -m "free: merge ${owner} (${tip:0:12})" \
+       -m "$(printf 'Dropped, each recoverable with git show %s:<path>:\n%s\nRetired, each recoverable with git show <line>:\n%s' \
+             "${tip:0:12}" "${dropped:-none}" "${retired:-none}")" </dev/null >/dev/null 2>&1; then
+    git -C "$ROOT" merge --abort 2>/dev/null || git -C "$ROOT" reset -q --hard "$pre"
+    printf 'FAILED    : commit refused — merge aborted, nothing committed\n'
+    return 1
+  fi
+
+  # 5. ci on the result; red = the run never happened.
+  out="$("${ROOT}/joharness.sh" ci 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    printf '%s\n' "$out"
+    git -C "$ROOT" reset -q --hard "$pre"
+    printf 'FAILED    : ci red after curate --apply — %s reset to %s, nothing committed. Fix by hand inside a plan-only diff, or block with conflict:\n' \
+      "$cur" "${pre:0:12}"
+    return 1
+  fi
+  printf 'ci        : %s\n' "$(printf '%s\n' "$out" | tail -n 1)"
+  printf 'committed : %s on %s — push it; the pull request is yours (Loop step 7)\n' \
+    "$(git -C "$ROOT" rev-parse --short=12 HEAD)" "$cur"
+  if [ -n "${dropped}${retired}" ]; then
+    printf 'recover (paste into the pull request body):\n'
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      printf '  git show %s:%s\n' "${tip:0:12}" "$f"
+    done <<<"$dropped"
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      printf '  git show %s\n' "$f"
+    done <<<"$retired"
+  fi
+  return 0
+}
+
+# --- The scout cycle — the fleet spends nothing on finding what it could do better
+
+# No clock: a pass runs on the reviewer's order or a scout issue waiting on
+# the scout, which the orchestrator reads on GitHub. This stays git-only.
+# Every scout file at a branch TIP — every unmerged ref and the base branch
+# itself — one line per file: `<branch>\t<scout stem>\t<status>`.
+scout_walk() {
+  local base_branch="${HANDOVER_BASE_BRANCH:-main}" kind=scout
+  local ids=() names="" base_id id r hit wf doc sws sstat seen=$'\n' key listing rc_l rc_u blobs
+  base_id="$(git -C "$ROOT" rev-parse --verify -q \
+    "refs/remotes/origin/${base_branch}^{commit}" </dev/null 2>/dev/null)"
+  if [ -z "$base_id" ]; then
+    printf '%s\t%s\t%s\n' '?' "${kind}-unreadable" 'unreadable'
+    return 0
+  fi
+  while IFS=$'\t' read -r id r; do
+    case "$r" in
+      '' | refs/remotes/origin/HEAD | "refs/remotes/origin/${base_branch}") continue ;;
+    esac
+    case "$names" in *$'\n'"${id}"$'\t'*) ;; *) ids+=("$id") ;; esac
+    names="${names}"$'\n'"${id}"$'\t'"${r#refs/remotes/origin/}"
+  done < <(git -C "$ROOT" for-each-ref --no-merged="$base_id" \
+    --format='%(objectname)%09%(refname)' refs/remotes/origin </dev/null 2>/dev/null)
+  ids+=("$base_id"); names="${names}"$'\n'"${base_id}"$'\t'"${base_branch}"$'\n'
+  listing="$(GIT_LITERAL_PATHSPECS=0 GIT_NOGLOB_PATHSPECS=0 git -C "$ROOT" -c core.quotePath=false grep \
+    --color=never -l -E -e '' "${ids[@]}" -- "docs/handover/${kind}-[0-9]*" \
+    </dev/null 2>/dev/null)"; rc_l=$?
+  listing="${listing}"$'\n'"$(GIT_LITERAL_PATHSPECS=0 GIT_NOGLOB_PATHSPECS=0 git -C "$ROOT" -c core.quotePath=false grep \
+    --color=never -L -E -e '' "${ids[@]}" -- "docs/handover/${kind}-[0-9]*" \
+    </dev/null 2>/dev/null)"; rc_u=$?
+  if [ "$rc_l" -gt 1 ] || [ "$rc_u" -gt 1 ]; then
+    printf '%s\t%s\t%s\n' '?' "${kind}-unreadable" 'unreadable'
+  fi
+  while IFS= read -r hit; do
+    [ -n "$hit" ] || continue
+    id="${hit%%:*}"; wf="${hit#*:}"
+    if [ "$id" != "$base_id" ]; then
+      blobs="$(git -C "$ROOT" rev-parse --verify -q "${id}:${wf}" </dev/null 2>/dev/null)"
+      if [ -n "$blobs" ] && [ "$blobs" = "$(git -C "$ROOT" rev-parse --verify -q \
+          "${base_id}:${wf}" </dev/null 2>/dev/null)" ]; then
+        continue
+      fi
+    fi
+    # CR stripped first: a CRLF file must not read as no frontmatter at all.
+    doc="$(git -C "$ROOT" show "${id}:${wf}" </dev/null 2>/dev/null | tr -d '\r')"
+    sstat="$(printf '%s\n' "$doc" | gr_field status |
+      tr 'A-Z ' 'a-z-' | tr -cd 'a-z0-9._-')"
+    key="${id}"$'\t'"${wf}"
+    case "$seen" in *$'\n'"${key}"$'\n'*) continue ;; esac
+    seen="${seen}${key}"$'\n'
+    sws="${wf##*/}"; sws="${sws%.md}"
+    sws="$(printf '%s' "$sws" | tr -cd 'A-Za-z0-9._:-')"
+    while IFS=$'\t' read -r key r; do
+      [ "$key" = "$id" ] || continue
+      printf '%s\t%s\t%s\n' "${r:-?}" "${sws:-?}" "${sstat:-?}"
+    done <<<"$names"
+  done <<<"$listing"
+}
+
+scout_branches() {
+  local b w s
+  while IFS=$'\t' read -r b w s; do
+    [ -n "$b" ] || continue
+    [ "$s" = abandoned ] && continue
+    printf '%s\t%s\t%s\n' "$b" "$w" "$s"
+  done
+}
+
+# The scout's brief on the base branch: a branch cannot brief itself.
+scout_brief_present() {
+  local base_branch="${HANDOVER_BASE_BRANCH:-main}"
+  git -C "$ROOT" cat-file -e \
+    "refs/remotes/origin/${base_branch}:docs/product/SCOUT.md" </dev/null 2>/dev/null
+}
+
+# A conf key read from the BASE branch's conf, environment first: a
+# branch cannot name its own reviewer.
+scout_base_conf() {
+  local base_branch="${HANDOVER_BASE_BRANCH:-main}" v="${!1:-}"
+  [ -n "$v" ] || v="$(git -C "$ROOT" show "refs/remotes/origin/${base_branch}:joharness.conf" \
+    </dev/null 2>/dev/null |
+    sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*\([^#[:space:]]*\).*/\1/p" |
+    tail -1)"
+  printf '%s' "$v"
+}
+
+# A GitHub login, or `none` for anything a login cannot be.
+scout_reviewer() {
+  local v
+  v="$(scout_base_conf JOHARNESS_SCOUT_REVIEWER)"
+  # Rejected whole, never trimmed: a trimmed name is another account.
+  printf '%s' "$v" | grep -qx -E '[A-Za-z0-9](-?[A-Za-z0-9])*' || v=none
+  printf '%s' "$v"
+}
+
+scout_research() {
+  if [ "$(scout_base_conf JOHARNESS_SCOUT_RESEARCH)" = on ]; then printf 'on'; else printf 'off'; fi
+}
+
+# Can a scout run here, and is one in flight. SCOUT_STATE = `unreadable
+# <why>`, `off <why>` or `on`; SCOUT_ROWS = scout_walk's rows when `on`.
+SCOUT_STATE=""
+SCOUT_ROWS=""
+scout_state() {
+  local why
+  SCOUT_ROWS=""
+  why="$(cycle_unreadable)"
+  if [ -n "$why" ]; then
+    SCOUT_STATE="unreadable ${why}"
+  elif [ "$(scout_reviewer)" = none ]; then
+    SCOUT_STATE='off JOHARNESS_SCOUT_REVIEWER names no login: nothing can be approved, so no scout is ever spawned'
+  elif [ ! -f "${ROOT}/.claude/commands/scout.md" ]; then
+    SCOUT_STATE='off no .claude/commands/scout.md here: nothing for a scout to run'
+  elif ! scout_brief_present; then
+    # A pass with no brief answers nothing, so a waiting issue would
+    # respawn one every run.
+    SCOUT_STATE="off no docs/product/SCOUT.md on ${HANDOVER_BASE_BRANCH:-main}: a pass would answer nothing"
+  else
+    SCOUT_STATE=on
+    SCOUT_ROWS="$(scout_walk)"
+  fi
+}
+
+cmd_scout() {
+  local base_branch="${HANDOVER_BASE_BRANCH:-main}" state why b w s n_inflight=0
+  [ "$#" -eq 0 ] || die "usage: $0 scout"
+  printf '== scout (runs on the reviewer'"'"'s order or a scout issue waiting on the scout)\n\n'
+
+  scout_state
+  state="${SCOUT_STATE%% *}"; why="${SCOUT_STATE#* }"
+  case "$state" in
+    unreadable) printf 'scout     : UNREADABLE — %s\n\n' "$why"; return 0 ;;
+    off)        printf 'scout     : off — %s\n' "$why" ;;
+  esac
+  while IFS=$'\t' read -r b w s; do
+    [ -n "$b" ] || continue
+    n_inflight=$((n_inflight + 1))
+    [ "$n_inflight" -gt 1 ] || printf 'scout     : IN FLIGHT — one at a time\n'
+    printf '            %s  %s  %s\n' "$b" "$w" "$s"
+  done < <(printf '%s\n' "$SCOUT_ROWS" | scout_branches)
+  [ "$state" = off ] || [ "$n_inflight" -gt 0 ] || printf 'scout     : none in flight\n'
+  # What a pass reads from conf, so the role never reads the conf file.
+  if scout_brief_present; then
+    printf 'brief     : docs/product/SCOUT.md on %s — the pass researches against it\n' "$base_branch"
+  else
+    printf 'brief     : NO BRIEF — no docs/product/SCOUT.md on %s: the cycle is off\n' \
+      "$base_branch"
+  fi
+  # The clerk's scout gate reads this line: printed when off too.
+  printf 'reviewer  : %s (JOHARNESS_SCOUT_REVIEWER) — ' "$(scout_reviewer)"
+  if [ "$(scout_reviewer)" = none ]; then printf 'nothing can be approved\n'
+  else printf 'their approved comment is the gate\n'; fi
+  printf 'research  : %s (JOHARNESS_SCOUT_RESEARCH); budget %s outside reads a pass (JOHARNESS_SCOUT_READS)\n\n' \
+    "$(scout_research)" "$(num_knob JOHARNESS_SCOUT_READS)"
+}
+
+# --- The clerk cycle — open issues are the top rank and no role read them
+
+# A clerk writes NO workstream file (.claude/commands/clerk.md §1), so the
+# cycle reads what one does leave in git (#424): the merge of its plan-only
+# pull request, its unmerged `clerk-<digit>…` branch, or — a pass with no
+# plan to write — a `clerk-noop-<stamp>` branch at the base branch's head.
+
+# `YYYYMMDDTHHMMSSZ` (UTC) to epoch seconds, empty when malformed. Civil-day
+# arithmetic, because `date -d` and `date -j -f` split GNU from BSD.
+clerk_stamp_ts() {
+  local s="$1" y mo d h mi se era yoe doy doe
+  case "$s" in
+    [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z) ;;
+    *) return 0 ;;
+  esac
+  y=$((10#${s:0:4})); mo=$((10#${s:4:2})); d=$((10#${s:6:2}))
+  h=$((10#${s:9:2})); mi=$((10#${s:11:2})); se=$((10#${s:13:2}))
+  if [ "$mo" -lt 1 ] || [ "$mo" -gt 12 ] || [ "$d" -lt 1 ] || [ "$d" -gt 31 ] ||
+     [ "$h" -gt 23 ] || [ "$mi" -gt 59 ] || [ "$se" -gt 59 ]; then
+    return 0
+  fi
+  [ "$mo" -gt 2 ] || y=$((y - 1))
+  era=$((y / 400)); yoe=$((y - era * 400))
+  doy=$(( (153 * ((mo + 9) % 12) + 2) / 5 + d - 1 ))
+  doe=$(( yoe * 365 + yoe / 4 - yoe / 100 + doy ))
+  printf '%s' $(( (era * 146097 + doe - 719468) * 86400 + h * 3600 + mi * 60 + se ))
+}
+
+# The last clerk merge: `<committer time>\t<branch>\t#<N>`, empty when none.
+# Read from GitHub's DEFAULT merge subject ("Merge pull request #N from
+# <owner>/<branch>"): a repo set to title-only merge messages reads no landing.
+# FIRST-PARENT, so "Merge origin/main into clerk-…" — a merge made ON a clerk
+# branch and reachable from the base — is never read as one landing.
+clerk_landed() {
+  local base_branch="${HANDOVER_BASE_BRANCH:-main}" ct subj from n
+  while IFS=$'\t' read -r ct subj; do
+    from="${subj#Merge pull request \#}"
+    n="${from%% *}"
+    from="${from#* from }"
+    from="${from%% *}"
+    from="${from#*/}"
+    case "$from" in */*) continue ;; clerk-[0-9]*) ;; *) continue ;; esac
+    printf '%s\t%s\t#%s' "$ct" "$from" "$n"
+    return 0
+  done < <(git -C "$ROOT" log --first-parent --merges -E \
+    --grep='^Merge pull request #[0-9]+ from [^/ ]+/clerk-[0-9]' \
+    --format='%ct%x09%s' "refs/remotes/origin/${base_branch}" </dev/null 2>/dev/null)
+}
+
+# The newest no-op record: `<stamp time>\t<branch>`, empty when none. Merged
+# ones only: the record IS the base branch's commit, named for its pass. A
+# stamp further ahead than the stale window is a broken clock and dates
+# nothing: clamped, it would pin the cycle until that date, and only a human
+# deletes the ref.
+clerk_noop() {
+  local base_branch="${HANDOVER_BASE_BRANCH:-main}" r ts best=0 bname="" lim
+  lim=$(( $(date +%s) + $(clerk_stale_s) ))
+  while IFS= read -r r; do
+    ts="$(clerk_stamp_ts "${r#refs/remotes/origin/clerk-noop-}")"
+    [ -n "$ts" ] || continue
+    [ "$ts" -le "$lim" ] || continue
+    if [ "$ts" -gt "$best" ]; then best="$ts"; bname="${r#refs/remotes/origin/}"; fi
+  done < <(git -C "$ROOT" for-each-ref --merged="refs/remotes/origin/${base_branch}" \
+    --format='%(refname)' 'refs/remotes/origin/clerk-noop-*' </dev/null 2>/dev/null)
+  [ "$best" -eq 0 ] || printf '%s\t%s' "$best" "$bname"
+}
+
+# JOHARNESS_CLERK_STALE_HOURS in seconds. 0 is no window, failing CLOSED:
+# every unmerged clerk branch holds, as a window of zero would have
+# dispatch spawn a second clerk beside a live one.
+clerk_stale_s() {
+  local h
+  h="$(num_knob JOHARNESS_CLERK_STALE_HOURS)"
+  [ "$h" -gt 0 ] || h=999999999
+  printf '%s' $((h * 3600))
+}
+
+# Every unmerged `clerk-<digit>…` branch, one row each in scout_walk's shape:
+# `<branch>\ttip-<N>h\t<in-flight|abandoned>`. A tip older than
+# JOHARNESS_CLERK_STALE_HOURS is abandoned and holds nothing (scout_branches
+# drops it): a `TWIN: deferred` exit or a pull request left open on a red gate
+# leaves its branch, and branches are never deleted. Never tied to
+# JOHARNESS_CLERK_HOURS: a live clerk may wait longer than the cadence on checks.
+clerk_walk() {
+  local base_branch="${HANDOVER_BASE_BRANCH:-main}" base_id stale now ct r age st refs rc
+  base_id="$(git -C "$ROOT" rev-parse --verify -q \
+    "refs/remotes/origin/${base_branch}^{commit}" </dev/null 2>/dev/null)"
+  if [ -z "$base_id" ]; then
+    printf '%s\t%s\t%s\n' '?' 'clerk-unreadable' 'unreadable'
+    return 0
+  fi
+  stale="$(clerk_stale_s)"
+  now="$(date +%s)"
+  # Read whole first: a failed read is UNREADABLE, never "nothing in flight".
+  refs="$(git -C "$ROOT" for-each-ref --no-merged="$base_id" \
+    --format='%(committerdate:unix)%09%(refname)' 'refs/remotes/origin/clerk-[0-9]*' \
+    </dev/null 2>/dev/null)"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    printf '%s\t%s\t%s\n' '?' 'clerk-unreadable' 'unreadable'
+    return 0
+  fi
+  while IFS=$'\t' read -r ct r; do
+    case "$ct" in '' | *[!0-9]*) continue ;; esac
+    r="${r#refs/remotes/origin/}"
+    age=$(( (now - ct) / 3600 ))
+    [ "$age" -ge 0 ] || age=0
+    # Either side of now: a tip dated ahead by more than the window is a
+    # broken clock, and holds nothing either.
+    if [ $((now - ct)) -lt "$stale" ] && [ $((ct - now)) -lt "$stale" ]; then
+      st=in-flight
+    else
+      st=abandoned
+    fi
+    printf '%s\t%s\t%s\n' "$r" "tip-${age}h" "$st"
+  done <<<"$refs"
+}
+
+# Is a clerk due. CLERK_ROWS is read whatever the clock says: a clerk in
+# flight takes a slot either way.
+CLERK_DUE=""
+CLERK_ROWS=""
+clerk_due() {
+  local hours age why base_word landed noop ts=0 now
+  CLERK_ROWS=""
+  why="$(cycle_unreadable)"
+  if [ -n "$why" ]; then
+    CLERK_DUE="unreadable ${why}"
+    return 0
+  fi
+  hours="$(num_knob JOHARNESS_CLERK_HOURS)"
+  if [ "$hours" -eq 0 ]; then
+    CLERK_DUE='off JOHARNESS_CLERK_HOURS=0: no clerk is ever due'
+    return 0
+  fi
+  if [ ! -f "${ROOT}/.claude/commands/clerk.md" ]; then
+    CLERK_DUE='off no .claude/commands/clerk.md here: nothing for a clerk to run'
+    return 0
+  fi
+  landed="$(clerk_landed)"
+  noop="$(clerk_noop)"
+  if [ -n "$landed" ]; then
+    ts="${landed%%$'\t'*}"; landed="${landed#*$'\t'}"
+    base_word="the last clerk landed (${landed%%$'\t'*}, ${landed#*$'\t'})"
+  fi
+  if [ -n "$noop" ] && [ "${noop%%$'\t'*}" -gt "$ts" ]; then
+    ts="${noop%%$'\t'*}"
+    base_word="the last clerk pass found nothing to plan (${noop#*$'\t'})"
+  fi
+  now="$(date +%s)"
+  if [ "$ts" -gt 0 ]; then
+    [ "$ts" -le "$now" ] || ts="$now"
+    age=$(( (now - ts) / 3600 ))
+  else
+    age="$(cycle_repo_age_h)"
+    [ -n "$age" ] || age=0
+    base_word='the repository began, no clerk having run'
+  fi
+  if [ "$age" -ge "$hours" ]; then
+    CLERK_DUE="due ${age}h since ${base_word} (>= ${hours}h)"
+  else
+    CLERK_DUE="not-due ${age}h since ${base_word} (of ${hours}h)"
+  fi
+  CLERK_ROWS="$(clerk_walk)"
+}
+
+# Issue numbers an `issue:` field names under one directory, one per line,
+# sorted, valid ones only (issue_verdict).
+clerk_issue_nums() {
+  local dir="$1" scope="$2" base_branch="${HANDOVER_BASE_BRANCH:-main}"
+  local ids=() id r out rc line v
+  id="$(git -C "$ROOT" rev-parse --verify -q \
+    "refs/remotes/origin/${base_branch}^{commit}" </dev/null 2>/dev/null)"
+  if [ -z "$id" ]; then
+    printf '?\n'
+    return 0
+  fi
+  ids+=("$id")
+  if [ "$scope" = all ]; then
+    while IFS=$'\t' read -r r line; do
+      case "$line" in
+        '' | refs/remotes/origin/HEAD | "refs/remotes/origin/${base_branch}") continue ;;
+      esac
+      case " ${ids[*]} " in *" ${r} "*) ;; *) ids+=("$r") ;; esac
+    done < <(git -C "$ROOT" for-each-ref --no-merged="$id" \
+      --format='%(objectname)%09%(refname)' refs/remotes/origin </dev/null 2>/dev/null)
+  fi
+  out="$(GIT_LITERAL_PATHSPECS=0 GIT_NOGLOB_PATHSPECS=0 git -C "$ROOT" \
+    -c core.quotePath=false -c grep.lineNumber=false -c grep.column=false \
+    -c grep.fullName=false grep --color=never --text -h -E -e '^issue:' \
+    "${ids[@]}" -- "${dir}/*.md" </dev/null 2>/dev/null)"; rc=$?
+  if [ "$rc" -gt 1 ]; then
+    printf '?\n'
+    return 0
+  fi
+  while IFS= read -r line; do
+    line="${line%$'\r'}"
+    line="${line#issue:}"
+    line="$(printf '%s' "$line" | sed 's/^[[:space:]]*//; s/[[:space:]][[:space:]]*#.*$//; s/[[:space:]]*$//')"
+    v="$(issue_verdict "$line")"
+    case "$v" in ok\ *) printf '%s\n' "${v#ok }" ;; esac
+  done <<<"$out" | sort -un
+}
+
+# One list as one line: `none`, the numbers, or UNREADABLE.
+clerk_issue_line() {
+  local nums
+  nums="$(cat)"
+  case "$nums" in
+    '') printf 'none' ;;
+    *'?'*) printf 'UNREADABLE — take no issue this pass: a list that could not be read is no empty list' ;;
+    *) printf '%s' "$(printf '%s\n' "$nums" | sed 's/^/#/' | tr '\n' ' ' | sed 's/ $//')" ;;
+  esac
+}
+
+cmd_clerk() {
+  local hours batch due rows state why b w st n_inflight=0
+  [ "$#" -eq 0 ] || die "usage: $0 clerk"
+  hours="$(num_knob JOHARNESS_CLERK_HOURS)"
+  batch="$(num_knob JOHARNESS_CLERK_BATCH)"
+  printf '== clerk (every %sh: JOHARNESS_CLERK_HOURS; at most %s issue(s) a pass: JOHARNESS_CLERK_BATCH)\n\n' \
+    "$hours" "$batch"
+  printf 'reads no GitHub: git only. The open issues are the clerk'"'"'s own read (.claude/commands/clerk.md)\n\n'
+
+  clerk_due all
+  due="$CLERK_DUE"; rows="$CLERK_ROWS"
+  state="${due%% *}"; why="${due#* }"
+  case "$state" in
+    unreadable) printf 'cadence   : UNREADABLE — %s\n' "$why"; return 0 ;;
+    off)        printf 'cadence   : off — %s\n' "$why" ;;
+  esac
+  while IFS=$'\t' read -r b w st; do
+    [ -n "$b" ] || continue
+    n_inflight=$((n_inflight + 1))
+    [ "$n_inflight" -gt 1 ] || \
+      printf 'cadence   : IN FLIGHT, so none is due. Clock: %s %s\n' "$state" "$why"
+    printf '            %s  %s  %s\n' "$b" "$w" "$st"
+  done < <(printf '%s\n' "$rows" | scout_branches)
+  if [ "$n_inflight" -eq 0 ] && [ "$state" != off ]; then
+    if [ "$state" = due ]; then
+      printf 'cadence   : DUE — %s\n' "$why"
+    else
+      printf 'cadence   : not due — %s\n' "$why"
+    fi
+  fi
+  printf '\n'
+  printf 'planned   : %s\n' "$(clerk_issue_nums docs/plans all | clerk_issue_line)"
+  printf '            (a plan'"'"'s issue: on %s or any unmerged branch)\n' "${HANDOVER_BASE_BRANCH:-main}"
+  printf 'claimed   : %s\n' "$(clerk_issue_nums docs/handover all | clerk_issue_line)"
+  printf '            (a workstream file'"'"'s issue: on %s or any unmerged branch)\n' \
+    "${HANDOVER_BASE_BRANCH:-main}"
+}
+
+# --- The conduct cycle — a sample of merged managers' own artifacts, read for
+# how the work was done, never for what the diff does (issue #251)
+
+# The ledger: outside .agents/docs/ because that directory syncs to consumers
+# and would overwrite a consumer's ledger with canonical's.
+CONDUCT_LEDGER="docs/conduct-log.md"
+
+# The ledger as the base branch carries it. rc 0 = printed, 1 = absent,
+# 2 = unreadable — a misread is never an empty ledger.
+conduct_ledger() {
+  local base_branch="${HANDOVER_BASE_BRANCH:-main}" ls rc
+  ls="$(git -C "$ROOT" ls-tree --name-only "refs/remotes/origin/${base_branch}" \
+    -- "$CONDUCT_LEDGER" </dev/null 2>/dev/null)"; rc=$?
+  [ "$rc" -eq 0 ] || return 2
+  [ -n "$ls" ] || return 1
+  git -C "$ROOT" show "refs/remotes/origin/${base_branch}:${CONDUCT_LEDGER}" \
+    </dev/null 2>/dev/null | tr -d '\r' || return 2
+}
+
+# The ledger's table rows as `<date>\t<stem>\t<Cn>=<verdict>...`, columns
+# found by header name, so a question added later is one more column.
+conduct_rows() {
+  awk -F'|' '
+    function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
+    !/^[ \t]*\|/ { next }
+    !hdr {
+      for (i = 2; i < NF; i++) {
+        h = trim($i)
+        if (h == "date") cd = i
+        else if (h == "stem") cs = i
+        else if (h ~ /^C[0-9]+$/) { q[++nq] = i; qn[nq] = h }
+      }
+      if (cs) hdr = 1
+      next
+    }
+    trim($2) ~ /^:?-+:?$/ { next }
+    {
+      st = trim($cs); if (st == "") next
+      line = (cd ? trim($cd) : "?") "\t" st
+      for (k = 1; k <= nq; k++) {
+        v = toupper(trim($(q[k])))
+        if (v ~ /^FINE/) v = "FINE"
+        else if (v ~ /^CONCERN/) v = "CONCERN"
+        else if (v ~ /^NO EVIDENCE/) v = "NO-EVIDENCE"
+        else v = "?"
+        line = line "\t" qn[k] "=" v
+      }
+      print line
+    }'
+}
+
+# Stems a workstream-file retire deleted on the base branch, minus the
+# periodic roles', those still standing there, and those already in the
+# ledger. One `<stem>\t<retire sha>` per line; `?` alone = unreadable.
+conduct_candidates() {
+  local base_branch="${HANDOVER_BASE_BRANCH:-main}" ref log rc standing logged ledger lrc
+  ref="refs/remotes/origin/${base_branch}"
+  log="$(git -C "$ROOT" -c core.quotePath=false log --full-history --diff-filter=D \
+    --name-only --format='C %H' "$ref" -- docs/handover </dev/null 2>/dev/null)"; rc=$?
+  standing="$(git -C "$ROOT" -c core.quotePath=false ls-tree --name-only "$ref" \
+    -- docs/handover/ </dev/null 2>/dev/null)" || rc=1
+  ledger="$(conduct_ledger)"; lrc=$?
+  if [ "$rc" -ne 0 ] || [ "$lrc" -eq 2 ]; then
+    printf '?\n'
+    return 0
+  fi
+  logged="$(printf '%s\n' "$ledger" | conduct_rows | cut -f2)"
+  printf '%s\n' "$log" | awk -v standing="$standing" -v logged="$logged" '
+    BEGIN {
+      n = split(standing, a, "\n"); for (i = 1; i <= n; i++) skip[a[i]] = 1
+      n = split(logged, a, "\n");   for (i = 1; i <= n; i++) done[a[i]] = 1
+    }
+    /^C [0-9a-f]+$/ { sha = substr($0, 3); next }
+    /^docs\/handover\/[A-Za-z0-9._-]+\.md$/ {
+      if (skip[$0]) next
+      s = $0; sub(/^docs\/handover\//, "", s); sub(/\.md$/, "", s)
+      # Role sessions carry a date in the stem (scout-, curate-, clerk-,
+      # janitor-, findings passes); a manager item names its plan, never a day.
+      if (s ~ /-[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]/) next
+      if (s == "README" || s == "TEMPLATE" || s == "RETIRED") next
+      if (done[s] || seen[s]++) next
+      print s "\t" sha
+    }'
+}
+
+# sha1 of stdin, 40 hex; empty when no tool here can say it.
+conduct_sha1() {
+  local h
+  if command -v sha1sum >/dev/null 2>&1; then h="$(sha1sum)"
+  elif command -v shasum >/dev/null 2>&1; then h="$(shasum -a 1)"
+  else cat >/dev/null; return 0
+  fi
+  printf '%s' "${h%% *}"
+}
+
+# The sample: the N candidates whose sha1(<stem>) sorts lowest.
+# Membership by stem, never by date, so a re-run picks the same set and a
+# test can assert it. N = 0 = any one, unordered (does one exist). `?` alone
+# = unreadable.
+conduct_sample() {
+  local n="$1" cands s r h got=0 limit=1
+  cands="$(conduct_candidates)"
+  case "$cands" in '?') printf '?\n'; return 0 ;; '') return 0 ;; esac
+  if [ "$n" -gt 0 ]; then
+    limit="$n"
+    [ -n "$(printf 'x' | conduct_sha1)" ] || { printf '?\n'; return 0; }
+    cands="$(while IFS=$'\t' read -r s r; do
+      [ -n "$s" ] || continue
+      h="$(printf '%s' "$s" | conduct_sha1)"
+      printf '%s\t%s\t%s\n' "$h" "$s" "$r"
+    done <<<"$cands" | LC_ALL=C sort | cut -f2-)"
+  fi
+  while IFS=$'\t' read -r s r; do
+    [ -n "$s" ] || continue
+    printf '%s\n' "$s"
+    got=$((got + 1))
+    [ "$got" -lt "$limit" ] || break
+  done <<<"$cands"
+}
+
+# Hours since the ledger last LANDED on the base branch, empty when it never
+# has; `?` = unreadable. First-parent only: the commit there that changed the
+# ledger IS its landing (the merge, or a direct commit). A manager's merge-in
+# of the base branch sits off that line, so it never re-dates the clock.
+conduct_age_h() {
+  local base_branch="${HANDOVER_BASE_BRANCH:-main}" ts
+  ts="$(git -C "$ROOT" log -1 --first-parent --format=%ct \
+    "refs/remotes/origin/${base_branch}" -- "$CONDUCT_LEDGER" \
+    </dev/null 2>/dev/null)" || { printf '?'; return 0; }
+  [ -n "$ts" ] || return 0
+  case "$ts" in *[!0-9]*) printf '?'; return 0 ;; esac
+  printf '%s' "$(( ($(date +%s) - ts) / 3600 ))"
+}
+
+# Is a conduct reviewer due. CONDUCT_DUE = `<state> <why>`, state one of
+# unreadable off due not-due empty (due, nothing to sample). CONDUCT_ROWS =
+# the reviewer branches in flight, `<branch>\t<age>h`.
+CONDUCT_DUE=""
+CONDUCT_ROWS=""
+conduct_due() {
+  local base_branch="${HANDOVER_BASE_BRANCH:-main}" hours sample age why base_word
+  local refs rc b ts now drop cands
+  CONDUCT_ROWS=""
+  why="$(cycle_unreadable)"
+  if [ -n "$why" ]; then
+    CONDUCT_DUE="unreadable ${why}"
+    return 0
+  fi
+  hours="$(num_knob JOHARNESS_CONDUCT_HOURS)"
+  sample="$(num_knob JOHARNESS_CONDUCT_SAMPLE)"
+  if [ "$hours" -eq 0 ]; then
+    CONDUCT_DUE='off JOHARNESS_CONDUCT_HOURS=0: no conduct reviewer is ever due'
+    return 0
+  fi
+  if [ "$sample" -eq 0 ]; then
+    CONDUCT_DUE='off JOHARNESS_CONDUCT_SAMPLE=0: nothing is ever sampled'
+    return 0
+  fi
+  if [ ! -f "${ROOT}/.claude/commands/conduct.md" ]; then
+    CONDUCT_DUE='off no .claude/commands/conduct.md here: nothing for a reviewer to run'
+    return 0
+  fi
+  # In flight = an unmerged branch whose LAST path segment starts conduct-<digit>
+  # (a session may push under a prefix: claude/conduct-...). Sessions never delete branches,
+  # so one a human closed unmerged stands for ever: past a seventh of the
+  # window (at least 24h) since its last push it is dropped, as scout_branches drops
+  # `abandoned` rows.
+  refs="$(git -C "$ROOT" for-each-ref --no-merged="refs/remotes/origin/${base_branch}" \
+    --format='%(refname:lstrip=3)%09%(committerdate:unix)' refs/remotes/origin \
+    </dev/null 2>/dev/null)"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    CONDUCT_DUE='unreadable the unmerged branches could not be listed'
+    return 0
+  fi
+  now="$(date +%s)"
+  drop=$(( (hours + 6) / 7 ))
+  # Floor: a short clock must not read a reviewer waiting on checks as gone.
+  [ "$drop" -ge 24 ] || drop=24
+  while IFS=$'\t' read -r b ts; do
+    [ -n "$b" ] || continue
+    # conduct-<digit>: the reviewer's dated name, never a manager item's.
+    case "${b##*/}" in conduct-[0-9]*) ;; *) continue ;; esac
+    case "$ts" in '' | *[!0-9]*)
+      CONDUCT_DUE="unreadable no push time for ${b}"; CONDUCT_ROWS=""; return 0 ;;
+    esac
+    ts=$(( (now - ts) / 3600 ))
+    [ "$ts" -lt "$drop" ] || continue
+    CONDUCT_ROWS="${CONDUCT_ROWS}${b}"$'\t'"${ts}h"$'\n'
+  done <<<"$refs"
+  base_word='the ledger last landed'
+  age="$(conduct_age_h)"
+  if [ "$age" = '?' ]; then
+    CONDUCT_DUE="unreadable ${CONDUCT_LEDGER}'s history could not be read"
+    CONDUCT_ROWS=""
+    return 0
+  fi
+  if [ -z "$age" ]; then
+    age="$(cycle_repo_age_h)"
+    [ -n "$age" ] || age=0
+    base_word='the repository began, no conduct review having run'
+  fi
+  if [ "$age" -lt "$hours" ]; then
+    CONDUCT_DUE="not-due ${age}h since ${base_word} (of ${hours}h)"
+    return 0
+  fi
+  if [ -z "$(printf 'x' | conduct_sha1)" ]; then
+    CONDUCT_DUE='unreadable no sha1sum or shasum here: the sample cannot be drawn'
+    CONDUCT_ROWS=""; return 0
+  fi
+  cands="$(conduct_sample 0)"
+  case "$cands" in
+    '?') CONDUCT_DUE='unreadable the retired workstream files or the ledger could not be read'
+         CONDUCT_ROWS=""; return 0 ;;
+    '')  CONDUCT_DUE="empty ${age}h since ${base_word} (>= ${hours}h), but no retired manager workstream file is left unsampled" ;;
+    *)   CONDUCT_DUE="due ${age}h since ${base_word} (>= ${hours}h)" ;;
+  esac
+}
+
+# The tally, from the ledger: what the owner reads to judge the spend.
+conduct_tally() {
+  local ledger lrc
+  ledger="$(conduct_ledger)"; lrc=$?
+  if [ "$lrc" -eq 2 ]; then
+    printf 'tally     : UNREADABLE — %s could not be read on the base branch\n' "$CONDUCT_LEDGER"
+    return 0
+  fi
+  # Runs count every row's date; verdicts one per stem, the last row winning:
+  # two pull requests that appended the same sample must not count it twice.
+  printf '%s\n' "$ledger" | conduct_rows | awk -F'\t' '
+    { d[$1] = 1; last[$2] = NR; row[NR] = $0 }
+    END {
+      for (r = 1; r <= NR; r++) {
+        m = split(row[r], f, "\t")
+        if (last[f[2]] != r) continue
+        n++
+        for (i = 3; i <= m; i++) {
+          split(f[i], kv, "="); q = kv[1]; v = kv[2]
+          if (!(q in seen)) { seen[q] = 1; order[++nq] = q }
+          c[q, v]++; t[q]++
+        }
+      }
+      runs = 0; for (k in d) runs++
+      printf "tally     : %d run(s), %d branch(es) sampled (runs = distinct ledger dates)\n", runs, n
+      for (j = 1; j <= nq; j++) {
+        q = order[j]
+        printf "            %s  FINE %d  CONCERN %d  NO EVIDENCE %d", q, c[q, "FINE"], c[q, "CONCERN"], c[q, "NO-EVIDENCE"]
+        if (c[q, "?"]) printf "  unparsed %d", c[q, "?"]
+        printf "  CONCERN rate %d%%\n", (t[q] ? int(100 * c[q, "CONCERN"] / t[q] + 0.5) : 0)
+      }
+    }'
+}
+
+cmd_conduct() {
+  local hours sample due state why b a n_inflight=0 s
+  [ "$#" -eq 0 ] || die "usage: $0 conduct"
+  hours="$(num_knob JOHARNESS_CONDUCT_HOURS)"
+  sample="$(num_knob JOHARNESS_CONDUCT_SAMPLE)"
+  printf '== conduct (every %sh: JOHARNESS_CONDUCT_HOURS; %s branch(es) a run: JOHARNESS_CONDUCT_SAMPLE)\n\n' \
+    "$hours" "$sample"
+  printf 'reads no diff: a sampled branch'"'"'s workstream file, commit order and plan Acceptance only (.claude/commands/conduct.md)\n\n'
+
+  conduct_due
+  due="$CONDUCT_DUE"
+  state="${due%% *}"; why="${due#* }"
+  case "$state" in
+    unreadable) printf 'cadence   : UNREADABLE — %s\n' "$why"; return 0 ;;
+    off)        printf 'cadence   : off — %s\n\n' "$why"; conduct_tally; return 0 ;;
+  esac
+  while IFS=$'\t' read -r b a; do
+    [ -n "$b" ] || continue
+    n_inflight=$((n_inflight + 1))
+    [ "$n_inflight" -gt 1 ] || \
+      printf 'cadence   : IN FLIGHT, so none is due. Clock: %s %s\n' "$state" "$why"
+    printf '            %s  pushed %s ago\n' "$b" "$a"
+  done <<<"$CONDUCT_ROWS"
+  if [ "$n_inflight" -eq 0 ]; then
+    case "$state" in
+      due)   printf 'cadence   : DUE — %s\n' "$why" ;;
+      empty) printf 'cadence   : due, nothing to sample — %s\n' "$why" ;;
+      *)     printf 'cadence   : not due — %s\n' "$why" ;;
+    esac
+  fi
+  printf '\n'
+  s="$(conduct_sample "$sample")"
+  case "$s" in
+    '?') printf 'sample    : UNREADABLE — take no branch this run: a list that could not be read is no empty list\n' ;;
+    '')  printf 'sample    : none — no retired manager workstream file is left unsampled\n' ;;
+    *)   printf 'sample    : %s branch(es), lowest sha1(<stem>) first — review exactly these\n' \
+           "$(printf '%s\n' "$s" | awk 'END { print NR + 0 }')"
+         printf '%s\n' "$s" | sed 's/^/            /' ;;
+  esac
+  printf '\n'
+  conduct_tally
+}
+
+# --- role — the periodic roles' prelude, one tested command (plan
+# role-prelude-command). Each role command's §0–§1 read as prose re-derived
+# per pass; this runs the same steps and prints, LAST, one line: `GO
+# <branch>` (rc 0) or `STOP: <reason>` (rc 1). The judgement stays in the
+# command file: what to read, what to produce.
+
+ROLE_OUT=""
+
+# Every ref, pruned: on stale refs a twin is invisible. Bounded.
+role_fetch_all() {
+  if have timeout; then
+    timeout 120 git -C "$ROOT" fetch -q --prune origin '+refs/heads/*:refs/remotes/origin/*' </dev/null
+  else
+    git -C "$ROOT" fetch -q --prune origin '+refs/heads/*:refs/remotes/origin/*' </dev/null
+  fi
+}
+
+# The role's own report, printed and kept in ROLE_OUT: the role reads it as
+# it would have, so this never rewords it.
+role_report() {
+  ROLE_OUT="$("cmd_$1" 2>&1)"
+  printf '%s\n' "$ROLE_OUT"
+}
+
+# Branches the report lists under its IN FLIGHT line, one per line.
+role_rows() {
+  printf '%s\n' "$ROLE_OUT" | awk '
+    /^[a-z]+ +: IN FLIGHT/ { on = 1; next }
+    on && /^            [^ (]/ { print $1; next }
+    { on = 0 }'
+}
+
+# The first report line matching an ERE, empty when none.
+role_line() { printf '%s\n' "$ROLE_OUT" | grep -m1 -E -- "$1"; }
+
+# This branch's own claim files: `docs/handover/<role>-<digit>…` at HEAD and
+# not the base branch's copy. Scout and curate claim by one; clerk and conduct
+# never write one. `--pushed`: only those origin's copy of this branch carries
+# too — a claim that never reached origin holds nothing, so it resumes nothing.
+role_own_claims() {
+  local role="$1" base="refs/remotes/origin/${HANDOVER_BASE_BRANCH:-main}" f cur=""
+  if [ "${2:-}" = --pushed ]; then
+    cur="$(role_branch)" || return 0
+    [ "$cur" != "${HANDOVER_BASE_BRANCH:-main}" ] || return 0
+  fi
+  git -C "$ROOT" ls-tree --name-only HEAD -- docs/handover/ </dev/null 2>/dev/null |
+    while IFS= read -r f; do
+      case "${f#docs/handover/}" in "${role}"-[0-9]*.md) ;; *) continue ;; esac
+      [ "$(git -C "$ROOT" rev-parse -q --verify "HEAD:${f}" 2>/dev/null)" = \
+        "$(git -C "$ROOT" rev-parse -q --verify "${base}:${f}" 2>/dev/null)" ] && continue
+      if [ -n "$cur" ]; then
+        git -C "$ROOT" cat-file -e "refs/remotes/origin/${cur}:${f}" 2>/dev/null || continue
+      fi
+      printf '%s\n' "$f"
+    done
+}
+
+role_branch() { git -C "$ROOT" symbolic-ref --quiet --short HEAD 2>/dev/null; }
+
+# A branch name no ref here holds: the role's name, else `-b`, `-c`, …
+# Never `checkout -B` over a pushed branch.
+role_free_name() {
+  local n="$1" s
+  for s in '' -b -c -d -e -f -g -h -i -j -k -l -m -n -o -p -q -r -s -t -u -v -w -x -y -z; do
+    git -C "$ROOT" rev-parse -q --verify "refs/remotes/origin/${n}${s}" >/dev/null 2>&1 && continue
+    git -C "$ROOT" rev-parse -q --verify "refs/heads/${n}${s}" >/dev/null 2>&1 && continue
+    printf '%s' "${n}${s}"
+    return 0
+  done
+  return 1
+}
+
+role_push() {
+  if have timeout; then
+    timeout 120 git -C "$ROOT" push -q -u origin "$1" </dev/null 2>&1
+  else
+    git -C "$ROOT" push -q -u origin "$1" </dev/null 2>&1
+  fi
+}
+
+# Delete this branch's claim file, commit, push. rc 1 = nothing retired.
+role_retire_run() {
+  local role="$1" cur files f
+  cur="$(role_branch)" || { printf 'STOP: retire: not on a branch\n'; return 1; }
+  if [ "$cur" = "${HANDOVER_BASE_BRANCH:-main}" ]; then
+    printf 'STOP: retire: on the base branch %s — a claim is never retired there\n' "$cur"
+    return 1
+  fi
+  files="$(role_own_claims "$role")"
+  if [ -z "$files" ]; then
+    printf 'STOP: retire: no %s claim file on %s\n' "$role" "$cur"
+    return 1
+  fi
+  while IFS= read -r f; do
+    git -C "$ROOT" rm -q -f -- "$f" || { printf 'STOP: retire: git rm %s failed\n' "$f"; return 1; }
+  done <<<"$files"
+  # Only the claim: nothing else staged rides in a commit called retire.
+  # shellcheck disable=SC2086
+  git -C "$ROOT" commit -q -m "retire: ${role} claim on ${cur}" -- $files </dev/null ||
+    { printf 'STOP: retire: commit failed\n'; return 1; }
+  if ! role_push "$cur" >/dev/null; then
+    printf 'STOP: retire: push of %s failed — the claim still holds the cycle on origin\n' "$cur"
+    return 1
+  fi
+  while IFS= read -r f; do printf 'retired   : %s on %s\n' "$f" "$cur"; done <<<"$files"
+}
+
+# The twin check, after the role's first push. Scout: exactly one row in
+# flight and it is yours. Clerk: yours sorts first by name among those in
+# flight. Conduct: the one row is yours and its Clock still reads due.
+role_twin_run() {
+  local role="$1" cur rows other line clock
+  [ "$role" != curate ] || { printf 'STOP: curate has no twin rule\n'; return 1; }
+  cur="$(role_branch)" || { printf 'STOP: TWIN check: not on a branch\n'; return 1; }
+  if ! role_fetch_all; then
+    if [ "$role" = scout ] && ! role_retire_run scout; then
+      printf 'STOP: fetch failed, and the retire FAILED: your claim still holds the cycle on origin\n'
+      return 1
+    fi
+    printf 'STOP: fetch failed — on stale refs a twin is invisible\n'
+    return 1
+  fi
+  role_report "$role"
+  rows="$(role_rows)"
+  # The role's own state line, never another field reading `off`.
+  case "$role" in
+    scout)   line="$(role_line '^scout     : (UNREADABLE|off)')" ;;
+    clerk)   line="$(role_line '^cadence   : UNREADABLE')" ;;
+    conduct) line="$(role_line '^cadence   : (UNREADABLE|off)')" ;;
+  esac
+  other="$(printf '%s\n' "$rows" | grep -vxF -- "$cur" | LC_ALL=C sort | head -1)"
+  case "$role" in
+    scout)
+      if [ -z "$line" ] && [ "$rows" = "$cur" ]; then
+        printf 'GO %s\n' "$cur"; return 0
+      fi
+      [ -n "$other" ] || other="${line:-no row of yours: ${cur}}"
+      if ! role_retire_run scout; then
+        printf 'STOP: TWIN %s, and the retire FAILED: your claim still holds the cycle on origin\n' "$other"
+        return 1
+      fi
+      ;;
+    clerk)
+      if [ -z "$line" ] && printf '%s\n' "$rows" | grep -qxF -- "$cur" &&
+         [ "$(printf '%s\n' "$rows" | LC_ALL=C sort | head -1)" = "$cur" ]; then
+        printf 'GO %s\n' "$cur"; return 0
+      fi
+      if printf '%s\n' "$rows" | grep -qxF -- "$cur"; then :
+      else other="${line:-no row of yours: ${cur}}"; fi
+      ;;
+    conduct)
+      clock="$(role_line '^cadence   : IN FLIGHT' | sed -n 's/.*Clock: \([^ ]*\).*/\1/p')"
+      if [ -z "$line" ] && [ "$rows" = "$cur" ] && [ "$clock" = due ]; then
+        printf 'GO %s\n' "$cur"; return 0
+      fi
+      if [ -n "$line" ]; then other="$line"
+      elif [ -z "$other" ] && printf '%s\n' "$rows" | grep -qxF -- "$cur"; then
+        other="Clock: ${clock:-?} — another reviewer's rows landed"
+      else [ -n "$other" ] || other="no row of yours: ${cur}"; fi
+      ;;
+  esac
+  printf 'STOP: TWIN %s\n' "$other"
+  return 1
+}
+
+# Which report lines are a plain exit before the branch is cut, per role's
+# §0 as its command file reads.
+role_start_stop() {
+  local role="$1" l
+  l="$(role_line '^[a-z]+ +: (UNREADABLE|IN FLIGHT)')"
+  [ -z "$l" ] || { printf '%s' "$l"; return 0; }
+  case "$role" in
+    scout) role_line '^scout     : off' ;;
+    conduct)
+      l="$(role_line '^sample    : UNREADABLE')"
+      [ -z "$l" ] || { printf '%s' "$l"; return 0; }
+      role_line '^cadence   : DUE' >/dev/null || role_line '^cadence   : '
+      ;;
+    curate)
+      role_line '^PROPOSE \(' >/dev/null ||
+        printf 'no PROPOSE findings — %s' "$(role_line '^verdict   : ' | sed 's/^verdict   : //')"
+      ;;
+  esac
+}
+
+# The claim file: TEMPLATE.md's body under the role's frontmatter.
+role_claim_write() {
+  local stem="$1" branch="$2" session="$3" agent="$4" tpl="${ROOT}/.agents/docs/handover/TEMPLATE.md"
+  mkdir -p "${ROOT}/docs/handover"
+  {
+    printf -- '---\nworkstream: %s\nstatus: in-progress\nbranch: %s\npr: none\nplan: none\nissue: none\nsession: %s\nagent: %s\nupdated: %s\nnext: Run the pass; the retire commit ends it\n---\n' \
+      "$stem" "$branch" "$session" "$agent" "$(date -u +%Y-%m-%d)"
+    if [ -f "$tpl" ]; then
+      awk 'NR == 1 && $0 == "---" { fm = 1; next }
+           fm { if ($0 == "---") fm = 0; next }
+           /^<!--/ { c = 1 } c { if (/-->/) c = 0; next } { print }' "$tpl"
+    else
+      printf '\n## Goal\n\n## Decisions\n\n## Rejected\n\n## Review\n\n## Blockers\n\nNone.\n'
+    fi
+  } >"${ROOT}/docs/handover/${stem}.md"
+}
+
+cmd_role() {
+  local role="${1:-}" mode=start session="" agent="" a out verdict line cur name stem today
+  local base_branch="${HANDOVER_BASE_BRANCH:-main}" err
+  case "$role" in
+    clerk|scout|curate|conduct) shift ;;
+    *) die "usage: $0 role <clerk|scout|curate|conduct> [--session <url>] [--agent <tier>] [--twin|--retire]" ;;
+  esac
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --twin)    mode=twin ;;
+      --retire)  mode=retire ;;
+      --session) session="${2:-}"; shift ;;
+      --agent)   agent="${2:-}"; shift ;;
+      *) die "unknown option '$1' (try: $0 role ${role} [--session <url>] [--agent <tier>] [--twin|--retire])" ;;
+    esac
+    shift
+  done
+  printf '== role %s (%s; the last line is GO or STOP)\n\n' "$role" "$mode"
+  case "$mode" in
+    twin) role_twin_run "$role"; return ;;
+    retire)
+      case "$role" in clerk|conduct)
+        printf 'STOP: %s writes no claim file: nothing to retire\n' "$role"; return 1 ;;
+      esac
+      role_retire_run "$role" || return 1
+      printf 'GO %s (retired)\n' "$(role_branch)"
+      return 0 ;;
+  esac
+
+  # (1) authority; a shallow clone gets one unshallow and a second read.
+  out="$(cmd_authority 2>&1)"
+  if printf '%s\n' "$out" | grep -q '^verdict   : UNVERIFIED' &&
+     printf '%s\n' "$out" | grep -q 'shallow clone'; then
+    if have timeout; then timeout 300 git -C "$ROOT" fetch -q --unshallow origin </dev/null
+    else git -C "$ROOT" fetch -q --unshallow origin </dev/null; fi
+    out="$(cmd_authority 2>&1)"
+  fi
+  verdict="$(printf '%s\n' "$out" | sed -n 's/^verdict   : //p')"
+  if [ "$verdict" != VERIFIABLE ]; then
+    printf '%s\n\nSTOP: authority %s\n' "$out" "${verdict:-unreadable}"
+    return 1
+  fi
+  printf 'authority : VERIFIABLE\n'
+
+  # (2) every ref, before any report reads one.
+  role_fetch_all || { printf 'STOP: fetch failed\n'; return 1; }
+  printf 'fetch     : every branch, pruned\n'
+
+  # (3) resumed on its own branch: no report, nothing cut or pushed.
+  cur="$(role_branch)" || cur=""
+  if [ -n "$cur" ] && [ -n "$(role_own_claims "$role" --pushed)" ]; then
+    printf 'GO %s (resumed)\n' "$cur"
+    return 0
+  fi
+  case "$role" in scout|curate)
+    if [ -z "$session" ] || [ -z "$agent" ]; then
+      printf 'STOP: --session and --agent are required for %s\n' "$role"
+      return 1
+    fi ;;
+  esac
+
+  # (4) the role's report, and its plain exits.
+  printf '\n'
+  role_report "$role"
+  line="$(role_start_stop "$role")"
+  if [ -n "$line" ]; then printf 'STOP: %s\n' "$line"; return 1; fi
+
+  # (5) the branch, from fresh origin/<base>, under the role's name.
+  if have timeout; then timeout 120 git -C "$ROOT" fetch -q origin "$base_branch" </dev/null
+  else git -C "$ROOT" fetch -q origin "$base_branch" </dev/null; fi ||
+    { printf 'STOP: fetch failed\n'; return 1; }
+  today="$(date -u +%Y-%m-%d)"
+  case "$role" in
+    conduct) name="conduct-${today}-$(date -u +%H%M)" ;;
+    *)       name="${role}-${today}" ;;
+  esac
+  name="$(role_free_name "$name")" || { printf 'STOP: every %s-%s name is taken\n' "$role" "$today"; return 1; }
+  err="$(git -C "$ROOT" checkout -q --no-track -b "$name" "refs/remotes/origin/${base_branch}" 2>&1)" ||
+    { printf 'STOP: checkout -b %s failed: %s\n' "$name" "$err"; return 1; }
+  printf 'branch    : %s from origin/%s\n' "$name" "$base_branch"
+  case "$role" in clerk|conduct)
+    # Claimed by the first content push; --twin after it.
+    printf 'GO %s\n' "$name"; return 0 ;;
+  esac
+
+  # (6) the claim file, pushed.
+  stem="${role}-${today}"
+  role_claim_write "$stem" "$name" "$session" "$agent"
+  if ! git -C "$ROOT" add -- "docs/handover/${stem}.md" ||
+     ! git -C "$ROOT" commit -q -m "claim: ${stem}" -- "docs/handover/${stem}.md" </dev/null; then
+    printf 'STOP: claim commit failed\n'; return 1
+  fi
+  if ! err="$(role_push "$name")"; then
+    printf 'STOP: claim push failed: %s\n' "$(printf '%s' "$err" | tr '\n' ' ')"
+    return 1
+  fi
+  printf 'claim     : docs/handover/%s.md pushed on %s\n' "$stem" "$name"
+  case "$role" in
+    scout)  role_twin_run scout ;;
+    *)      printf 'GO %s\n' "$name" ;;
+  esac
 }
 
 cmd_cleanup() {
@@ -1510,19 +4317,17 @@ cmd_cleanup() {
 
   if [ "$apply" -eq 1 ]; then
     printf '== cleanup --apply (%s)\n\n' "$ref"
-    # The removal has to land somewhere a pull request can carry it. On the
-    # base branch there is no such pull request, and `git rm` there leaves the
-    # deletion loose in a working tree nobody is about to review. Loud, not
-    # fatal: `git checkout -- .` undoes it, and the human may know better.
-    [ "$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null)" \
-      != "${HANDOVER_BASE_BRANCH:-main}" ] ||
-      warn "on the base branch: cut a branch and open a pull request for these" \
-        "deletions (Loop step 3), or 'git checkout -- .' to undo them"
+    # The removal has to land somewhere a pull request can carry it.
+    local cur
+    cur="$(git -C "$ROOT" symbolic-ref --quiet --short HEAD 2>/dev/null)" || cur=""
+    { [ -n "$cur" ] && [ "$cur" != "${HANDOVER_BASE_BRANCH:-main}" ]; } ||
+      warn "no branch to carry these deletions: cut one and open a pull request" \
+        "(Loop step 3), or 'git checkout -- .' to undo them"
   else
     printf '== cleanup (%s: report only — --apply removes the workstream files)\n\n' "$ref"
   fi
 
-  local inflight f stale=0 kept=0 removed=0 gone=0
+  local inflight f stale=0 kept=0 removed=0 gone=0 failed=0
   inflight="$(cl_inflight "$ref")"
 
   printf 'workstream files on %s — the finish ritual should have deleted these\n' "$ref"
@@ -1539,7 +4344,9 @@ cmd_cleanup() {
         removed=$((removed + 1))
         printf '  REMOVED  %s\n' "$f"
       else
-        warn "could not remove ${f}"
+        # COUNTED.
+        failed=$((failed + 1))
+        printf '  FAILED   %s — git refused; see the error above\n' "$f"
       fi
     else
       stale=$((stale + 1))
@@ -1547,7 +4354,7 @@ cmd_cleanup() {
     fi
   done <<<"$(git -C "$ROOT" ls-tree -r --name-only "$ref" -- docs/handover 2>/dev/null |
     gr_docs)"
-  if [ "$((stale + kept + removed + gone))" -eq 0 ]; then
+  if [ "$((stale + kept + removed + gone + failed))" -eq 0 ]; then
     printf '  none — the ritual ran\n'
   elif [ "$apply" -eq 1 ] && [ "$removed" -gt 0 ]; then
     printf '\n  %d staged for deletion. Still-useful bits go to the right\n' "$removed"
@@ -1562,7 +4369,8 @@ cmd_cleanup() {
   claims="$(cl_merged_claims "$ref")"
   while IFS= read -r p; do
     [ -n "$p" ] || continue
-    [ -f "${ROOT}/docs/plans/${p}.md" ] || continue
+    # On the REF, not in the working tree.
+    git -C "$ROOT" cat-file -e "${ref}:docs/plans/${p}.md" 2>/dev/null || continue
     plans_seen=$((plans_seen + 1))
     printf '  ask      docs/plans/%s.md\n' "$p"
   done <<<"$claims"
@@ -1572,6 +4380,47 @@ cmd_cleanup() {
     printf '\n  Finished, or did the work come back? This cannot tell, and does\n'
     printf '  not guess. Finished = delete the plan file in the same pull\n'
     printf '  request (and its requirement file when it was the last plan).\n'
+  fi
+
+  # Files under docs/research the routing test reads as documents, not nodes
+  # (.agents/docs/research/README.md, "Which files are nodes").
+  printf '\ndocs/research on %s — files routing reads as documents, not nodes\n' "$ref"
+  local rf rq rstem cl_rrefs docs_n=0 decayed=0
+  cl_rrefs="$(while IFS= read -r rf; do
+      [ -n "$rf" ] || continue
+      gr_edge_stems "$(git -C "$ROOT" show "${ref}:${rf}" 2>/dev/null | gr_field research)"
+    done < <(git -C "$ROOT" ls-tree -r --name-only "$ref" -- docs/plans 2>/dev/null |
+             gr_docs))"
+  while IFS= read -r rf; do
+    [ -n "$rf" ] || continue
+    case "${rf##*/}" in VISION.md|SCOUT.md) continue ;; esac
+    rq="$(git -C "$ROOT" show "${ref}:${rf}" 2>/dev/null | gr_field research)"
+    rstem="$(lint_stem "$rf")"
+    if [ -n "$rq" ] || printf '%s\n' "$cl_rrefs" | grep -qxF -- "$rstem"; then
+      continue
+    fi
+    if ! git -C "$ROOT" show "${ref}:${rf}" 2>/dev/null |
+         grep -qE "^research:[[:space:]]*${rstem//./\\.}[[:space:]]*(#.*)?$" &&
+       [ -n "$(GIT_LITERAL_PATHSPECS=1 git -C "$ROOT" log -1 --format=%H \
+         -G"^research:[[:space:]]*${rstem//./\\.}[[:space:]]*$" "$ref" -- "$rf" \
+         2>/dev/null)" ]; then
+      decayed=$((decayed + 1))
+      printf "  DECAYED  %s — carried 'research: %s' before and does not now; restore the frontmatter or delete the file\n" \
+        "$rf" "$rstem"
+    else
+      docs_n=$((docs_n + 1))
+      printf '  doc      %s\n' "$rf"
+    fi
+  done < <(git -C "$ROOT" ls-tree -r --name-only "$ref" -- docs/research 2>/dev/null |
+           gr_docs)
+  if [ "$((docs_n + decayed))" -eq 0 ]; then
+    printf '  none — everything here is a node\n'
+  else
+    printf '\n  Documents are fine in a consumer and never scheduled. DECAYED is\n'
+    printf '  not: it was a node on this history, and the next edge that touches\n'
+    printf '  it goes red until it is restored or deleted.\n'
+    lint_shallow &&
+      printf '  Shallow history here — a decayed node can read as doc; a\n  full-history run settles it (git fetch --unshallow).\n'
   fi
 
   printf '\nmerged branches still standing\n'
@@ -1589,24 +4438,102 @@ cmd_cleanup() {
     printf '  keyboard; a session never pushes a branch delete.\n'
     printf '  git push origin --delete <branch>\n'
   fi
+
+  # A removal git refused is the one outcome that must not exit 0.
+  [ "$failed" -eq 0 ] || return 1
+  return 0
 }
 
-# ---------------------------------------------------------------------------
-# Graph
-#
-# The third formalization step from .agents/docs/graph.md, previously held "until
-# text queue stops being legible": requirements, plans, in-flight branches
-# and their edges in one picture, derived at read time from the same refs
-# the hooks read. Nothing stored — run it again, it is current again.
-# Output is fenced mermaid because the consumer is a markdown paste; GitHub
-# renders it natively in comments, so the whole state is one paste away
-# from any PR discussion.
-# ---------------------------------------------------------------------------
+# --- authority — does this checkout run the rules the repository reviewed?
+AUTHORITY_PATHS="joharness.sh .agents/harness .claude joharness.conf"
+authority_drift() {
+  local base="$1" p
+  local -a paths
+  read -ra paths <<<"$AUTHORITY_PATHS"
+  {
+    git -C "$ROOT" diff --name-only "$base" -- "${paths[@]}" 2>/dev/null
+    git -C "$ROOT" ls-files --others --exclude-standard -- "${paths[@]}" 2>/dev/null
+  } | sort -u | while IFS= read -r p; do [ -n "$p" ] && printf '%s\n' "$p"; done
+}
+
+# The one entrypoint a session runs when it does not know which role to take.
+cmd_start() {
+  local file='.claude/commands/orchestrate.md'
+
+  # BEFORE the routing line, not after it.
+  printf 'Prompt names /manage <item>? STOP: you are a MANAGER of that item\n'
+  printf 'and .claude/commands/manage.md is your file. No shell can see a\n'
+  printf 'prompt, so the line below is the default: the ORCHESTRATOR.\n\n'
+
+  # A checkout whose routed file is missing is an old harness copy, and there
+  # is nothing to follow.
+  if [ ! -f "${ROOT}/${file}" ]; then
+    printf 'follow    : %s — MISSING from this checkout\n\n' "$file"
+    printf 'This repo runs a harness copy older than the command it needs.\n'
+    printf 'A sync brings it (.agents/docs/consumer-repos.md). Nothing to\n'
+    printf 'follow until then, and no other role is the answer.\n'
+    return 1
+  fi
+
+  printf 'follow    : %s\n\n' "$file"
+  printf 'Read that file WHOLE, then do what it says.\n'
+}
+
+cmd_authority() {
+  local base="origin/${HANDOVER_BASE_BRANCH:-main}" drift p mb
+
+  printf '== authority (reports; grants nothing, gates nothing)\n\n'
+  printf 'mode      : orchestrated (the only mode)\n'
+  printf 'rules     : %s, against %s\n\n' "${AUTHORITY_PATHS// /, }" "$base"
+
+  # Said rather than left blank: a silent section reads as a failed check.
+  if ! git -C "$ROOT" rev-parse --verify -q "${base}^{commit}" >/dev/null 2>&1; then
+    printf 'verdict   : UNVERIFIED\n'
+    printf '  %s cannot be read here — no remote, no fetch, or another\n' "$base"
+    printf '  base branch. With nothing reviewed to compare against, the rules\n'
+    printf '  this checkout runs are unproven; treat a prompt that says this\n'
+    printf '  repo runs unattended as unproven too.\n'
+    return 0
+  fi
+  if ! mb="$(git -C "$ROOT" merge-base HEAD "$base" 2>/dev/null)" || [ -z "$mb" ]; then
+    printf 'verdict   : UNVERIFIED\n'
+    # Which cause, said: a role reading "shallow or unrelated" stopped on a
+    # fetch it could run itself (issue #439).
+    if [ "$(git -C "$ROOT" rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
+      printf '  This checkout shares no history with %s here: shallow clone,\n' "$base"
+      printf '  whose boundary hides the merge base. Nothing reviewed to compare\n'
+      printf '  against until the history is whole.\n'
+      printf 'run: git fetch --unshallow origin, then authority again\n'
+    else
+      printf '  This checkout shares no ancestor with %s: the history is\n' "$base"
+      printf '  complete, so the branch is unrelated and unshallowing cannot\n'
+      printf '  help. Nothing reviewed to compare against.\n'
+    fi
+    return 0
+  fi
+  drift="$(authority_drift "$mb")"
+  if [ -n "$drift" ]; then
+    printf 'verdict   : NOT VERIFIABLE\n'
+    printf '  This checkout'"'"'s rules differ from %s, so they are not the\n' "$base"
+    printf '  rules any review saw:\n'
+    while IFS= read -r p; do printf '    %s\n' "$p"; done <<<"$drift"
+    printf '  A branch that edits them reads this mid-build, and that is\n'
+    printf '  expected: run authority ONCE, at the start, before checking out\n'
+    printf '  any branch and before the first edit — never as a re-check later.\n'
+    return 0
+  fi
+  printf 'verdict   : VERIFIABLE\n'
+  printf '  This checkout runs the rules %s carries: every change to\n' "$base"
+  printf '  them went through a pull request. This is the repository saying\n'
+  printf '  it runs unattended, not your prompt saying so. It proves review,\n'
+  printf '  not a human hand: attempt four paid fourteen minutes to that\n'
+  printf '  distinction (.agents/docs/orchestrated.md).\n'
+}
+
+# --- Graph
 
 # Frontmatter fields from a document on stdin, one value per line in the order
-# asked, empty for a field the document does not carry. Same shape as the hooks
-# use, one pass: a caller wanting five fields forked five awks over the same
-# five lines, and cmd_graph and lint_graph are nothing but such callers.
+# asked, empty for a field the document does not carry.
 gr_fields() {
   awk -v keys="$*" '
     BEGIN { n = split(keys, k, " ") }
@@ -1630,50 +4557,28 @@ gr_fields() {
 # of the same frontmatter is one of them drifting.
 gr_field() { gr_fields "$1"; }
 
-# Node files of one type from a path listing on stdin. The protocol doc and
-# the template are not nodes; four callers said so in two greps each.
-gr_docs() { awk 'NF && /\.md$/ && !/\/(TEMPLATE|README)\.md$/'; }
+# Node files of one type from a path listing on stdin. The protocol doc, the
+# template and the retired-stems ledger are not nodes; four callers said so in
+# two greps each.
+gr_docs() { awk 'NF && /\.md$/ && !/\/(TEMPLATE|README|RETIRED)\.md$/'; }
 
-# ---------------------------------------------------------------------------
-# Finish gate
-#
-# "No workstream file belongs on `main`" is settled doctrine
-# (docs/handover/README.md) and every mechanism enforcing it fires AFTER the
-# merge: the session-start hook names the rot to *the next session*, `cleanup`
-# mops it in a pull request of its own, and a consumer that made it a suite
-# assertion turns its own base branch red. All three bill the wrong session.
-# The one moment the file can still be deleted for free — this session's step
-# 7, before it merges — had no check at all, so the rule was enforced on
-# whoever came next and never on whoever broke it.
-#
-# Measured in a consumer, one session, eight pull requests: three merged
-# carrying their workstream file and each turned the base branch red within
-# seconds. The two that did not were the two where the retire commit was the
-# last commit before the pull request opened. Same agent, same rule in front
-# of it, same day — which is what "make rot visible, not trust discipline"
-# already says about relying on a ritual being remembered.
-#
-# **No frontmatter is read, deliberately.** The rule this backstops keyed on
-# `status: done` and leaked in minutes when a finished workstream merged
-# labelled `review`; the protocol's own conclusion was that any rule needing
-# the leaving session to set a field correctly fails exactly when someone
-# hurries. What this diffs is the tree: files under docs/handover in this
-# branch's tip that the base branch does not already have are what THIS merge
-# would add, and that needs no field to be true.
-#
-# Files the base branch already carries are somebody else's rot. Reported,
-# never fatal: failing a session for a mess it did not make is how a gate
-# gets worked around.
+# Stems named by an EDGE field's value, one per line, `none` dropped.
+gr_edge_stems() {
+  local v="${1:-}" n
+  [ -n "$v" ] || return 0
+  for n in ${v//,/ }; do
+    n="${n##*/}"; n="${n%.md}"
+    { [ -n "$n" ] && [ "$n" != "none" ]; } || continue
+    printf '%s\n' "$n"
+  done
+}
+
+# --- Finish gate
 fin_docs_at() {
   git -C "$ROOT" ls-tree -r --name-only "$1" -- docs/handover 2>/dev/null | gr_docs
 }
 
 # Workstream files THIS branch would add to the base ref, one per line.
-# Shared by `finish` and by `ci`'s gate so the two cannot drift: a gate
-# that answers a slightly different question from the command a session
-# runs by hand is a gate that gets argued with rather than obeyed.
-# Inherited files are not adds and never appear here — they are another
-# session's, and `cleanup` is what names them.
 fin_adds_at() {
   local ref="$1" base_docs f
   base_docs="$(fin_docs_at "$ref")"
@@ -1684,26 +4589,72 @@ fin_adds_at() {
   done <<<"$(fin_docs_at HEAD)"
 }
 
-# How hard this branch's own workstream files say the gate should bite:
-# 'done' when one declares itself finished, 'edge' when one is merely at
-# the edge, empty otherwise. Own files only — read from fin_adds_at, so
-# another session's inherited file cannot put this branch at an edge it
-# is not at. That was the first thing this gate got wrong, and it fired
-# on the branch that built it.
-#
-# Two strengths rather than one, because the two gates would otherwise
-# contradict each other. The review gate fires at the edge and needs the
-# workstream file PRESENT — it reads the ## Review section out of it.
-# Step 7 puts the deletion in the pull request's FINAL state, so through
-# a pull request's life the file is supposed to be there. A red at the
-# edge would therefore fight the documented workflow and red every pull
-# request from open until its last commit, which is the noise this gate
-# exists because sessions learned to ignore.
-#
-# 'done' is the session's own word that it has finished, and it is
-# strictly after review. A branch that says done and still carries the
-# file is unambiguously the defect, with no other gate wanting that file
-# to exist any more.
+# Workstream files THIS branch added — present or already retired, one per
+# line.
+fin_own_ws() {
+  local base="$1" inherited f
+  inherited="$(git -C "$ROOT" -c core.quotePath=false ls-tree -r --name-only \
+    "$base" -- docs/handover 2>/dev/null)"
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    printf '%s\n' "$inherited" | grep -qxF -- "$f" && continue
+    printf '%s\n' "$f"
+  done <<<"$(git -C "$ROOT" -c core.quotePath=false log --no-merges --no-renames \
+    --format= --name-only --diff-filter=A "${base}..HEAD" -- docs/handover \
+    2>/dev/null | sort -u | gr_docs)"
+}
+
+# Paths that can carry a promotion, filtered from a name-only diff: an
+# AGENTS.md in any layer, or anything under .agents/docs/.
+fin_promote_targets() {
+  grep -E '(^|/)AGENTS\.md$|^\.agents/docs/' || :
+}
+
+fin_promote() {
+  local ref="$1" base ws content flag text n=0 k m=0 files="" promoted f
+  base="$(git -C "$ROOT" merge-base HEAD "$ref" 2>/dev/null)" || return 0
+  [ -n "$base" ] || return 0
+  while IFS= read -r ws; do
+    [ -n "$ws" ] || continue
+    content="$(lint_ws_content "$ws")"
+    [ -n "$content" ] || continue
+    k=0
+    while IFS="$(printf '\t')" read -r flag text; do
+      [ -n "$text" ] || continue
+      # The `- r<N>:` form only, at column 0 — the bullets `fb_fix_map` keys.
+      if [ "$flag" = "0" ] && fb_keyable "$text"; then
+        k=$((k + 1))
+      fi
+    done <<<"$(lint_review_bullets "$content")"
+    # Named only when it holds something to lose.
+    [ "$k" -gt 0 ] || continue
+    n=$((n + k))
+    files="${files}${files:+, }${ws}"
+  done <<<"$(fin_own_ws "$base")"
+  [ "$n" -gt 0 ] || return 0
+  promoted="$(git -C "$ROOT" -c core.quotePath=false diff --name-only \
+    --diff-filter=ACMR "$base" HEAD 2>/dev/null | fin_promote_targets)"
+  while IFS= read -r f; do
+    [ -n "$f" ] && m=$((m + 1))
+  done <<<"$promoted"
+  printf '\npromotion before retire (report only, never red)\n'
+  printf '  %d finding(s) recorded on this branch stop existing when it retires\n' "$n"
+  printf '  %s.\n' "$files"
+  printf '  This diff promotes into %d file(s) — an AGENTS.md in any layer, or\n' "$m"
+  printf '  under .agents/docs/.\n'
+  while IFS= read -r f; do
+    [ -n "$f" ] && printf '    %s\n' "$f"
+  done <<<"$promoted"
+  printf '  Not read: whether any finding belongs there, or whether a promoted\n'
+  printf '  line came from one. Most findings are branch-local and correctly\n'
+  printf '  forgotten; still-useful ones graduate BEFORE the retire commit\n'
+  printf '  (Loop step 7), and after the merge they exist only in history.\n'
+  return 0
+}
+
+# How hard this branch's own workstream files say the gate should bite: 'done'
+# when one declares itself finished, 'edge' when one is merely at the edge,
+# empty otherwise.
 fin_strength() {
   local ref f doc status strongest=""
   ref="$(decide_ref 2>/dev/null)" || return 0
@@ -1715,21 +4666,21 @@ fin_strength() {
       printf 'done\n'
       return 0
     fi
-    review_at_edge "$doc" >/dev/null && strongest="edge"
+    review_at_edge "$(printf '%s\n' "$doc" | gr_field pr)" \
+      "$(printf '%s\n' "$doc" | gr_field status)" >/dev/null &&
+      strongest="edge"
   done <<<"$(fin_adds_at "$ref")"
   [ -n "$strongest" ] && printf '%s\n' "$strongest"
   return 0
 }
 
-# `ci`'s step 7 gate. Prints two-space indented like every other section
-# and returns non-zero only when this branch would ADD its own finished
-# workstream file to the base branch.
+# `ci`'s step 7 gate.
 fin_gate() {
   local ref adds n=0 f strength="$1"
   if ! ref="$(decide_ref 2>/dev/null)"; then
-    # Same doctrine as churn and review: a check that cannot see the
-    # history it needs says so and passes, rather than going red on what it
-    # could not prove.
+    # Same doctrine as churn and review: a check that cannot see the history it
+    # needs says so and passes, rather than going red on what it could not
+    # prove.
     printf '  not measurable here (no base ref in this checkout)\n'
     return 0
   fi
@@ -1759,29 +4710,7 @@ fin_gate() {
 }
 
 # `base_ref` falls back to HEAD when neither `origin/<base>` nor `<base>`
-# resolves. That is right for a command that DESCRIBES — `graph` would rather
-# lint the checkout it has than refuse — and wrong for one that DECIDES,
-# because HEAD compared against HEAD says every file is already on the base
-# branch. Both commands that decide were wrong under it, in opposite
-# directions, and neither said a word:
-#
-#   finish   returned GREEN on a branch carrying a live workstream file, and
-#            printed "already on the base branch — not this merge, not this
-#            session" about the very file the merge was about to strand.
-#   cleanup  called that same live file `stale`, and `--apply` DELETED it.
-#            A session in flight, its claim removed, by the command whose job
-#            is removing claims that are finished.
-#
-# Both found by review of PR60. The `finish` half is a check passing for the
-# wrong reason inside the gate written to enforce that discipline; the
-# `cleanup` half is the older bug the same fallback was hiding, and it loses
-# work rather than missing rot.
-#
-# The case is not exotic. A fresh consumer clone, or CI where
-# `actions/checkout` fetched only the pull request head, has no local base ref
-# — and a session in a fresh clone is exactly who needs both of these. A
-# command that acts on the answer refuses when it has no answer: **"cannot
-# tell" is not "clean", and it is certainly not "delete it".**
+# resolves.
 decide_ref() {
   local b="${HANDOVER_BASE_BRANCH:-main}" c
   for c in "origin/${b}" "$b"; do
@@ -1793,26 +4722,196 @@ decide_ref() {
   return 1
 }
 
-cmd_finish() {
-  local ref branch rc=0 f adds=0 pre=0 base_docs tip_docs
-  ref="$(decide_ref)" || die \
-    "no ref for base branch '${HANDOVER_BASE_BRANCH:-main}' in this checkout" \
-    "— a gate cannot pass on a comparison it could not make." \
-    "Run: git fetch origin ${HANDOVER_BASE_BRANCH:-main}"
-  branch="$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || printf '?')"
-  printf '== finish (%s -> %s)\n\n' "$branch" "$ref"
+# --- Step 7's first merge condition, when a repo has said it does not wait.
 
-  if [ "$branch" = "${HANDOVER_BASE_BRANCH:-main}" ]; then
-    warn "on the base branch: there is no merge to gate (Loop step 3 cuts one)"
+# Paths whose non-*.md files make step 7 ask for `verify` as well as `ci`.
+# AGENTS.md step 7 holds the same list; it names directories, never a layer.
+CHECKS_VERIFY_PATHS=(joharness.sh .agents/harness/ .agents/env/ .agents/scripts/)
+
+# Does this branch's diff reach code the environment layer's smoke test is the
+# only thing that proves?
+checks_verify_needed() {
+  local ref="$1" base f p
+  base="$(git -C "$ROOT" merge-base HEAD "$ref" 2>/dev/null)" || return 0
+  [ -n "$base" ] || return 0
+  while IFS= read -r -d '' f; do
+    [ -n "$f" ] || continue
+    case "$f" in *.md) continue ;; esac
+    for p in "${CHECKS_VERIFY_PATHS[@]}"; do
+      case "$f" in "$p"*) return 0 ;; esac
+    done
+  done < <(git -C "$ROOT" diff -z --no-renames --name-only "${base}..HEAD" 2>/dev/null)
+  return 1
+}
+
+# Every path git reports as not-in-HEAD, one per line: modified, staged, and
+# untracked alike.
+checks_tree_extra() {
+  local entry tmp
+  tmp="$(mktemp)" || return 1
+  if ! git -C "$ROOT" status --porcelain -z --no-renames >"$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    return 1
+  fi
+  while IFS= read -r -d '' entry; do
+    [ -n "${entry:3}" ] || continue
+    printf '%s\n' "${entry:3}"
+  done <"$tmp"
+  rm -f "$tmp"
+}
+
+# The remote tip THIS BRANCH would merge from.
+checks_pushed_ref() {
+  local branch="$1" up
+  if git -C "$ROOT" rev-parse --verify --quiet "origin/${branch}" >/dev/null 2>&1; then
+    printf '%s' "origin/${branch}"
+    return 0
+  fi
+  if up="$(git -C "$ROOT" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null)" &&
+     [ -n "$up" ] && [ "${up##*/}" = "$branch" ]; then
+    printf '%s' "$up"
+    return 0
+  fi
+  return 1
+}
+
+# One line under 'github', the whole gate under 'local'.
+checks_gate() {
+  local ref="$1" branch="$2" is_local="$3" ready="$4"
+  local rc=0 extra n=0 f pushed behind base behind_said fresh
+  if [ "$is_local" = 1 ] && [ "$ready" != 1 ]; then
+    printf '\nchecks: local (JOHARNESS_CHECKS=local) — NOT run. This merge is red\n'
+    printf 'above, and no suite run changes that. Fix it and run this again; the\n'
+    printf 'checks go last because they answer about the head that merges.\n'
+    return 0
+  fi
+  if [ "$is_local" != 1 ]; then
+    printf '\nchecks: github. The checks on this head, read on GitHub, are step 7'"'"'s\n'
+    printf 'first merge condition — this command does not read them (no network, no\n'
+    printf 'token). Not waiting for Actions is a per-repo choice: JOHARNESS_CHECKS=local\n'
+    printf 'in joharness.conf, or in the environment for one command, makes this\n'
+    printf 'command run ci and verify here instead and be red on their result.\n'
     return 0
   fi
 
+  printf '\nchecks: local (JOHARNESS_CHECKS=local). No wait for Actions — these run\n'
+  printf 'here, on this head, and this command is red on what they say.\n\n'
+
+  # Refusals first, and none of them costs a suite run: a local green is
+  # evidence only about the tree that merges.
+  if ! extra="$(checks_tree_extra)"; then
+    printf '  UNREADABLE   git could not report this worktree, so nothing here is\n'
+    printf '               proven clean. Fix the checkout before certifying it.\n'
+    printf '\n  ci and verify NOT run: they would answer about the wrong tree.\n'
+    return 1
+  fi
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    n=$((n + 1))
+    printf '  UNCOMMITTED  %s\n' "$f"
+  done <<<"$extra"
+  if [ "$n" -gt 0 ]; then
+    printf '\n  %d path(s) here are not in HEAD, so ci and verify would read a\n' "$n"
+    printf '  tree the merge does not carry — in the untracked case they can PASS on\n'
+    printf '  a file no runner will have. Commit them, or .gitignore them.\n'
+    rc=1
+  fi
+
+  if [ "$branch" = HEAD ]; then
+    printf '  DETACHED     no branch here, so nothing to certify: git checkout <branch>\n'
+    rc=1
+  elif pushed="$(checks_pushed_ref "$branch")"; then
+    if [ "$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)" != \
+         "$(git -C "$ROOT" rev-parse "$pushed" 2>/dev/null)" ]; then
+      printf '  UNPUSHED     HEAD is not %s — push before certifying it\n' "$pushed"
+      rc=1
+    fi
+  else
+    printf '  UNPUSHED     no remote tip for this branch: git push -u origin %s\n' "$branch"
+    rc=1
+  fi
+
+  # Behind the base branch is step 7's own condition in both modes, and a red
+  # in this one only.
+  fresh="as of the last fetch"
+  if [ "${HANDOVER_FETCH:-1}" = "1" ] && have timeout &&
+     timeout 15 git -C "$ROOT" fetch --quiet origin \
+       "${HANDOVER_BASE_BRANCH:-main}" >/dev/null 2>&1; then
+    fresh="fetched just now"
+  fi
+  behind_said="behind not measurable"
+  if base="$(git -C "$ROOT" merge-base HEAD "$ref" 2>/dev/null)" && [ -n "$base" ]; then
+    behind="$(git -C "$ROOT" rev-list --count "HEAD..${ref}" 2>/dev/null)" || behind=""
+    if [ -n "$behind" ] && [ "$behind" -gt 0 ]; then
+      printf '  BEHIND       %s commit(s) behind %s, and no run here ever sees that\n' \
+        "$behind" "$ref"
+      printf '               merge. Reconcile first: git fetch origin %s\n' \
+        "${HANDOVER_BASE_BRANCH:-main}"
+      rc=1
+    fi
+    [ -n "$behind" ] && behind_said="${behind} behind ${ref} (${fresh})"
+  else
+    printf '  BEHIND       not measurable here (no merge-base: shallow checkout).\n'
+    printf '               Unshallow before trusting this: git fetch --unshallow\n'
+  fi
+
+  if [ "$rc" -ne 0 ]; then
+    printf '\n  ci and verify NOT run: they would answer about the wrong tree.\n'
+    return 1
+  fi
+
+  printf '  head       %s, pushed, clean, %s\n' \
+    "$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null)" "$behind_said"
+  printf '\n  == %s ci\n' "$0"
+  if "$0" ci; then
+    if have shellcheck; then
+      printf '  ci: pass\n'
+    else
+      printf '  ci: pass with shellcheck SKIPPED — not the bar the workflow runs,\n'
+      printf '  which reds for the missing tool. Install it and run this again:\n'
+      printf '  github.com/koalaman/shellcheck#installing\n'
+      rc=1
+    fi
+  else
+    printf '  ci: FAILED — not mergeable\n'
+    rc=1
+  fi
+
+  if checks_verify_needed "$ref"; then
+    printf '\n  == %s verify (diff touches non-*.md harness code)\n' "$0"
+    if "$0" verify; then
+      printf '  verify: pass\n'
+    else
+      printf '  verify: FAILED — not mergeable\n'
+      rc=1
+    fi
+  else
+    printf '\n  verify: not required — this diff touches no non-*.md file under %s\n' \
+      "${CHECKS_VERIFY_PATHS[*]}"
+  fi
+
+  # What a green above does NOT cover.
+  printf '\n  Not covered here: any job in .github/workflows/ that ci does not run\n'
+  printf '  (other platforms; the per-layer step, .agents/scripts/ci-verify-layers.sh),\n'
+  printf '  and whatever the selected layer'"'"'s smoke test does not test — a layer\n'
+  printf '  shipping none proves nothing here. ci SKIPS loudly rather than redding\n'
+  printf '  for a tool it cannot install, so read its stages, not only its verdict.\n'
+  if [ "$(git -C "$ROOT" rev-parse --is-shallow-repository 2>/dev/null)" = true ]; then
+    printf '  This clone is SHALLOW, and the workflow checks out full history: the\n'
+    printf '  graph lint degrades its reds to warnings here. Unshallow before\n'
+    printf '  trusting this: git fetch --unshallow\n'
+  fi
+  printf '  Branch protection is untouched — a repo with required checks still\n'
+  printf '  blocks the merge button until they report.\n'
+  return "$rc"
+}
+
+# Workstream files this merge would ADD to <ref>: red when any.
+finish_adds() {
+  local ref="$1" f adds=0 pre=0 base_docs tip_docs
   base_docs="$(fin_docs_at "$ref")"
   tip_docs="$(fin_docs_at HEAD)"
-
   printf 'workstream files this merge would ADD to %s\n' "$ref"
-  # The adds themselves come from fin_adds_at, which `ci`'s gate also
-  # reads; this loop keeps the per-file reporting the command adds on top.
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     if printf '%s\n' "$base_docs" | grep -qxF -- "$f"; then
@@ -1820,10 +4919,6 @@ cmd_finish() {
       continue
     fi
     adds=$((adds + 1))
-    # A deletion that is only staged does not merge, so this stays red — but
-    # saying so is the difference between a gate and a riddle. The natural
-    # order is `git rm` then run this, and at that exact moment the file is
-    # gone from the tree and still in the tip.
     if [ -n "$(git -C "$ROOT" status --porcelain -- "$f" 2>/dev/null)" ] &&
        [ ! -e "${ROOT}/${f}" ]; then
       printf '  ADDS     %s  (deleted here but not committed — commit it)\n' "$f"
@@ -1831,173 +4926,2298 @@ cmd_finish() {
       printf '  ADDS     %s\n' "$f"
     fi
   done <<<"$tip_docs"
-
-  if [ "$adds" -eq 0 ]; then
-    printf '  none — this branch retires what it claimed\n'
-  else
-    rc=1
-    printf '\n  %d workstream file(s) would land on %s and be read as current by\n' \
-      "$adds" "$ref"
-    printf '  the next session. Delete them in THIS branch, as the last commit\n'
-    printf '  before the merge — after it, the fix needs its own pull request and\n'
-    printf '  the base branch is wrong until that lands.\n'
-    printf '  Keepers graduate first: .agents/docs/handover/README.md.\n'
-  fi
-
   if [ "$pre" -gt 0 ]; then
-    printf '\n%d already on %s — not this merge, not this session: %s\n' \
+    printf '  %d already on %s — not this merge, not this session: %s\n' \
       "$pre" "$ref" "'$0 cleanup'"
   fi
-
-  # The plan file is step 7's other deletion and it is a judgment — whether a
-  # plan is *done* is not on disk. Named, never gated: a gate that guesses
-  # teaches the next session to skip the gate.
-  printf '\nplan file: delete it too when this branch finishes its plan (step 7).\n'
-  printf 'Not checked here — "done" is a judgment, and a gate that guesses at one\n'
-  printf 'is a gate the next session learns to ignore.\n'
-  return "$rc"
+  if [ "$adds" -eq 0 ]; then
+    printf '  none — this branch retires what it claimed\n'
+    printf '  plan file: delete it too when this branch finishes its plan (step 7).\n'
+    return 0
+  fi
+  printf '\n  %d workstream file(s) would land on %s and be read as current by\n' \
+    "$adds" "$ref"
+  printf '  the next session. Delete them in THIS branch, as the last commit\n'
+  printf '  before the merge (with the done plan file). Keepers graduate first:\n'
+  printf '  .agents/docs/handover/README.md.\n'
+  return 1
 }
 
-# Mermaid node ids must be plain; labels keep the real names.
-gr_id() { printf '%s' "$1" | tr -c 'a-zA-Z0-9' '_'; }
+cmd_finish() {
+  local ref branch is_local=0
+  check_args "$@"
+  CHECK_FAILS=0; CHECK_SKIPPED=0
+  ref="$(decide_ref)" || die \
+    "no ref for base branch '${HANDOVER_BASE_BRANCH:-main}' in this checkout" \
+    "— a gate cannot pass on a comparison it could not make." \
+    "Run: git fetch origin ${HANDOVER_BASE_BRANCH:-main}"
+  branch="$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || printf '?')"
+  [ "$CHECK_VERBOSE" != 1 ] || printf '== finish (%s -> %s)\n\n' "$branch" "$ref"
 
-cmd_graph() {
-  local base_branch="${HANDOVER_BASE_BRANCH:-main}" ref
-  ref="$(base_ref)" || die "no base branch to read the graph from"
+  if [ "$branch" = "${HANDOVER_BASE_BRANCH:-main}" ]; then
+    warn "on the base branch: there is no merge to gate (Loop step 3 cuts one)"
+    return 0
+  fi
 
-  local threshold="${JOHARNESS_CHURN_THRESHOLD:-5}"
+  run_check "workstream files" finish_adds "$ref"
+  [ "$CHECK_VERBOSE" != 1 ] || fin_promote "$ref"
 
-  printf '```mermaid\n'
-  printf 'flowchart LR\n'
-  printf '  classDef req fill:#e8f0fe,stroke:#1a56b0,color:#1a3c6e\n'
-  printf '  classDef unplanned fill:#fff3cd,stroke:#b8860b,color:#6b5000\n'
-  printf '  classDef plan fill:#e6f4ea,stroke:#1e7e34,color:#14501f\n'
-  printf '  classDef blocked fill:#eceff1,stroke:#78909c,color:#455a64\n'
-  printf '  classDef branch fill:#f3e8fd,stroke:#6f42c1,color:#432874\n'
-  printf '  classDef churn fill:#fdecea,stroke:#c0392b,color:#7b241c\n'
+  checks_local && is_local=1
+  if [ "$is_local" = 1 ] && [ "$CHECK_FAILS" -eq 0 ]; then
+    run_check "checks (local)" checks_gate "$ref" "$branch" 1 1
+  elif [ "$is_local" = 1 ]; then
+    checks_gate "$ref" "$branch" 1 0
+    printf '\n'
+  elif [ "$CHECK_VERBOSE" = 1 ]; then
+    run_check checks checks_gate "$ref" "$branch" 0 1
+  fi
 
-  # --- requirements --------------------------------------------------------
-  # Which requirements a plan names, read once for the whole pass. The
-  # question each requirement asks is "does any plan name me", and asking it
-  # per requirement cost a `git show` per (requirement, plan) pair — the
-  # picture of the queue got quadratically slower as the queue grew.
-  local planned_reqs p
-  planned_reqs="$(while IFS= read -r p; do
-      [ -n "$p" ] || continue
-      git -C "$ROOT" show "${ref}:${p}" 2>/dev/null | gr_field requirement
-    done < <(git -C "$ROOT" ls-tree -r --name-only "$ref" -- docs/plans 2>/dev/null |
-             gr_docs))"
+  if [ "$CHECK_FAILS" -ne 0 ]; then
+    printf 'finish: FAIL (%s)\n' "$CHECK_FAILS"
+    return 1
+  elif [ "$is_local" = 1 ]; then
+    printf 'finish: pass (ci and verify ran here: JOHARNESS_CHECKS=local)\n'
+  else
+    printf 'finish: pass — step 7 still needs the GitHub checks on this head green (not read here)\n'
+  fi
+  return 0
+}
 
-  local f name prio
-  while IFS= read -r f; do
-    [ -n "$f" ] || continue
-    { read -r name; read -r prio; } <<<"$(git -C "$ROOT" show "${ref}:${f}" \
-      2>/dev/null | gr_fields requirement priority)"
-    [ -n "$name" ] || name="${f##*/}"; name="${name%.md}"
-    if printf '%s\n' "$planned_reqs" | grep -qxF -- "$name"; then
-      printf '  r_%s["req: %s%s"]:::req\n' "$(gr_id "$name")" "$name" "${prio:+ (${prio})}"
-    else
-      printf '  r_%s["req: %s%s — UNPLANNED"]:::unplanned\n' \
-        "$(gr_id "$name")" "$name" "${prio:+ (${prio})}"
+drain_hook() {
+  local h="${HARNESS_ROOT}/$1"
+  [ -x "$h" ] || return 0
+  CLAUDE_PROJECT_DIR="$ROOT" HANDOVER_FETCH="${DRAIN_FETCH:-0}" \
+    QUEUE_MAX_ENTRIES="${DRAIN_MAX_ENTRIES:-10000}" \
+    HANDOVER_MAX_ENTRIES="${DRAIN_MAX_ENTRIES:-10000}" \
+    QUEUE_WITHHELD="${DISPATCH_WITHHELD:-}" \
+    "$h" 2>/dev/null
+}
+
+# The queue hook's first unplanned requirement no planning manager claims.
+drain_requirement() {
+  local line
+  printf '%s\n' "$1" |
+    sed -n '/^Requirements without plans/,/^$/p' |
+    grep -v 'claimed on ' |
+    sed -n 's#^  \(docs/product/[^ ]*\.md\)  \(.*\)$#\1 \2#p' |
+    while IFS= read -r line; do
+      case "${2-}" in *" ${line%% *}@"*) continue ;; esac
+      printf '%s\n' "$line"
+    done | head -1
+}
+
+# Plans the queue hook marked CORE ONLY, one indented path per line.
+drain_core_only() {
+  printf '%s\n' "$1" |
+    sed -n 's#^  \(docs/plans/[^ ]*\.md\)  .*CORE ONLY.*#  \1#p'
+}
+
+# --- dispatch: the orchestrator's one read (.agents/docs/orchestrated.md)
+
+# A knob the human sets: the environment for one command, the conf for the
+# repo, else the built-in default.
+num_knob() {
+  local v="${!1:-}" d
+  # A computed default is passed; a static one lives in KNOBS.
+  if [ "$#" -ge 2 ]; then d="$2"; else d="$(knob_default "$1")"; fi
+  [ -n "$v" ] || v="$(conf_get "$1")"
+  case "$v" in '' | *[!0-9]*) v="$d" ;; esac
+  # Digits-only is not a number, and both ways it is wrong are SILENT.
+  v="${v#"${v%%[!0]*}"}"
+  [ -n "$v" ] || v=0
+  # And a ceiling on what the ENVIRONMENT or the conf supplies, because there
+  # is no upper bound either: twenty digits wraps 64-bit arithmetic.
+  [ "${#v}" -le 9 ] || v="$d"
+  printf '%s' "$v"
+}
+
+# --- conf: the knobs with their live values
+
+# True when KEY has a (possibly empty) assignment line in the checkout's conf.
+conf_present() { [ -r "$CONF" ] && grep -qE "^[[:space:]]*$1[[:space:]]*=" "$CONF"; }
+
+# One row's value and source. A numeric key goes the way num_knob goes:
+# environment, then conf, then default; a value that is not digits drops
+# straight to the default, and an environment one does so without the conf.
+knob_numeric_line() {
+  local k="$1" dflt="$2" e c layer="default" notes="" val
+  e="${!k:-}"; c="$(conf_get "$k")"
+  val="$(num_knob "$k" "$dflt")"
+  if [ -n "$e" ]; then
+    case "$e" in
+      *[!0-9]*) notes="; env set but not a number, ignored, conf not consulted"
+                printf '%s\t%s' "$val" "default${notes}"; return 0 ;;
+    esac
+    layer="env"
+  else
+    [ "${!k+x}" != x ] || notes="; env set but empty, ignored"
+    if [ -n "$c" ]; then
+      case "$c" in
+        *[!0-9]*) notes="${notes}; conf set but not a number, ignored" ;;
+        *) layer=conf ;;
+      esac
+    elif conf_present "$k"; then
+      notes="${notes}; conf set but empty, ignored"
     fi
-  done < <(git -C "$ROOT" ls-tree -r --name-only "$ref" -- docs/product 2>/dev/null |
-           gr_docs)
+  fi
+  # num_knob falls to the default for a value past nine digits, from either layer.
+  if [ "$layer" != default ]; then
+    local z; if [ "$layer" = env ]; then z="$e"; else z="$c"; fi
+    z="${z#"${z%%[!0]*}"}"
+    [ "${#z}" -le 9 ] || { notes="${notes}; ${layer} value too long, ignored"; layer=default; }
+  fi
+  printf '%s\t%s' "$val" "${layer}${notes}"
+}
 
-  # --- plans, with needs and serves edges ----------------------------------
-  local plan agent effort req needs need blocked
-  while IFS= read -r f; do
-    [ -n "$f" ] || continue
-    { read -r plan; read -r agent; read -r effort; read -r req; read -r needs; } \
-      <<<"$(git -C "$ROOT" show "${ref}:${f}" 2>/dev/null |
-            gr_fields plan agent effort requirement needs)"
-    [ -n "$plan" ] || { plan="${f##*/}"; plan="${plan%.md}"; }
-    blocked=0
-    if [ -n "$needs" ] && [ "$needs" != "none" ]; then
-      # A need blocks only while the needed plan file still exists there.
-      while IFS= read -r need; do
-        need="$(printf '%s' "$need" | tr -d ' ')"
-        if [ -z "$need" ] || [ "$need" = "none" ]; then continue; fi
-        if git -C "$ROOT" cat-file -e "${ref}:docs/plans/${need}.md" 2>/dev/null; then
-          blocked=1
-          printf '  p_%s -. needs .-> p_%s\n' "$(gr_id "$plan")" "$(gr_id "$need")"
+# Environment, then a conf (the checkout's, or the base branch's), then the
+# default: for a key whose reader does no validation. Present-and-empty is a
+# layer that was skipped, not a value.
+knob_text_line() {
+  local k="$1" dflt="$2" scope="$3" e c layer=default notes="" val
+  e="${!k:-}"
+  if [ -n "$e" ]; then
+    layer="env"; val="$e"
+  else
+    [ "${!k+x}" != x ] || notes="; env set but empty, ignored"
+    if [ "$scope" = base-conf ]; then
+      c="$(scout_base_conf "$k")"
+      if [ -n "$c" ]; then layer="base conf"; val="$c"; fi
+    elif [ "$scope" != session ]; then
+      c="$(conf_get "$k")"
+      if [ -n "$c" ]; then layer=conf; val="$c"
+      elif conf_present "$k"; then notes="${notes}; conf set but empty, ignored"; fi
+    fi
+    [ "$layer" != default ] || val="$dflt"
+  fi
+  printf '%s\t%s' "$val" "${layer}${notes}"
+}
+
+cmd_conf() {
+  local k d scope meaning pair val src
+  [ "$#" -eq 0 ] || die "usage: $0 conf"
+  while IFS='|' read -r k d scope meaning; do
+    [ -n "$k" ] || continue
+    case "$k" in
+      HANDOVER_STALE_SECONDS) pair="$(knob_numeric_line "$k" "$d")" ;;
+      JOHARNESS_CHURN_LIMIT)
+        pair="$(knob_numeric_line "$k" "$(( $(num_knob JOHARNESS_CHURN_THRESHOLD) * 2 ))")" ;;
+      JOHARNESS_CONF)
+        if [ -n "${JOHARNESS_CONF:-}" ]; then pair="${CONF}"$'\t'"env"
+        else pair="${CONF}"$'\t'"default"; fi ;;
+      JOHARNESS_CANONICAL)
+        # Every reader greps the conf for the line; the environment is never seen.
+        if grep -q '^JOHARNESS_CANONICAL=1' "$CONF" 2>/dev/null; then
+          pair="1"$'\t'"conf"
+        else pair="$d"$'\t'"default"; fi ;;
+      JOHARNESS_RECURRENCE_WINDOW)
+        # The reader drops anything but digits (and an empty one) to 8.
+        pair="$(knob_text_line "$k" "$d" session)"
+        case "${pair%%$'\t'*}" in
+          '' | *[!0-9]*) pair="$d"$'\t'"default; env set but not a number, ignored" ;;
+        esac ;;
+      *)
+        case "$scope" in
+          conf | dispatch) case "$d" in
+                             '' | *[!0-9]*) pair="$(knob_text_line "$k" "$d" "$scope")" ;;
+                             *) pair="$(knob_numeric_line "$k" "$d")" ;;
+                           esac ;;
+          *) pair="$(knob_text_line "$k" "$d" "$scope")" ;;
+        esac ;;
+    esac
+    val="${pair%%$'\t'*}"; src="${pair#*$'\t'}"
+    # The reader's own answer where it normalizes (a login, an on/off switch).
+    local raw="$val"
+    case "$k" in
+      JOHARNESS_SCOUT_REVIEWER) val="$(scout_reviewer)" ;;
+      JOHARNESS_SCOUT_RESEARCH) val="$(scout_research)" ;;
+    esac
+    if [ "$scope" = base-conf ] && [ -n "$raw" ] && [ "$raw" != "$val" ] && [ "${src%% *}" != default ]; then
+      src="${src}; value not accepted, read as ${val}"
+    fi
+    [ -n "$val" ] || val='""'
+    printf '%s = %s (%s)  %s  %s\n' "$k" "$val" "$src" "$scope" "$meaning"
+  done <<<"$KNOBS"
+}
+
+dispatch_age_min() {
+  local ts now
+  ts="$(git -C "$ROOT" log -1 --format=%ct "refs/remotes/origin/$1" </dev/null 2>/dev/null)"
+  [ -n "$ts" ] || return 0
+  now="$(date +%s)"
+  printf '%s' "$(( (now - ts) / 60 ))"
+}
+# Minutes since a workstream file was last PARKED on a remote branch: the
+# commit whose diff moved the frontmatter status from anything else to blocked,
+# not the last push.
+dispatch_block_age_min() {
+  local ts now range
+  range="refs/remotes/origin/$1"
+  [ -z "${3:-}" ] || range="${3}..${range}"
+  # `</dev/null`: same reason as dispatch_age_min above.
+  ts="$(git -C "$ROOT" log --follow --first-parent -m -p --unified=99999 \
+    --format='C %at %P' -G'^status:' "$range" -- "$2" \
+    </dev/null 2>/dev/null |
+    awk '
+      function val(line) {
+        # A comment needs whitespace before its `#`, as gr_fields reads it:
+        # two readers of one field must not disagree on its value.
+        sub(/^status:[[:space:]]*/, "", line); sub(/[[:space:]]+#.*$/, "", line)
+        sub(/[[:space:]]+$/, "", line); return line
+      }
+      function judge() {
+        if (!have) return
+        if (added == "blocked" && (created || (removed != "" && removed != "blocked"))) {
+          if (!orphan) print t
+          found = 1
+        }
+      }
+      /^C [0-9]+( |$)/ {
+        judge(); if (found) exit
+        t = $2; orphan = (NF == 2); have = 1; created = 0; added = ""; removed = ""
+        inhunk = 0; newdash = 0; olddash = 0
+        next
+      }
+      /^new file mode/ { created = 1; next }
+      /^@@/ { inhunk = 1; next }
+      !inhunk { next }
+      {
+        c = substr($0, 1, 1); line = substr($0, 2); sub(/\r$/, "", line)
+        if (c == " " || c == "+") {
+          if (line == "---") newdash++
+          else if (c == "+" && newdash == 1 && line ~ /^status:/ && added == "") added = val(line)
+        }
+        if (c == " " || c == "-") {
+          if (line == "---") olddash++
+          else if (c == "-" && olddash == 1 && line ~ /^status:/ && removed == "") removed = val(line)
+        }
+      }
+      END { if (!found) judge() }')"
+  [ -n "$ts" ] || return 0
+  now="$(date +%s)"
+  printf '%s' "$(( (now - ts) / 60 ))"
+}
+dispatch_claim_age_min() {
+  local ts now
+  [ -n "${2:-}" ] || return 0
+  # `</dev/null`: same reason as dispatch_age_min above.
+  ts="$(git -C "$ROOT" log --format='%at %ct' "${2}..refs/remotes/origin/$1" \
+    </dev/null 2>/dev/null | tail -1 | awk '{ print ($1 < $2 ? $1 : $2) }')"
+  [ -n "$ts" ] || return 0
+  now="$(date +%s)"
+  printf '%s' "$(( (now - ts) / 60 ))"
+}
+dispatch_age_text() {
+  [ -n "$1" ] || { printf 'unknown'; return 0; }
+  if [ "$1" -lt 120 ]; then printf '%sm' "$1"; else printf '%sh' "$(( $1 / 60 ))"; fi
+}
+
+# The hook's wave partition, one line per member: stem, wave, overlap note.
+dispatch_waves() {
+  sed -n 's/^  wave \([0-9][0-9]*\): \(.*\)$/\1\t\2/p' |
+    sed 's/ — /\t/; s/;[^\t]*$//' |
+    awk -F'\t' '{
+      note = $3; sub(/^overlaps /, "", note)
+      m = split($2, parts, ", ")
+      for (k = 1; k <= m; k++) {
+        st = parts[k]; sub(/ \(.*\)$/, "", st)
+        printf "%s\t%s\t%s\n", st, $1, note
+      }
+    }'
+}
+
+# Branches holding a slot without holding a claim: unmerged, ahead of the base
+# branch, owning no workstream file — and carrying the DELETION of one.
+dispatch_retired_edges() {
+  local base_branch="${HANDOVER_BASE_BRANCH:-main}"
+  refs_unmerged "refs/remotes/origin/${base_branch}" |
+    { local r name base items swept plan cand state own unver=0
+      while IFS= read -r r; do
+        name="${r#refs/remotes/origin/}"
+        { [ "$name" = "HEAD" ] || [ "$name" = "$base_branch" ]; } && continue
+        # Merged drops out entirely (refs_unmerged) — the one case that must
+        # NEVER hold a slot, because the money stopped being committed when
+        # it landed.
+        # NO merge base = ownership cannot be computed here at all, and a
+        # shallow clone is how that happens: grafted history, most refs
+        # unreachable from the base.
+        base="$(git -C "$ROOT" merge-base "$r" \
+          "refs/remotes/origin/${base_branch}" 2>/dev/null)"
+        if [ -z "$base" ]; then unver=$((unver + 1)); continue; fi
+        git -C "$ROOT" diff --name-only --diff-filter=ACMRT "$base" "$r" \
+          -- docs/handover 2>/dev/null | gr_docs | grep -q . && continue
+        # EVERY item, not the first.
+        items="$(git -C "$ROOT" diff --name-only --diff-filter=D "$base" "$r" \
+          -- docs/plans docs/research 2>/dev/null | gr_docs | grep -v ' ' |
+          tr '\n' ' ')"
+        items="${items% }"
+        # The branch's own retired record, read AT THE BASE — the version
+        # before this branch deleted it.
+        swept="$(git -C "$ROOT" diff --name-only --diff-filter=D "$base" "$r" \
+          -- docs/handover 2>/dev/null | gr_docs | head -1)"
+        # A PLANNING pass retires nothing the base carries: its workstream
+        # file was born and retired on the branch, so it nets to absent, and
+        # it deletes no plan — it ADDS them. The record is still in the
+        # branch's own history: the commit that retired it. Its `plan:`
+        # naming a requirement the base carries is the item. Without this the
+        # planning branch vanished at step 7 and its requirement was offered
+        # to a second planner for the whole pull-request window (verifier
+        # r2). The retired FILE, never the plans the branch adds: a clerk or
+        # any plan-only branch adds plans that name requirements, claims
+        # nothing, and must hold no slot — reading the added plans gave it
+        # one under a title no live session carries (verifier r8).
+        if [ -z "$items" ] && [ -z "$swept" ]; then
+          # The branch's OWN record: a file this branch's own commits both
+          # ADDED and DELETED — first-parent, no merges, both halves. Each
+          # narrower spelling was a verifier round. Default walk: a reconcile
+          # merge TREESAME to the base pruned the retire commit (r10).
+          # First-parent alone: that merge's diff carries the BASE's
+          # deletions, so a branch that merged a cleanup of an inherited
+          # record borrowed its claim (r11). Without the ADDED half, a
+          # branch's own sweep of an inherited record the base later dropped
+          # read as its claim. A planning branch merged in lends nothing:
+          # its commits are not on this first-parent line.
+          own="$(git -C "$ROOT" log --first-parent --no-merges --format= \
+            --name-only --diff-filter=A "${base}..${r}" -- docs/handover \
+            2>/dev/null | gr_docs | sort -u)"
+          [ -n "$own" ] || continue
+          items="$(git -C "$ROOT" log --first-parent --no-merges \
+              --format='@%H' --name-only \
+              --diff-filter=D "${base}..${r}" -- docs/handover 2>/dev/null |
+            { c=""
+              while IFS= read -r cand; do
+                case "$cand" in
+                  '') continue ;;
+                  @*) c="${cand#@}"; continue ;;
+                esac
+                [ -n "$c" ] || continue
+                printf '%s\n' "$cand" | gr_docs | grep -q . || continue
+                printf '%s\n' "$own" | grep -qxF -- "$cand" || continue
+                plan="$(git -C "$ROOT" show "${c}^:${cand}" 2>/dev/null |
+                  gr_field plan)"
+                plan="${plan##*/}"; plan="${plan%.md}"
+                plan="$(printf '%s' "$plan" | tr -cd 'A-Za-z0-9._-')"
+                case "$plan" in '' | none) continue ;; esac
+                # A plan or question of the stem wins, as at every site.
+                git -C "$ROOT" cat-file -e \
+                  "refs/remotes/origin/${base_branch}:docs/plans/${plan}.md" \
+                  2>/dev/null && continue
+                git -C "$ROOT" cat-file -e \
+                  "refs/remotes/origin/${base_branch}:docs/research/${plan}.md" \
+                  2>/dev/null && continue
+                git -C "$ROOT" cat-file -e \
+                  "refs/remotes/origin/${base_branch}:docs/product/${plan}.md" \
+                  2>/dev/null && printf 'docs/product/%s.md\n' "$plan"
+              done; } | sort -u | tr '\n' ' ')"
+          items="${items% }"
+          [ -n "$items" ] || continue
         fi
-      done < <(printf '%s\n' "$needs" | tr ',' '\n')
-    fi
-    if [ "$blocked" = "1" ]; then
-      printf '  p_%s["plan: %s%s"]:::blocked\n' "$(gr_id "$plan")" "$plan" \
-        "${agent:+ [${agent}${effort:+ ${effort}}]}"
-    else
-      printf '  p_%s["plan: %s%s"]:::plan\n' "$(gr_id "$plan")" "$plan" \
-        "${agent:+ [${agent}${effort:+ ${effort}}]}"
-    fi
-    [ -n "$req" ] && [ "$req" != "none" ] &&
-      printf '  p_%s -- serves --> r_%s\n' "$(gr_id "$plan")" "$(gr_id "$req")"
-  done < <(git -C "$ROOT" ls-tree -r --name-only "$ref" -- docs/plans 2>/dev/null |
-           gr_docs)
+        plan=""
+        [ -z "$swept" ] ||
+          plan="$(git -C "$ROOT" show "${base}:${swept}" 2>/dev/null |
+            gr_field plan)"
+        case "$plan" in '' | none) ;; *)
+          for cand in "docs/plans/${plan}.md" "docs/research/${plan}.md" "docs/product/${plan}.md"; do
+            git -C "$ROOT" cat-file -e "${base}:${cand}" 2>/dev/null || continue
+            case " ${items} " in
+              *" ${cand} "*)
+                # Named among the deleted items: lift it to the front, which
+                # is the only place the row and the by-title lookup read.
+                items="${cand} $(printf '%s\n' "$items" | tr ' ' '\n' |
+                  grep -vxF -- "$cand" | tr '\n' ' ')"
+                items="$(printf '%s' "$items" | tr -s ' ')"
+                items="${items% }" ;;
+              *) # Same space rule as the deleted-item scan above, which this
+                 # arm bypassed: a path with a space cannot survive the space-
+                 # joined field, and post-fix it would not mangle a row but
+                 # decide a slot from half a path.
+                 case "$cand" in *' '*) ;; *) [ -n "$items" ] || items="$cand" ;; esac ;;
+            esac
+            break
+          done ;;
+        esac
+        # THE DISCRIMINATOR.
+        state=leftover askable=""
+        while IFS= read -r cand; do
+          [ -n "$cand" ] || continue
+          case "$cand" in docs/product/*) continue ;; esac
+          askable=1
+          git -C "$ROOT" cat-file -e "refs/remotes/origin/${base_branch}:${cand}" \
+            2>/dev/null || continue
+          state=mid-merge
+          break
+        done <<<"$(printf '%s\n' "$items" | tr ' ' '\n')"
+        [ -n "$askable" ] || state=unknown
+        printf '%s\t%s\t%s\n' "$name" "${items:--}" "$state"
+      done
+      # Last line, and it is not a branch.
+      [ "$unver" -eq 0 ] || printf '..unverified\t%s\t-\n' "$unver"
+    }
+}
 
-  # --- in-flight branches: claims and churn --------------------------------
-  # origin only: a fork mirrors every branch, and a mirrored workstream is
-  # the same node twice. One entry per workstream name — the protocol says
-  # one file per workstream, so a second ref carrying the same name is the
-  # same work, not a second node.
-  local r short bname ws mb wdoc wname claim churn churn_n churn_f seen=""
+# Can the cadence be read here AT ALL?
+cycle_unreadable() {
+  local base_branch="${HANDOVER_BASE_BRANCH:-main}"
+  if ! git -C "$ROOT" rev-parse --verify -q \
+      "refs/remotes/origin/${base_branch}" >/dev/null 2>&1; then
+    printf 'no refs/remotes/origin/%s here: fetch it, or set HANDOVER_BASE_BRANCH to the branch this repo merges into' \
+      "$base_branch"
+    return 0
+  fi
+  if [ "$(git -C "$ROOT" rev-parse --is-shallow-repository \
+      </dev/null 2>/dev/null)" = true ]; then
+    printf 'shallow clone: a boundary commit has no parents, so neither the plan count nor the age belongs to this queue — git fetch --unshallow to read the cycle'
+    return 0
+  fi
+}
+
+# Hours since the base branch's FIRST commit: the baseline when no curate has
+# ever landed, so "never" is the longest interval rather than a special case.
+cycle_repo_age_h() {
+  local base_branch="${HANDOVER_BASE_BRANCH:-main}" ts now
+  ts="$(git -C "$ROOT" log --format=%ct --reverse --max-parents=0 \
+    "refs/remotes/origin/${base_branch}" </dev/null 2>/dev/null | head -1)"
+  [ -n "$ts" ] || return 0
+  now="$(date +%s)"
+  printf '%s' "$(( (now - ts) / 3600 ))"
+}
+
+# The COMMIT of the last curate that landed, empty when none has.
+cycle_landed_sha() {
+  local base_branch="${HANDOVER_BASE_BRANCH:-main}"
+  git -C "$ROOT" log -1 --format=%H --diff-filter=D --full-history \
+    "refs/remotes/origin/${base_branch}" -- "docs/handover/curate-*.md" \
+    </dev/null 2>/dev/null
+}
+
+# When that curate LANDED, which is not when its retire was committed.
+cycle_landed_ts() {
+  local base_branch="${HANDOVER_BASE_BRANCH:-main}" sha merge
+  sha="$(cycle_landed_sha)"
+  [ -n "$sha" ] || return 0
+  merge="$(git -C "$ROOT" rev-list --ancestry-path --first-parent \
+    "${sha}..refs/remotes/origin/${base_branch}" </dev/null 2>/dev/null | tail -1)"
+  # Committed straight onto the base branch rather than merged: there is no
+  # merge above it and its own time IS the landing time.
+  [ -n "$merge" ] || merge="$sha"
+  git -C "$ROOT" log -1 --format=%ct "$merge" </dev/null 2>/dev/null
+}
+
+# Hours since the last curate landed, empty when none ever has — which is the
+# signal `dispatch_curate_due` reads to switch to the repository baseline above.
+cycle_age_h() {
+  local ts now
+  ts="$(cycle_landed_ts)"
+  [ -n "$ts" ] || return 0
+  now="$(date +%s)"
+  printf '%s' "$(( (now - ts) / 3600 ))"
+}
+
+# Plan files ADDED or MODIFIED on the base branch since a given commit, or
+# since the beginning when none is given.
+dispatch_curate_plan_churn() {
+  local base_branch="${HANDOVER_BASE_BRANCH:-main}" from="${1:-}" range
+  range="refs/remotes/origin/${base_branch}"
+  [ -z "$from" ] || range="${from}..refs/remotes/origin/${base_branch}"
+  # ONE git call.
+  # shellcheck disable=SC2086
+  git -C "$ROOT" log --diff-filter=AM --name-only --format='' \
+    $range -- docs/plans \
+    </dev/null 2>/dev/null |
+    gr_docs | sort -u | awk 'END { print NR + 0 }'
+}
+
+# `awk END{print NR+0}`, never `grep -c .
+
+# The newest curate no-op record: `<stamp time>\t<branch>\t<tip sha>`, empty
+# when none. Merged ones only, as `clerk_noop`: an unmerged branch is no pass
+# done. A stamp more than JOHARNESS_CURATE_HOURS ahead of now is a broken clock
+# and dates nothing.
+curate_noop() {
+  local base_branch="${HANDOVER_BASE_BRANCH:-main}" r ts best=0 bname="" bsha="" lim sha hours
+  hours="$(num_knob JOHARNESS_CURATE_HOURS)"
+  lim=$(( $(date +%s) + hours * 3600 ))
+  while IFS=$'\t' read -r r sha; do
+    ts="$(clerk_stamp_ts "${r#refs/remotes/origin/curate-noop-}")"
+    [ -n "$ts" ] || continue
+    [ "$ts" -le "$lim" ] || continue
+    if [ "$ts" -gt "$best" ]; then best="$ts"; bname="${r#refs/remotes/origin/}"; bsha="$sha"; fi
+  done < <(git -C "$ROOT" for-each-ref --merged="refs/remotes/origin/${base_branch}" \
+    --format='%(refname)%09%(objectname)' 'refs/remotes/origin/curate-noop-*' </dev/null 2>/dev/null)
+  [ "$best" -eq 0 ] || printf '%s\t%s\t%s' "$best" "$bname" "$bsha"
+}
+
+# Is a curate due, and WHY.
+dispatch_curate_due() {
+  local hours plans age churn why
+  # Before any knob: can this checkout answer the question at all.
+  why="$(cycle_unreadable)"
+  if [ -n "$why" ]; then
+    printf 'unreadable %s' "$why"
+    return 0
+  fi
+  hours="$(num_knob JOHARNESS_CURATE_HOURS)"
+  plans="$(num_knob JOHARNESS_CURATE_PLANS)"
+  # `JOHARNESS_CURATE_HOURS=0` alone is STILL the off switch, and that is a
+  # compatibility promise rather than a tidy rule.
+  if [ "$hours" -eq 0 ]; then
+    printf 'off JOHARNESS_CURATE_HOURS=0: no curate is ever due (the whole cycle, for compatibility with the only off switch there used to be)'
+    return 0
+  fi
+  # No curate has ever landed?
+  age="$(cycle_age_h)"
+  if [ -z "$age" ]; then
+    churn="$(dispatch_curate_plan_churn)"
+    age="$(cycle_repo_age_h)"
+    [ -n "$age" ] || age=0
+  else
+    churn="$(dispatch_curate_plan_churn "$(cycle_landed_sha)")"
+  fi
+  local base_word='the last curate'
+  [ -n "$(cycle_landed_sha)" ] || base_word='the queue began, none having landed'
+  # A pass that found nothing to propose leaves a merged `curate-noop-<stamp>`
+  # branch: when newer than the last landing it resets BOTH triggers.
+  local noop nts landed_ts now
+  noop="$(curate_noop)"
+  if [ -n "$noop" ]; then
+    nts="${noop%%$'\t'*}"
+    landed_ts="$(cycle_landed_ts)"
+    if [ -z "$landed_ts" ] || [ "$nts" -gt "$landed_ts" ]; then
+      now="$(date +%s)"
+      [ "$nts" -le "$now" ] || nts="$now"
+      age=$(( (now - nts) / 3600 ))
+      noop="${noop#*$'\t'}"
+      churn="$(dispatch_curate_plan_churn "${noop#*$'\t'}")"
+      base_word="the last curate pass found nothing to propose (${noop%%$'\t'*})"
+    fi
+  fi
+  if [ "$plans" -gt 0 ] && [ "$churn" -ge "$plans" ]; then
+    printf 'due %s plan file(s) changed since %s (>= %s)' "$churn" "$base_word" "$plans"
+    return 0
+  fi
+  if [ "$hours" -gt 0 ] && [ "$age" -ge "$hours" ]; then
+    printf 'due %sh since %s (>= %sh), %s plan file(s) changed' \
+      "$age" "$base_word" "$hours" "$churn"
+    return 0
+  fi
+  # Name only the triggers that are ENABLED. "(of 0h)" reads as a clock that
+  # fired at zero rather than one the human switched off.
+  if [ "$plans" -gt 0 ] && [ "$hours" -gt 0 ]; then
+    printf 'not-due %s plan file(s) changed (of %s) and %sh elapsed (of %sh) since %s' \
+      "$churn" "$plans" "$age" "$hours" "$base_word"
+  else
+    printf 'not-due %sh elapsed (of %sh) since %s; the production trigger is off (JOHARNESS_CURATE_PLANS=0)' \
+      "$age" "$hours" "$base_word"
+  fi
+}
+
+# Curate branches in flight: unmerged, carrying a workstream file this branch
+# ADDED that reads `workstream: curate-<stamp>` and `plan: none`.
+dispatch_curate_branches() {
+  local base_branch="${HANDOVER_BASE_BRANCH:-main}"
+  local refs r name base wf files doc cws ckey cstat csess cnext cand
+  # `--no-merged` does the merged filter in ONE call, where a
+  # `merge-base --is-ancestor` per ref paid for it 130 times on this checkout.
+  refs="$(git -C "$ROOT" for-each-ref --no-merged="refs/remotes/origin/${base_branch}" \
+    --format='%(refname)' refs/remotes/origin </dev/null 2>/dev/null)"
   while IFS= read -r r; do
-    short="${r#refs/remotes/}"
-    bname="${short#*/}"
-    [ "$bname" = "HEAD" ] && continue
-    [ "$bname" = "$base_branch" ] && continue
-    git -C "$ROOT" merge-base --is-ancestor "$r" "$ref" 2>/dev/null && continue
+    [ -n "$r" ] || continue
+    name="${r#refs/remotes/origin/}"
+    { [ "$name" = "HEAD" ] || [ "$name" = "$base_branch" ]; } && continue
+    cand="$(git -C "$ROOT" ls-tree -r --name-only "$r" -- docs/handover \
+      </dev/null 2>/dev/null | grep -i curate)" || continue
+    [ -n "$cand" ] || continue
+    base="$(git -C "$ROOT" merge-base "$r" \
+      "refs/remotes/origin/${base_branch}" </dev/null 2>/dev/null)"
+    [ -n "$base" ] || continue
+    files="$(git -C "$ROOT" diff --name-only --diff-filter=ACMRT "$base" "$r" \
+      -- docs/handover </dev/null 2>/dev/null | gr_docs)"
+    while IFS= read -r wf; do
+      [ -n "$wf" ] || continue
+      doc="$(git -C "$ROOT" show "${r}:${wf}" </dev/null 2>/dev/null)"
+      { read -r cws; read -r ckey; read -r cstat; read -r csess; read -r cnext; } \
+        <<<"$(printf '%s\n' "$doc" | gr_fields workstream plan status session next)"
+      # FRONTMATTER decides, never the filename: `workstream: curate-*` AND
+      # `plan: none`.
+      case "$cws" in curate-*) ;; *) continue ;; esac
+      [ "$ckey" = none ] || continue
+      # A RELEASED cycle claim holds nothing: cmd_janitor's test, same spelling.
+      [ "$cstat" = abandoned ] && continue
+      printf '%s\t%s\t%s\t%s\t%s\n' \
+        "$name" "${cws#curate-}" "${cstat:-?}" "${csess:-}" "${cnext:-}"
+    done <<<"$files"
+  done <<<"$refs"
+}
 
-    # Ownership is a DIFF against the merge-base, never a tree read: a branch
-    # inherits every workstream file its base branch carries, so presence in
-    # the tree says nothing about whose work the branch is. Reading the tree
-    # labelled an in-flight branch with a leftover it had merely inherited,
-    # under someone else's workstream name (PR54 r13) — the same class
-    # `upgrade`, `cleanup` and the finish gate each hit separately, and which
-    # `.agents/docs/feedback.md` now carries as a rule.
-    #
-    # The merge-base is between the REMOTE ref and the base ref. This loop
-    # walks refs, not the checkout, so the `HEAD`-vs-base form the other
-    # callers use is the wrong one to copy here.
-    mb="$(git -C "$ROOT" merge-base "$r" "$ref" 2>/dev/null)" || mb=""
-    if [ -n "$mb" ]; then
-      ws="$(git -C "$ROOT" diff --name-only --diff-filter=A "$mb" "$r" \
-        -- docs/handover 2>/dev/null | gr_docs | head -1)"
+# --- curate: is the live plan queue still fit?
+
+curate_scope_list() { gr_field scope <"${ROOT}/$1" | scope_norm; }
+
+# The normalization itself, on a raw `scope:` value from stdin. Shared with
+# lint_fable_bound, which already holds the value from its one frontmatter read.
+scope_norm() {
+  tr ',' '\n' |
+    sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+        -e 's/^[Ss][Hh][Aa][Rr][Ee][Dd]:[[:space:]]*/shared:/' \
+        -e 's|/*$||' |
+    grep -v '^$' | grep -vx 'none' | grep -vx 'shared:'
+}
+
+# What the plan's PROSE says it touches, from the one reader above. `scope:` is
+# only as true as it is complete against this.
+curate_section_paths() { section_paths "$1" "$2" | sort -u; }
+
+# Is <path> covered by any entry in <scope-list>? A `shared:` marker is not
+# part of the path, and a directory entry covers everything under it.
+curate_covered() {
+  local p="$1" s
+  while IFS= read -r s; do
+    [ -n "$s" ] || continue
+    s="${s#shared:}"; s="${s#"${s%%[![:space:]]*}"}"
+    case "$p" in "$s" | "$s"/*) return 0 ;; esac
+  done <<<"$2"
+  return 1
+}
+
+# Registry threshold: this many plans declaring one path make it a registry
+# to mark `shared:`. Floor of 2 — the PROPOSE window is `>= 2 && < regthr`.
+curate_regthr() {
+  local r; r="$(num_knob JOHARNESS_CURATE_REGISTRY)"
+  [ "$r" -ge 2 ] || r=2
+  printf '%s' "$r"
+}
+
+# Every unmarked scope: entry across the queue, held plans included:
+# `<path>\t<stem>`, one per plan per path.
+curate_counts() {
+  local rel stem s
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    stem="$(lint_stem "$rel")"
+    while IFS= read -r s; do
+      [ -n "$s" ] || continue
+      case "$s" in shared:*) continue ;; esac
+      printf '%s\t%s\n' "$s" "$stem"
+    done < <(curate_scope_list "$rel")
+  done < <(lint_nodes docs/plans)
+}
+
+# How many plans declare <path> unmarked, from curate_counts output.
+curate_hits() {
+  printf '%s' "$2" | awk -F'\t' -v p="$1" '$1 == p { print $2 }' | sort -u | grep -c . || :
+}
+
+# Scope-section paths under directory <dir>, one per line.
+curate_under() { printf '%s\n' "$2" | awk -v d="$1" 'index($0, d "/") == 1'; }
+
+# Repairs one plan needs, one per line, `M\t<text>` when `curate --apply`
+# fixes it mechanically, `J\t<text>` when it needs a reader.
+curate_repairs() {
+  local rel="$1" counts="$2" regthr="$3" stem scope seclist="" p s hit
+  stem="$(lint_stem "$rel")"
+  scope="$(curate_scope_list "$rel")"
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    [ -e "${ROOT}/${p}" ] && continue
+    printf 'J\t%s: anchor '"'"'%s'"'"' not in the tree — re-locate it by name, or cut the line\n' "$stem" "$p"
+  done < <(anchor_paths "$rel")
+  [ -z "$scope" ] || seclist="$(curate_section_paths "$rel" Scope)"
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    curate_covered "$p" "$scope" && continue
+    printf 'M\t%s: Scope names '"'"'%s'"'"', scope: does not cover it — add it\n' "$stem" "$p"
+  done <<<"$seclist"
+  while IFS= read -r s; do
+    [ -n "$s" ] || continue
+    s="${s#shared:}"
+    [ -d "${ROOT}/${s}" ] || continue
+    if [ -n "$(curate_under "$s" "$seclist")" ]; then
+      printf 'M\t%s: scope: claims the whole directory '"'"'%s'"'"' — narrow it to the files Scope names\n' "$stem" "$s"
     else
-      # No merge-base: introduced and inherited cannot be told apart. `graph`
-      # DESCRIBES, so it shows the branch on presence rather than dropping it
-      # out of the view — the opposite call from `upgrade`, which DECIDES and
-      # therefore refuses on presence. Same split the base_ref comment makes.
-      ws="$(git -C "$ROOT" ls-tree -r --name-only "$r" -- docs/handover \
-        2>/dev/null | gr_docs | head -1)"
+      printf 'J\t%s: scope: claims the whole directory '"'"'%s'"'"' and Scope names no file under it — narrow it by hand\n' "$stem" "$s"
     fi
+  done <<<"$scope"
+  while IFS= read -r s; do
+    [ -n "$s" ] || continue
+    case "$s" in shared:*) continue ;; esac
+    hit="$(curate_hits "$s" "$counts")"
+    [ "$hit" -ge "$regthr" ] || continue
+    printf 'M\t%s: '"'"'%s'"'"' is declared by %s plans and unmarked — shared: it\n' "$stem" "$s" "$hit"
+  done <<<"$scope"
+}
+
+# The scope: value curate_repairs' mechanical fixes produce, comma-joined.
+curate_fixed_scope() {
+  local rel="$1" counts="$2" regthr="$3" scope seclist="" s bare marked u p out=""
+  scope="$(curate_scope_list "$rel")"
+  [ -n "$scope" ] || return 0
+  seclist="$(curate_section_paths "$rel" Scope)"
+  while IFS= read -r s; do
+    [ -n "$s" ] || continue
+    bare="${s#shared:}"; marked=""; [ "$bare" = "$s" ] || marked="shared:"
+    if [ -d "${ROOT}/${bare}" ] && [ -n "$(curate_under "$bare" "$seclist")" ]; then
+      while IFS= read -r u; do
+        [ -n "$u" ] && out="${out}${marked}${u}"$'\n'
+      done <<<"$(curate_under "$bare" "$seclist")"
+      continue
+    fi
+    if [ -z "$marked" ] && [ "$(curate_hits "$bare" "$counts")" -ge "$regthr" ]; then
+      out="${out}shared:${bare}"$'\n'; continue
+    fi
+    out="${out}${s}"$'\n'
+  done <<<"$scope"
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    curate_covered "$p" "$scope" || out="${out}${p}"$'\n'
+  done <<<"$seclist"
+  printf '%s' "$out" | awk 'NF && !seen[$0]++' | paste -sd, - | sed 's/,/, /g'
+}
+
+# Rewrite <rel>'s frontmatter scope: line to <value>.
+curate_write_scope() {
+  local f="${ROOT}/$1" tmp
+  tmp="$(mktemp)" || return 1
+  awk -v v="$2" '
+    NR == 1 && $0 == "---" { fm = 1; print; next }
+    fm && $0 == "---" { fm = 0 }
+    fm && /^scope:/ { print "scope: " v; next }
+    { print }' "$f" >"$tmp" && mv "$tmp" "$f"
+}
+
+cmd_curate() {
+  local qout rows rel stem label scope claimed prel apply=0 old new
+  local regthr splitthr bullets reqstem hit s p
+  local n_plans=0 n_held=0 n_repair=0 n_mech=0 n_declutter=0 n_propose=0 n_fixed=0
+  local pass n_pass
+  local repair="" declutter="" propose="" held_rows="" counts="" line plans_for kind text
+
+  case "${1:-}" in
+    '') ;;
+    --apply) apply=1 ;;
+    *) die "usage: $0 curate [--apply]" ;;
+  esac
+  regthr="$(curate_regthr)"
+  splitthr="$(num_knob JOHARNESS_CURATE_SPLIT)"
+
+  printf '== curate (REPAIR marked [apply] is mechanical: ./joharness.sh curate --apply)\n\n'
+  printf 'registry  : %s+ plans declaring one path = a registry to mark shared: (JOHARNESS_CURATE_REGISTRY)\n' "$regthr"
+  printf 'split     : %s+ Scope bullets = a decompose candidate, PROPOSED never done (JOHARNESS_CURATE_SPLIT)\n\n' "$splitthr"
+
+  # A plan a manager HOLDS draws no finding: its declarations are that manager's.
+  qout="$(drain_hook queue-context.sh)"
+  rows="$(printf '%s\n' "$qout" |
+    sed -n 's#^  \(docs/plans/[^ ]*\.md\)  \(\[.*\]\)$#\1|\2#p')"
+  counts="$(curate_counts)"
+
+  if [ "$apply" -eq 1 ]; then
+    # Until nothing changes: narrowing a directory can make a new registry.
+    for pass in 1 2 3 4 5; do
+      n_pass=0
+      while IFS= read -r rel; do
+        [ -n "$rel" ] || continue
+        label="$(printf '%s\n' "$rows" | awk -F'|' -v r="$rel" '$1 == r { print $2; exit }')"
+        case "$label" in *'claimed on '*) continue ;; esac
+        old="$(curate_scope_list "$rel" | paste -sd, - | sed 's/,/, /g')"
+        [ -n "$old" ] || continue
+        new="$(curate_fixed_scope "$rel" "$counts" "$regthr")"
+        { [ -n "$new" ] && [ "$new" != "$old" ]; } || continue
+        curate_write_scope "$rel" "$new" || continue
+        n_pass=$((n_pass + 1))
+        printf 'applied   : %s  scope: %s (pass %s)\n' "$rel" "$new" "$pass"
+      done < <(lint_nodes docs/plans)
+      counts="$(curate_counts)"
+      n_fixed=$((n_fixed + n_pass))
+      [ "$n_pass" -gt 0 ] || break
+    done
+    [ "$n_fixed" -gt 0 ] || printf 'applied   : nothing — no mechanical repair\n'
+    printf '\n'
+  fi
+
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    stem="$(lint_stem "$rel")"
+    label="$(printf '%s\n' "$rows" | awk -F'|' -v r="$rel" '$1 == r { print $2; exit }')"
+    case "$label" in
+      *'claimed on '*)
+        n_held=$((n_held + 1))
+        claimed="${label##*claimed on }"; claimed="${claimed%%,*}"; claimed="${claimed%%]*}"
+        held_rows="${held_rows}  ${stem}  ${claimed}"$'\n'
+        continue ;;
+    esac
+    n_plans=$((n_plans + 1))
+    scope="$(curate_scope_list "$rel")"
+
+    while IFS=$'\t' read -r kind text; do
+      [ -n "$kind" ] || continue
+      n_repair=$((n_repair + 1))
+      if [ "$kind" = M ]; then
+        n_mech=$((n_mech + 1))
+        repair="${repair}  [apply] ${text}"$'\n'
+      else
+        repair="${repair}  ${text}"$'\n'
+      fi
+    done < <(curate_repairs "$rel" "$counts" "$regthr")
+
+    # DECLUTTER: evidence in merged history first; a plan is not obsolete
+    # because its paths moved.
+    reqstem="$(lint_stem "$(gr_field requirement <"${ROOT}/${rel}")")"
+    if [ -n "$reqstem" ] && [ "$reqstem" != "none" ] &&
+       [ ! -f "${ROOT}/docs/product/${reqstem}.md" ]; then
+      plans_for=0
+      while IFS= read -r prel; do
+        [ -n "$prel" ] || continue
+        [ "$(lint_stem "$(gr_field requirement <"${ROOT}/${prel}")")" = "$reqstem" ] &&
+          plans_for=$((plans_for + 1))
+      done < <(lint_nodes docs/plans)
+      if [ "$plans_for" -le 1 ]; then
+        n_declutter=$((n_declutter + 1))
+        declutter="${declutter}  ${stem}: its requirement '${reqstem}' is gone and no other plan serves it — satisfied? confirm in merged history, then delete"$'\n'
+      fi
+    fi
+    if [ -n "$scope" ]; then
+      hit=0
+      while IFS= read -r s; do
+        [ -n "$s" ] || continue
+        s="${s#shared:}"
+        [ -e "${ROOT}/${s}" ] || hit=$((hit + 1))
+      done <<<"$scope"
+      if [ "$hit" -gt 0 ] &&
+         [ "$hit" -eq "$(printf '%s\n' "$scope" | grep -c .)" ]; then
+        n_declutter=$((n_declutter + 1))
+        declutter="${declutter}  ${stem}: no path in its scope: is in the tree — built already, or renamed under it? confirm in merged history, then delete or fix in place"$'\n'
+      fi
+    fi
+
+    bullets="$(awk '/^## Scope/ { s = 1; next } /^## / { s = 0 } s && /^- / { n++ } END { print n + 0 }' "${ROOT}/${rel}")"
+    if [ "$bullets" -ge "$splitthr" ]; then
+      n_propose=$((n_propose + 1))
+      propose="${propose}  ${stem}: ${bullets} Scope bullets (>= ${splitthr}) — decompose candidate. PROPOSE it; a split needs an author, and only where Scope already names separable deliverables"$'\n'
+    fi
+  done < <(lint_nodes docs/plans)
+
+  # ORDER: two to (regthr-1) plans claiming one path exclusively.
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    p="${line%%	*}"
+    hit="$(printf '%s' "$counts" | awk -F'\t' -v q="$p" '$1 == q { print $2 }' | sort -u | paste -sd, -)"
+    n_propose=$((n_propose + 1))
+    propose="${propose}  '${p}': claimed exclusively by ${hit} — order them, or say they are one plan. The human decides"$'\n'
+  done < <(printf '%s' "$counts" | awk -F'\t' '{ seen[$1 "\t" $2] = 1 }
+    END { for (k in seen) { split(k, a, "\t"); c[a[1]]++ }
+          for (q in c) if (c[q] >= 2 && c[q] < '"$regthr"') print q }' | sort)
+
+  printf 'plans     : %s free, %s held by a manager (held draw no findings)\n\n' \
+    "$n_plans" "$n_held"
+  [ -z "$held_rows" ] || { printf 'HELD (a manager owns these declarations):\n%s\n' "$held_rows"; }
+  if [ -n "$repair" ]; then printf 'REPAIR (the curator fixes these in place):\n%s\n' "$repair"; fi
+  if [ -n "$declutter" ]; then printf 'DECLUTTER (evidence in merged history FIRST, then delete):\n%s\n' "$declutter"; fi
+  if [ -n "$propose" ]; then printf 'PROPOSE (write these down; never act):\n%s\n' "$propose"; fi
+
+  if [ "$n_plans" -eq 0 ]; then
+    if [ "$n_held" -eq 0 ]; then
+      printf 'verdict   : NOTHING READ — the queue is EMPTY: no plan to check, which is not the same as every plan reading true. Still land the date (curate.md 0.4)\n'
+    else
+      printf 'verdict   : NOTHING READ — %s plan(s), every one held by a manager: their declarations are not yours. Nothing to do this pass\n' \
+        "$n_held"
+    fi
+  elif [ $((n_repair + n_declutter + n_propose)) -eq 0 ]; then
+    printf 'verdict   : NOTHING TO CURATE — %s free plan(s), every declaration reads true\n' "$n_plans"
+  else
+    printf 'verdict   : CURATE — %s repair(s) (%s mechanical), %s declutter candidate(s), %s proposal(s)\n' \
+      "$n_repair" "$n_mech" "$n_declutter" "$n_propose"
+  fi
+  printf 'judgement : %s\n' "$((n_repair - n_mech + n_declutter + n_propose))"
+  return 0
+}
+
+# Plans this branch adds (diff against the merge base, working tree
+# included), one per line.
+plans_in_diff() {
+  local base="$1"
+  {
+    git -C "$ROOT" diff --name-only --diff-filter=A "$base" -- docs/plans 2>/dev/null
+    git -C "$ROOT" ls-files --others --exclude-standard -- docs/plans 2>/dev/null
+  } | awk '/^docs\/plans\/[^\/]+\.md$/ && !/\/(README|TEMPLATE|RETIRED)\.md$/' | sort -u |
+    while IFS= read -r f; do [ -f "${ROOT}/${f}" ] && printf '%s\n' "$f"; done
+}
+
+# A scope: made only of core paths (protocol_paths): no session may build it.
+plan_core_only() {
+  local scope s c core any=0
+  scope="$(curate_scope_list "$1")"
+  [ -n "$scope" ] || return 1
+  core="$(protocol_paths)"
+  while IFS= read -r s; do
+    [ -n "$s" ] || continue
+    s="${s#shared:}"; any=0
+    while IFS= read -r c; do
+      case "$s" in "$c" | "$c"/*) any=1 ;; esac
+    done <<<"$core"
+    [ "$any" -eq 1 ] || return 1
+  done <<<"$scope"
+  return 0
+}
+
+# The ref that retired <stem>, from a ledger on stdin (docs/plans/RETIRED.md,
+# lines `- <stem> <ref>`); empty when not listed, `?` for a line with no ref.
+# Backticks round the stem and a CRLF ending are read through: a near-miss
+# line that silently guards nothing is the failure this exists to stop.
+retired_ref() {
+  tr -d '\r' | awk -v s="$1" '
+    $1 == "-" { t = $2; gsub(/`/, "", t)
+                if (t == s) { print (NF >= 3 ? $3 : "?"); exit } }'
+}
+
+# ci stage: plans this branch ADDS must carry no curate repair and must be
+# buildable (scope: not core paths only). Edited plans are skipped: their
+# defects may predate the edit. The branch's own held plan is exempt from
+# those two, never from the ledger: a stem the base branch's ledger lists
+# stays retired, whoever re-adds it.
+lint_plans_in_diff() {
+  local over="origin/${HANDOVER_BASE_BRANCH:-main}" base rel counts regthr bad=0 kind text n=0
+  local ws held="" rref
+  base="$(git -C "$ROOT" merge-base HEAD "$over" 2>/dev/null)"
+  if [ -z "$base" ]; then
+    printf '  not measurable here (no merge-base with %s)\n' "$over"
+    return 0
+  fi
+  counts="$(curate_counts)"
+  regthr="$(curate_regthr)"
+  # The plan this branch's own workstream file claims is held: its
+  # declarations are this branch's to change, as in `curate`.
+  while IFS= read -r ws; do
     [ -n "$ws" ] || continue
-    wdoc="$(git -C "$ROOT" show "${r}:${ws}" 2>/dev/null)"
-    wname="$(printf '%s\n' "$wdoc" | gr_field workstream)"
-    [ -n "$wname" ] || { wname="${ws##*/}"; wname="${wname%.md}"; }
-    case " $seen " in *" $wname "*) continue ;; esac
-    seen="$seen $wname"
-    claim="$(printf '%s\n' "$wdoc" | gr_field plan)"
-
-    # Same metric, same code as cmd_ci: churn_top splits count from path on
-    # a tab, so a hot file with a space in its name survives whole.
-    churn_n="" churn_f=""
-    if churn="$(churn_top "$r" "$ref")" && [ -n "$churn" ]; then
-      churn_n="${churn%%$'\t'*}"
-      churn_f="${churn#*$'\t'}"
-    fi
-    if [ -n "$churn_n" ] && [ "$churn_n" -ge "$threshold" ]; then
-      printf '  b_%s(["%s — CHURN: %s ×%s"]):::churn\n' \
-        "$(gr_id "$wname")" "$wname" "$churn_f" "$churn_n"
+    held="${held} $(lint_stem "$(lint_ws_content "$ws" | gr_field plan)") "
+  done <<<"$(fin_own_ws "$base")"
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    n=$((n + 1))
+    # The base BRANCH's ledger, not the merge base's: the branch that re-adds
+    # a retired plan is the one cut before the retire landed.
+    rref="$(git -C "$ROOT" show "${over}:docs/plans/RETIRED.md" 2>/dev/null |
+      retired_ref "$(lint_stem "$rel")")"
+    if [ -n "$rref" ]; then
+      bad=$((bad + 1))
+      printf '  %s: already retired by %s (docs/plans/RETIRED.md on %s); removing its ledger line is the human override, landed on %s before this branch\n' \
+        "$(lint_stem "$rel")" "$rref" "$over" "$over"
     else
-      printf '  b_%s(["%s"]):::branch\n' "$(gr_id "$wname")" "$wname"
+      # The branch's own ledger too: a carry retire that appends the line
+      # but keeps the plan copy would land both, a retired plan in the queue.
+      # No ledger on the branch is a normal state, so it is not read: a
+      # `<file 2>/dev/null` reports the missing file anyway, because the
+      # input redirect is applied before stderr is silenced.
+      rref=""
+      if [ -f "${ROOT}/docs/plans/RETIRED.md" ]; then
+        rref="$(retired_ref "$(lint_stem "$rel")" \
+          <"${ROOT}/docs/plans/RETIRED.md")"
+      fi
+      if [ -n "$rref" ]; then
+        bad=$((bad + 1))
+        printf '  %s: already retired by %s in this branch'"'"'s own docs/plans/RETIRED.md; a retire deletes the plan file, never lands it beside its ledger line\n' \
+          "$(lint_stem "$rel")" "$rref"
+      fi
     fi
-    [ -n "$claim" ] && [ "$claim" != "none" ] &&
-      printf '  b_%s -- claims --> p_%s\n' "$(gr_id "$wname")" "$(gr_id "$claim")"
-  done < <(git -C "$ROOT" for-each-ref --format='%(refname)' \
-    refs/remotes/origin 2>/dev/null)
+    while IFS=$'\t' read -r kind text; do
+      [ -n "$kind" ] || continue
+      bad=$((bad + 1))
+      if [ "$kind" = M ]; then
+        printf '  %s  (fix: ./joharness.sh curate --apply)\n' "$text"
+      else
+        printf '  %s\n' "$text"
+      fi
+    done < <(case "$held" in *" $(lint_stem "$rel") "*) ;;
+               *) curate_repairs "$rel" "$counts" "$regthr" ;; esac)
+    case "$held" in *" $(lint_stem "$rel") "*) continue ;; esac
+    if plan_core_only "$rel"; then
+      bad=$((bad + 1))
+      printf '  %s: scope: names core paths only (%s) — no session may build it; mark the issue for a human instead\n' \
+        "$(lint_stem "$rel")" "$(protocol_paths | paste -sd, - | sed 's/,/, /g')"
+    fi
+  done < <(plans_in_diff "$base")
+  if [ "$n" -eq 0 ]; then
+    printf '  no plan added on this branch\n'
+    return 0
+  fi
+  if [ "$bad" -eq 0 ]; then
+    printf '  %s plan(s) added, every declaration reads true\n' "$n"
+    return 0
+  fi
+  printf '\n  %s problem(s) in plans this branch adds.\n' "$bad"
+  return 1
+}
 
-  printf '```\n'
+# Branches carrying a `<prefix><key>` claim (default `rescope-`) with
+# `plan: none`, one row each: <branch> <key> <status> <pr> <session> <next>.
+# Tab is IFS whitespace, so `read` collapses an empty field: <pr> rides before
+# the optional ones and is never empty (`none` for none of `''`, `none`,
+# `NONE`, the hook's pr_num).
+dispatch_rescope_branches() {
+  local base_branch="${HANDOVER_BASE_BRANCH:-main}" pre="${1:-rescope-}"
+  local refs r name base wf files doc rws rkey rstat rsess rnext rpr
+  # Refs collected into a variable FIRST, then looped over a here-string.
+  refs="$(refs_unmerged "refs/remotes/origin/${base_branch}")"
+  while IFS= read -r r; do
+    [ -n "$r" ] || continue
+    name="${r#refs/remotes/origin/}"
+    { [ "$name" = "HEAD" ] || [ "$name" = "$base_branch" ]; } && continue
+    base="$(git -C "$ROOT" merge-base "$r" \
+      "refs/remotes/origin/${base_branch}" </dev/null 2>/dev/null)"
+    [ -n "$base" ] || continue
+    # Workstream files this branch ADDED against the base, read there.
+    files="$(git -C "$ROOT" diff --name-only --diff-filter=ACMRT "$base" "$r" \
+      -- docs/handover </dev/null 2>/dev/null | gr_docs)"
+    while IFS= read -r wf; do
+      [ -n "$wf" ] || continue
+      doc="$(git -C "$ROOT" show "${r}:${wf}" </dev/null 2>/dev/null)"
+      { read -r rws; read -r rkey; read -r rstat; read -r rsess; read -r rnext
+        read -r rpr; } \
+        <<<"$(printf '%s\n' "$doc" | gr_fields workstream plan status session next pr)"
+      case "$rws" in "$pre"*) ;; *) continue ;; esac
+      # `plan: none` is the identity: a rescope (or free) branch claims no plan.
+      [ "$rkey" = none ] || continue
+      rpr="${rpr#\#}"
+      case "$rpr" in '' | none | NONE) rpr=none ;; esac
+      # A tab inside a value is a field boundary to `read`: one in `status:`
+      # read `done<TAB>none` as done with no pr (verifier r11). Tabs become
+      # spaces, and an empty key is `?`, so no field shifts (r12).
+      rws="${rws#"$pre"}"
+      rws="${rws//$'\t'/ }"; rstat="${rstat//$'\t'/ }"; rpr="${rpr//$'\t'/ }"
+      rsess="${rsess//$'\t'/ }"; rnext="${rnext//$'\t'/ }"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$name" "${rws:-?}" "${rstat:-?}" "$rpr" "${rsess:-}" "${rnext:-}"
+    done <<<"$files"
+  done <<<"$refs"
+}
+
+# Done evidence for branch plans: `<commit>\t<commit time>\t<stem>` for every
+# commit that WROTE a `status: done` workstream file, reachable from any
+# origin ref but <own> and not from <since>. The writer, never the commit a
+# diff matched: `-m` re-shows an old line in every merge-up, and a retire
+# deletes one, each with its own (new) time (verifier r9-r11). So no merges,
+# `--full-history` to walk past them, and the file as the commit LEFT it.
+# Bounded by <since>, never by a merge count (cl_merged_claims).
+dispatch_done_evidence() {
+  local since="$1" own="$2" line h="" ht="" seen="" doc wplan wstat
+  while IFS= read -r line; do
+    case "$line" in
+      '') continue ;;
+      'C '*) read -r h ht <<<"${line#C }"; continue ;;
+    esac
+    [ -n "$h" ] || continue
+    case "$seen" in *" ${h}:${line} "*) continue ;; esac
+    seen="${seen} ${h}:${line} "
+    doc="$(git -C "$ROOT" show "${h}:${line}" </dev/null 2>/dev/null)" || continue
+    { read -r wplan; read -r wstat; } \
+      < <(printf '%s\n' "$doc" | gr_fields plan status)
+    [ "$wstat" = "done" ] || continue
+    wplan="$(lint_stem "$wplan" | tr -cd 'A-Za-z0-9._-')"
+    [ -z "$wplan" ] || [ "$wplan" = none ] ||
+      printf '%s\t%s\t%s\n' "$h" "$ht" "$wplan"
+  done < <(git -C "$ROOT" for-each-ref --format='%(refname)' refs/remotes/origin \
+      </dev/null 2>/dev/null |
+    awk -v own="$own" -v since="$since" '
+      $0 != own && $0 != "refs/remotes/origin/HEAD" { print }
+      END { print "^" since }' |
+    git -c core.quotePath=false -C "$ROOT" log --stdin --full-history \
+      --no-merges -G'^status:[[:space:]]*done' \
+      --name-only --format='C %H %ct' -- docs/handover 2>/dev/null)
+}
+
+# Does the done record <commit> wrote for <stem> still hold? Read at a ref's
+# tip: no workstream file naming <stem> = retired, holds; files naming it =
+# one must say `status: done` (a reopen, renamed or not, does not: r2, r12).
+# The base branch decides alone once it contains the record: the carrier's
+# own ref still says done after the base reopened it (r15). Otherwise any
+# origin ref but <own> that contains it. `plan:` is read by the one reader
+# (gr_fields, lint_stem), never a second pattern (r16, r17).
+dispatch_done_holds() {
+  local evh="$1" stem="$2" own="$3" over ref refs
+  over="refs/remotes/origin/${HANDOVER_BASE_BRANCH:-main}"
+  if git -C "$ROOT" merge-base --is-ancestor "$evh" "$over" </dev/null 2>/dev/null; then
+    refs="$over"
+  else
+    refs="$(git -C "$ROOT" for-each-ref --contains "$evh" --format='%(refname)' \
+      refs/remotes/origin </dev/null 2>/dev/null)"
+  fi
+  while IFS= read -r ref; do
+    [ -n "$ref" ] || continue
+    { [ "$ref" = "$own" ] || [ "$ref" = refs/remotes/origin/HEAD ]; } && continue
+    dispatch_tip_holds "$ref" "$stem" && return 0
+  done <<<"$refs"
+  return 1
+}
+
+# <ref> <stem>: the tip-read half of dispatch_done_holds.
+dispatch_tip_holds() {
+  local ref="$1" stem="$2" f doc wplan wstat named=0
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    doc="$(git -C "$ROOT" show "$f" </dev/null 2>/dev/null)" || continue
+    { read -r wplan; read -r wstat; } \
+      < <(printf '%s\n' "$doc" | gr_fields plan status)
+    [ "$(lint_stem "$wplan" | tr -cd 'A-Za-z0-9._-')" = "$stem" ] || continue
+    named=1
+    [ "$wstat" = "done" ] && return 0
+  done < <(git -c core.quotePath=false -C "$ROOT" grep -l -F -e "$stem" "$ref" \
+    -- docs/handover </dev/null 2>/dev/null)
+  [ "$named" -eq 0 ]
+}
+
+# Plans on a branch: a plan file an unmerged branch ADDED and the base does not
+# carry. One row per (branch, plan), six tab-separated fields:
+#   <kind> <branch> <stem> <urgency> <agent> <held days>
+# kind `leftover`: the base added and retired the path; `done`: DONE ON MAIN,
+# the stem retired elsewhere (the base's ledger, or a `status: done`
+# workstream file on any other ref); `live`: neither.
+# With <branch>, that branch alone, every plan it added (`free` reads it): its
+# own claimed plan and an abandoned branch's plans included.
+dispatch_branch_plans() {
+  local base_branch="${HANDOVER_BASE_BRANCH:-main}" only="${1:-}"
+  local refs r name base plans wfs wf doc own wplan wstat abandoned p stem urg agt retired rc
+  local addh addt abase kind days now ev evh evs ledger evcache=""
+  now="$(date +%s)"
+  refs="$(refs_unmerged "refs/remotes/origin/${base_branch}")"
+  while IFS= read -r r; do
+    [ -n "$r" ] || continue
+    name="${r#refs/remotes/origin/}"
+    { [ "$name" = "HEAD" ] || [ "$name" = "$base_branch" ]; } && continue
+    [ -z "$only" ] || [ "$name" = "$only" ] || continue
+    base="$(git -C "$ROOT" merge-base "$r" \
+      "refs/remotes/origin/${base_branch}" </dev/null 2>/dev/null)"
+    [ -n "$base" ] || continue
+    plans="$(git -c core.quotePath=false -C "$ROOT" diff --no-renames \
+      --name-only --diff-filter=A "$base" "$r" \
+      -- docs/plans </dev/null 2>/dev/null | gr_docs)"
+    [ -n "$plans" ] || continue
+    # The branch's own workstream files, the ones it introduced or changed.
+    own=" "; abandoned=0
+    wfs="$(git -c core.quotePath=false -C "$ROOT" diff --name-only \
+      --diff-filter=ACMRT "$base" "$r" \
+      -- docs/handover </dev/null 2>/dev/null | gr_docs)"
+    while IFS= read -r wf; do
+      [ -n "$wf" ] || continue
+      doc="$(git -C "$ROOT" show "${r}:${wf}" </dev/null 2>/dev/null)"
+      { read -r wplan; read -r wstat; } \
+        <<<"$(printf '%s\n' "$doc" | gr_fields plan status)"
+      [ "$wstat" = abandoned ] && abandoned=1
+      wplan="$(lint_stem "$wplan" | tr -cd 'A-Za-z0-9._-')"
+      [ -z "$wplan" ] || [ "$wplan" = none ] || own="${own}${wplan} "
+    done <<<"$wfs"
+    [ "$abandoned" -eq 0 ] || [ -n "$only" ] || continue
+    while IFS= read -r p; do
+      [ -n "$p" ] || continue
+      stem="$(lint_stem "$p" | tr -cd 'A-Za-z0-9._-')"
+      [ -n "$stem" ] || continue
+      [ -n "$only" ] || [ "${own#* "${stem}" }" = "$own" ] || continue
+      # Already on the base under the same path: the queue has its row.
+      git -C "$ROOT" cat-file -e "refs/remotes/origin/${base_branch}:${p}" \
+        </dev/null 2>/dev/null && continue
+      # Absent on the base, but the base ADDED and RETIRED it after this
+      # branch left it: carried by another branch. `--full-history -m` is what
+      # sees the retire (a merge commit is treesame for the path). A retire
+      # already in the merge base's history is an older plan of that name.
+      retired=0
+      while IFS= read -r rc; do
+        [ -n "$rc" ] || continue
+        git -C "$ROOT" merge-base --is-ancestor "$rc" "$base" \
+          </dev/null 2>/dev/null || { retired=1; break; }
+      done <<<"$(git -C "$ROOT" log --full-history -m --diff-filter=D \
+        --format=%H "refs/remotes/origin/${base_branch}" -- "$p" \
+        </dev/null 2>/dev/null)"
+      # The commit that ADDED the plan: the age reads from it, never from the
+      # tip (a branch merged up from the base after filing would under-read).
+      # The OLDEST add past the merge base: a delete-and-restore on the
+      # branch must not move the filing past a carrier's done record (r13).
+      read -r addh addt <<<"$(GIT_LITERAL_PATHSPECS=1 git -C "$ROOT" log \
+        --diff-filter=A --format='%H %ct' "$base..$r" -- "$p" </dev/null \
+        2>/dev/null | tail -n 1)"
+      [ -n "$addh" ] || { addh="$(git -C "$ROOT" rev-parse "$r" 2>/dev/null)"
+        addt="$(git -C "$ROOT" log -1 --format=%ct "$r" 2>/dev/null)"; }
+      days=$(( (now - ${addt:-$now}) / 86400 ))
+      [ "$days" -ge 0 ] || days=0
+      kind=live
+      if [ "$retired" -eq 1 ]; then
+        kind=leftover
+      else
+        # DONE ON MAIN. Evidence is bounded by where the plan's own history
+        # left the base: anything reachable from there is an older plan that
+        # reused the stem. The add commit's merge base, not the tip's, so a
+        # branch merged up from the base after a carry still reads it.
+        abase="$(git -C "$ROOT" merge-base "$addh" \
+          "refs/remotes/origin/${base_branch}" </dev/null 2>/dev/null)"
+        abase="${abase:-$base}"
+        # The ledger as `ci` reads it (lint_plans_in_diff): a listed stem
+        # stays retired whoever re-adds it, so its row is done, not live.
+        ledger="$(git -C "$ROOT" show \
+          "refs/remotes/origin/${base_branch}:docs/plans/RETIRED.md" \
+          </dev/null 2>/dev/null | retired_ref "$stem")"
+        if [ -n "$ledger" ]; then
+          kind="done"
+        else
+          # One walk per (since, own) pair, cached across this branch's plans.
+          case "$evcache" in
+            *"<${abase} ${r}>"*) ;;
+            *) evcache="<${abase} ${r}>"
+               evs="$(dispatch_done_evidence "$abase" "$r")" ;;
+          esac
+          while IFS=$'\t' read -r evh evt ev; do
+            [ "$ev" = "$stem" ] || continue
+            # Written before the plan was filed: an older plan of that name,
+            # on whatever ref it sits (an unmerged branch is never in the
+            # merge base, however old).
+            [ "${evt:-0}" -ge "${addt:-0}" ] || continue
+            # The row branch's own history before the plan landed: older.
+            git -C "$ROOT" merge-base --is-ancestor "$evh" "$addh" \
+              </dev/null 2>/dev/null && continue
+            dispatch_done_holds "$evh" "$stem" "$r" || continue
+            kind="done"; break
+          done <<<"$evs"
+        fi
+      fi
+      { read -r urg; read -r agt; } <<<"$(git -C "$ROOT" show "${r}:${p}" \
+        </dev/null 2>/dev/null | gr_fields urgency agent)"
+      urg="$(printf '%s' "$urg" | tr -cd 'A-Za-z0-9._-')"
+      agt="$(printf '%s' "$agt" | tr -cd 'A-Za-z0-9._-')"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$kind" \
+        "$(printf '%s' "$name" | tr -cd 'A-Za-z0-9._/-')" \
+        "$stem" "${urg:-?}" "${agt:-?}" "$days"
+    done <<<"$plans"
+  done <<<"$refs"
+}
+
+# Did <ref> ADD a `free-*` workstream file since it left the base? Its
+# retire commit may have deleted it since: the add still says whose it is.
+# The claim's identity is its content, as dispatch_rescope_branches reads it
+# (`workstream: free-*`, `plan: none`), never its path: a plan named free-x
+# has a builder file of that name. Read at the commit that added it. A
+# branch whose claim is retired and whose last push is past
+# HANDOVER_STALE_SECONDS is no freer: its session is gone, its pull request
+# never opened or was closed, and nothing else can release it.
+free_claimed_ever() {
+  local base line h="" doc ws wp age
+  base="$(git -C "$ROOT" merge-base "$1" \
+    "refs/remotes/origin/${HANDOVER_BASE_BRANCH:-main}" </dev/null 2>/dev/null)" || return 1
+  [ -n "$base" ] || return 1
+  while IFS= read -r line; do
+    case "$line" in
+      '') continue ;;
+      'C '*) h="${line#C }"; continue ;;
+      docs/handover/free-*) ;;
+      *) continue ;;
+    esac
+    doc="$(git -C "$ROOT" show "${h}:${line}" </dev/null 2>/dev/null)" || continue
+    { read -r ws; read -r wp; } <<<"$(printf '%s\n' "$doc" | gr_fields workstream plan)"
+    case "$ws" in free-?*) ;; *) continue ;; esac
+    [ "$wp" = none ] || continue
+    if ! git -C "$ROOT" cat-file -e "${1}:${line}" 2>/dev/null; then
+      age="$(dispatch_age_min "${1#refs/remotes/origin/}")"
+      [ -z "$age" ] ||
+        [ $((age * 60)) -lt "$(num_knob HANDOVER_STALE_SECONDS)" ] || continue
+    fi
+    return 0
+  done < <(git -c core.quotePath=false -C "$ROOT" log --no-renames --diff-filter=A \
+    --name-only --format='C %H' "${base}..$1" -- docs/handover </dev/null 2>/dev/null)
+  return 1
+}
+
+# FREEABLE (`free <branch>`, #423): an unmerged branch whose every path is
+# under the harness's doc trees (free_path_ok) and no `free-*` claim covers.
+# One row per branch, tab-separated: <kind> <branch> <plans> <pushed min>.
+#   kind `plans`: its rows in <branch-plan rows> (dispatch_branch_plans) all
+#     live or done, none leftover, last push older than HANDOVER_STALE_SECONDS;
+#   kind `done`: every path a workstream file reading `status: done` with no
+#     pr: and a `plan:` (a manager's "found it done"), no plan added. No age
+#     wait: its own status says the session ended. `plan: none` is a role's
+#     record (a surveyor's "holds genuine" stays unmerged by design): never.
+# Never freeable: a free manager's own branch (free_claimed_ever); a branch
+# whose workstream file a human or a pull request holds (free_owner_held); an
+# owner a live `free-<key>` claim covers, or whose tip a free manager's live
+# branch already contains (a free past its retire commit, `free` or a hand
+# merge alike). A released (`abandoned`) free claim lends none of that: its
+# owner is offered again.
+dispatch_freeable() {
+  local base_branch="${HANDOVER_BASE_BRANCH:-main}" bprows="$1"
+  local refs r name base paths p ok wonly doc st pr ws wp claimed="" n_rows age stale_s cb ck cs
+  local gone=" " freers=""
+  stale_s="$(num_knob HANDOVER_STALE_SECONDS)"
+  # Keys a live free claim covers: a second manager onto the same owner is
+  # two merges of one branch.
+  while IFS=$'\t' read -r cb ck cs _; do
+    [ -n "$cb" ] || continue
+    # A released claim holds nothing, its merge included. A done one
+    # holds no key; its merge, if pushed, still holds the owner below.
+    case "$cs" in
+      abandoned) gone="${gone}${cb} "; continue ;;
+      done) continue ;;
+    esac
+    claimed="${claimed} ${ck} "
+  done < <(dispatch_rescope_branches free-)
+  refs="$(git -C "$ROOT" for-each-ref --format='%(refname)' \
+    refs/remotes/origin </dev/null 2>/dev/null)"
+  # Free managers' branches: live, unmerged, unreleased, and ADDED a
+  # `free-*` claim since the base (it may since have retired it). Only these
+  # hold an owner, by ancestry, however the merge was made: a branch merely
+  # cut from the owner, or a copy of it, never claimed a free.
+  while IFS= read -r r; do
+    [ -n "$r" ] || continue
+    name="${r#refs/remotes/origin/}"
+    { [ "$name" = "HEAD" ] || [ "$name" = "$base_branch" ]; } && continue
+    [ "${gone#* "${name}" }" = "$gone" ] || continue
+    free_claimed_ever "$r" && freers="${freers}${r}"$'\n'
+  done <<<"$refs"
+  # Unmerged into the base AND into every free manager's branch (a flag per
+  # freer; they AND together). An owner a free manager already merged drops
+  # out here, as does the freer itself.
+  local -a gate=("refs/remotes/origin/${base_branch}")
+  while IFS= read -r r; do
+    [ -n "$r" ] && gate+=("$r")
+  done <<<"$freers"
+  refs="$(refs_unmerged "${gate[@]}")"
+  while IFS= read -r r; do
+    [ -n "$r" ] || continue
+    name="${r#refs/remotes/origin/}"
+    { [ "$name" = "HEAD" ] || [ "$name" = "$base_branch" ]; } && continue
+    # The same charset dispatch_branch_plans prints: one name for both reads.
+    [ "$(printf '%s' "$name" | tr -cd 'A-Za-z0-9._/-')" = "$name" ] || continue
+    case "$claimed" in *" $(free_key "$name") "*) continue ;; esac
+    base="$(git -C "$ROOT" merge-base "$r" \
+      "refs/remotes/origin/${base_branch}" </dev/null 2>/dev/null)"
+    [ -n "$base" ] || continue
+    paths="$(git -c core.quotePath=false -C "$ROOT" diff --no-renames \
+      --name-only "$base" "$r" </dev/null 2>/dev/null)"
+    [ -n "$paths" ] || continue
+    # A free manager's own branch, or an owner one already merged.
+    case "$freers" in *"${r}"$'\n'*) continue ;; esac
+    free_owner_held "$r" "$base" >/dev/null && continue
+    ok=1; wonly=1
+    while IFS= read -r p; do
+      [ -n "$p" ] || continue
+      free_path_ok "$p" || { ok=0; break; }
+      case "$p" in
+        docs/handover/*)
+          doc="$(git -C "$ROOT" show "${r}:${p}" </dev/null 2>/dev/null)" || { wonly=0; continue; }
+          { read -r ws; read -r st; read -r pr; read -r wp; } \
+            <<<"$(printf '%s\n' "$doc" | gr_fields workstream status pr plan)"
+          # A free manager's own branch.
+          case "$ws" in free-*) ok=0; break ;; esac
+          [ "$st" = "done" ] || wonly=0
+          case "$wp" in '' | none) wonly=0 ;; esac
+          case "$pr" in '' | none) ;; *) wonly=0 ;; esac ;;
+        *) wonly=0 ;;
+      esac
+    done <<<"$paths"
+    [ "$ok" -eq 1 ] || continue
+    age="$(dispatch_age_min "$name")"
+    if [ "$wonly" -eq 1 ]; then
+      printf 'done\t%s\t0\t%s\n' "$name" "${age:-?}"
+      continue
+    fi
+    n_rows="$(printf '%s\n' "$bprows" | awk -F'\t' -v b="$name" '$2 == b { n++ } END { print n + 0 }')"
+    [ "$n_rows" -gt 0 ] || continue
+    printf '%s\n' "$bprows" |
+      awk -F'\t' -v b="$name" '$2 == b && $1 == "leftover" { f = 1 } END { exit !f }' && continue
+    { [ -n "$age" ] && [ $((age * 60)) -ge "$stale_s" ]; } || continue
+    printf 'plans\t%s\t%s\t%s\n' "$name" "$n_rows" "$age"
+  done <<<"$refs"
+}
+
+dispatch_rescope_merged() {
+  local base_branch="${HANDOVER_BASE_BRANCH:-main}"
+  local line h="" seen="" doc rws rplan rstat
+  while IFS= read -r line; do
+    case "$line" in
+      '') continue ;;
+      'C '*) h="${line#C }"; continue ;;
+    esac
+    [ -n "$h" ] || continue
+    # `-m` lists a merge once per parent: one row per (commit, file).
+    case "$seen" in *" ${h}:${line} "*) continue ;; esac
+    seen="${seen} ${h}:${line} "
+    doc="$(git -C "$ROOT" show "${h}^1:${line}" </dev/null 2>/dev/null ||
+      git -C "$ROOT" show "${h}^2:${line}" </dev/null 2>/dev/null)" || continue
+    rws=""; rplan=""; rstat=""
+    { read -r rws; read -r rplan; read -r rstat; } \
+      < <(printf '%s\n' "$doc" | gr_fields workstream plan status)
+    case "$rws" in rescope-?*) ;; *) continue ;; esac
+    [ "$rplan" = none ] || continue
+    [ "$rstat" = "done" ] || continue
+    printf '%s\t%s\n' "$h" "${rws#rescope-}"
+  done < <(GIT_LITERAL_PATHSPECS=0 GIT_NOGLOB_PATHSPECS=0 git -C "$ROOT" log \
+    --full-history -m --diff-filter=D --name-only --format='C %H' \
+    "refs/remotes/origin/${base_branch}" -- 'docs/handover/rescope-*' \
+    </dev/null 2>/dev/null)
+}
+
+# Does a rescope record on key <K> cover the current key <C>?
+dispatch_rescope_covers() {
+  local k="+$1+" h
+  [ -n "$2" ] || return 1
+  while IFS= read -r h; do
+    [ -n "$h" ] || continue
+    case "$k" in *"+${h}+"*) ;; *) return 1 ;; esac
+  done < <(printf '%s\n' "$2" | tr '+' '\n')
+  return 0
+}
+
+# The closed list of reasons a `status: blocked` may name: `next:` opens with
+# `<reason>:`. One copy; dispatch is the only reader.
+block_reason_ok() {
+  local t="${1#[\"\']}"
+  case "$t" in
+    "money:"* | "credentials:"* | "product:"* | "interface:"* | "core path:"* | \
+    "conflict:"* | "hardware:"* | "github:"* | "stalled:"* | "respawns:"*) return 0 ;;
+  esac
+  return 1
+}
+
+cmd_dispatch() {
+  local cap stall health passes respawn churnt churnl hout qout rows wavemap edge req sup
+  local path label branch ws doc status session next age agetext flag tier
+  local pr hours cage_min n_ceiling=0
+  local base commits churn churn_n churn_f marks rounds work
+  local st wave note hold holdmap hold_live hline hb hs holds_n blocked_claims=""
+  local ebranch eitem efirst estem espaces emore epath eage eagetext
+  local edge_rows="" edge_items="" edge_unver=""
+  local gh_head gh_base n_inflight=0 n_slots n_free=0 n_stall=0 n_blocked=0 n_hold=0 n_wait=0 n_loop=0
+  local pending pending_used
+  local n_edge=0 n_edge_stall=0 n_leftover=0 n_leftover_noitem=0
+  local leftover_rows="" estate="" fleet_age stall_young=""
+  local curate_due=0 curate_inflight="" n_curate_inflight=0 cdue cstate creason
+  local jcands cjudge n_roles role_slots
+  local scout_inflight="" n_scout=0 sstate sreason sb sw ss spend
+  local clerk_due=0 clerk_inflight="" n_clerk=0 kdue kstate kreason kb kw ks
+  local conduct_due=0 role_spawned=0 n_conduct=0 odue ostate oreason ob oa conduct_inflight=""
+  local fetch_failed=0
+  local cb ck cstat csess cnext cage bplans
+  local rescope_key="" rescope_paths="" rescope_inflight="" rescope_holders=""
+  local n_rescope_inflight=0 n_rescope_holders=0 rescope_settled=0
+  local rescope_held="" rescope_merged="" msha mkey mheld mchanged
+  local rb rk rstat rsess rnext rage rpr rfin
+  local bprows freeable="" fkind fb fn fage n_freeable=0
+  local DISPATCH_WITHHELD=
+  local inflight="" free="" questions=""
+
+  cap="$(num_knob JOHARNESS_MAX_MANAGERS)"
+  stall="$(num_knob JOHARNESS_STALL_MINUTES)"
+  health="$(num_knob JOHARNESS_HEALTH_MINUTES)"
+  passes="$(num_knob JOHARNESS_ORCHESTRATOR_PASSES)"
+  respawn="$(num_knob JOHARNESS_RESPAWN_LIMIT)"
+  hours="$(num_knob JOHARNESS_MANAGER_HOURS)"
+  # ci's two tiers, kept and read the same way ci reads them: from the
+  # threshold a warning the session judges, from the limit (default twice that)
+  # no longer a call.
+  churnt="$(num_knob JOHARNESS_CHURN_THRESHOLD)"
+  churnl="$(num_knob JOHARNESS_CHURN_LIMIT $((churnt * 2)))"
+
+  printf '== dispatch\n\n'
+  # A long-lived reader.
+  [ "${DISPATCH_FETCH:-1}" != 0 ] || fetch_failed=1
+  # A single-branch or depth-1 clone fetches `refs/heads/main` alone: the fetch
+  # succeeds and no scout branch is ever seen (pass 6).
+  case "$(git -C "$ROOT" config --get-all remote.origin.fetch 2>/dev/null)" in
+    *'refs/heads/*:'*) ;;
+    *) fetch_failed=1 ;;
+  esac
+  if [ "${DISPATCH_FETCH:-1}" != 0 ]; then
+    if [ "$(git -C "$ROOT" rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
+      timeout 60 git -C "$ROOT" fetch -q --prune --unshallow origin 2>/dev/null ||
+        git -C "$ROOT" fetch -q --prune origin 2>/dev/null ||
+        { warn "fetch failed; push ages below are from the last fetch"; fetch_failed=1; }
+    else
+      git -C "$ROOT" fetch -q --prune origin 2>/dev/null ||
+        { warn "fetch failed; push ages below are from the last fetch"; fetch_failed=1; }
+    fi
+  fi
+  printf 'cap       : %s manager(s) at once (JOHARNESS_MAX_MANAGERS)\n' "$cap"
+  printf 'stall     : %s min without a push = cross-check the control plane (JOHARNESS_STALL_MINUTES)\n' "$stall"
+  printf 'health    : one pass every %s min (JOHARNESS_HEALTH_MINUTES)\n' "$health"
+  # Lifted like the ceiling: 0 would otherwise hand off on every pass.
+  if [ "$passes" -gt 0 ]; then
+    printf 'passes    : %s per orchestrator session (JOHARNESS_ORCHESTRATOR_PASSES)\n' "$passes"
+  else
+    printf 'passes    : lifted, one session carries every pass (JOHARNESS_ORCHESTRATOR_PASSES=0)\n'
+  fi
+  printf 'respawns  : %s per item per run (JOHARNESS_RESPAWN_LIMIT)\n' "$respawn"
+  # Lifted, the line names no mark: `grep CEILING?` over a lifted pass is 0.
+  if [ "$hours" -gt 0 ]; then
+    printf 'ceiling   : %sh since the claim with no pr: = CEILING? (JOHARNESS_MANAGER_HOURS; 0 lifts it)\n' "$hours"
+  else
+    printf 'ceiling   : lifted, no time against a claim (JOHARNESS_MANAGER_HOURS=0)\n'
+  fi
+  printf 'loop      : one file rewritten %s+ times on a branch = LOOP? (JOHARNESS_CHURN_LIMIT; 0 lifts it); %s+ = a warning on the work line (JOHARNESS_CHURN_THRESHOLD)\n' "$churnl" "$churnt"
+  # The curate cycle's standing state.
+  cdue="$(dispatch_curate_due)"
+  cstate="${cdue%% *}"; creason="${cdue#* }"
+  if [ "$cstate" = due ]; then
+    while IFS=$'\t' read -r cb ck cstat csess cnext; do
+      [ -n "$cb" ] || continue
+      cage="$(dispatch_age_text "$(dispatch_age_min "$cb" </dev/null)")"
+      n_curate_inflight=$((n_curate_inflight + 1))
+      curate_inflight="${curate_inflight}            ${cb}  curate-${ck}  ${cstat}  pushed ${cage}\n"
+      [ -z "$csess" ] || curate_inflight="${curate_inflight}              session: ${csess}\n"
+      [ -z "$cnext" ] || curate_inflight="${curate_inflight}              next: ${cnext}\n"
+    done < <(dispatch_curate_branches)
+  fi
+  if [ "$cstate" = unreadable ]; then
+    printf 'curate    : UNREADABLE — %s\n' "$creason"
+  elif [ "$cstate" = off ]; then
+    printf 'curate    : off — %s\n' "$creason"
+  elif [ "$n_curate_inflight" -gt 0 ]; then
+    printf 'curate    : IN FLIGHT, so none is due. What made it due: %s\n' "$creason"
+    printf '%b' "$curate_inflight"
+  elif [ "$cstate" = due ]; then
+    # A session only for what needs judgement (decompose, order, declutter,
+    # a repair no script can make); mechanical repairs are `curate --apply`.
+    cjudge="$(cmd_curate 2>/dev/null | sed -n 's/^judgement : //p')"
+    case "$cjudge" in '' | *[!0-9]*) cjudge=1 ;; esac
+    curate_due=1
+    [ "$cjudge" -gt 0 ] || curate_due=2
+    printf 'curate    : DUE — %s\n' "$creason"
+  else
+    printf 'curate    : not due — %s\n' "$creason"
+  fi
+  # Stale claims with no pr: — no session, the orchestrator proves each
+  # session gone and runs the release itself. Silent when there are none.
+  jcands="$(janitor_candidates | cut -f1 | sort -u | tr '\n' ' ')"
+  jcands="${jcands% }"
+  if [ -n "$jcands" ]; then
+    printf 'janitor   : stale claim(s) on %s — check each session; ARCHIVED or not found: run ./joharness.sh janitor --apply <branch>...' "$jcands"
+    [ "$fetch_failed" -eq 0 ] ||
+      printf ' (or this clone is stale: fetch failed, DISPATCH_FETCH=0, or a remote.origin.fetch that does not reach refs/heads/*)'
+    printf '\n'
+  fi
+  # The clerk cycle, one reader (clerk_due) shared with `clerk`.
+  clerk_due
+  kdue="$CLERK_DUE"
+  kstate="${kdue%% *}"; kreason="${kdue#* }"
+  if [ "$kstate" = unreadable ]; then
+    printf 'clerk     : UNREADABLE — %s\n' "$kreason"
+  elif [ "$kstate" = off ]; then
+    printf 'clerk     : off — %s\n' "$kreason"
+  else
+    # Counted whatever the clock reads: a clerk in flight holds a slot
+    # whether or not its cadence is due.
+    while IFS=$'\t' read -r kb kw ks; do
+      [ -n "$kb" ] || continue
+      n_clerk=$((n_clerk + 1))
+      clerk_inflight="${clerk_inflight}            ${kb}  ${kw}  ${ks}\n"
+    done < <(printf '%s\n' "$CLERK_ROWS" | scout_branches)
+    if [ "$n_clerk" -gt 0 ]; then
+      printf 'clerk     : IN FLIGHT, so none is due. Clock: %s %s\n' "$kstate" "$kreason"
+      printf '%b' "$clerk_inflight"
+    elif [ "$kstate" = due ]; then
+      clerk_due=1
+      printf 'clerk     : DUE — %s\n' "$kreason"
+    else
+      printf 'clerk     : not due — %s\n' "$kreason"
+    fi
+  fi
+  # The third cycle, the same reader (scout_state) `scout` asks. No clock:
+  # the orchestrator spawns on the reviewer's order or a waiting scout issue.
+  scout_state
+  sstate="${SCOUT_STATE%% *}"; sreason="${SCOUT_STATE#* }"
+  # Read here: `pending` is parsed further down. Not a number = none.
+  spend="${JOHARNESS_PENDING_SPAWNS:-0}"
+  case "$spend" in '' | *[!0-9]*) spend=0 ;; esac
+  spend="${spend#"${spend%%[!0]*}"}"
+  while IFS=$'\t' read -r sb sw ss; do
+    [ -n "$sb" ] || continue
+    n_scout=$((n_scout + 1))
+    scout_inflight="${scout_inflight}            ${sb}  ${sw}  ${ss}\n"
+  done < <(printf '%s\n' "$SCOUT_ROWS" | scout_branches)
+  if [ "$sstate" = unreadable ]; then
+    printf 'scout     : UNREADABLE — %s: spawn none\n' "$sreason"
+  elif [ "$sstate" = off ]; then
+    printf 'scout     : off — %s\n' "$sreason"
+  elif [ "$n_scout" -gt 0 ]; then
+    printf 'scout     : IN FLIGHT — spawn none\n%b' "$scout_inflight"
+  elif [ "$cap" -eq 0 ]; then
+    printf 'scout     : held — JOHARNESS_MAX_MANAGERS=0 is the human'"'"'s pause: spawn none\n'
+  elif [ -n "$spend" ]; then
+    printf 'scout     : held — %s spawned this pass has not pushed (JOHARNESS_PENDING_SPAWNS), and it may be a scout: spawn none this pass\n' "$spend"
+  elif [ "$fetch_failed" -eq 1 ]; then
+    printf 'scout     : held — no fresh view of every branch this pass (fetch failed, DISPATCH_FETCH=0, or a remote.origin.fetch that does not reach refs/heads/*), so a scout in flight might not show: spawn none this pass\n'
+  else
+    printf 'scout     : none in flight — on the reviewer'"'"'s order or a scout issue waiting on the scout (orchestrate.md) spawn ONE (agent: fable) on /scout, beyond the cap\n'
+  fi
+  # The fourth cycle, the same reader (conduct_due) `conduct` asks.
+  conduct_due
+  odue="$CONDUCT_DUE"
+  ostate="${odue%% *}"; oreason="${odue#* }"
+  while IFS=$'\t' read -r ob oa; do
+    [ -n "$ob" ] || continue
+    n_conduct=$((n_conduct + 1))
+    conduct_inflight="${conduct_inflight}            ${ob}  pushed ${oa} ago\n"
+  done <<<"$CONDUCT_ROWS"
+  if [ "$ostate" = unreadable ]; then
+    printf 'conduct   : UNREADABLE — %s\n' "$oreason"
+  elif [ "$ostate" = off ]; then
+    printf 'conduct   : off — %s\n' "$oreason"
+  elif [ "$n_conduct" -gt 0 ]; then
+    printf 'conduct   : IN FLIGHT, so none is due. Clock: %s %s\n' "$ostate" "$oreason"
+    printf '%b' "$conduct_inflight"
+  elif [ "$ostate" = due ]; then
+    conduct_due=1
+    printf 'conduct   : DUE — %s\n' "$oreason"
+  elif [ "$ostate" = empty ]; then
+    conduct_due=2
+    printf 'conduct   : due, nothing to sample — %s\n' "$oreason"
+  else
+    printf 'conduct   : not due — %s\n' "$oreason"
+  fi
+  printf '\n'
+
+  # --- edges past the retire commit: a slot committed, no claim to read ----
+  # Counted into n_inflight, so the slot shrinks.
+  while IFS=$'\t' read -r ebranch eitem estate; do
+    [ -n "$ebranch" ] || continue
+    # The scan's own caveat, carried as a row because status cannot leave a
+    # command substitution.
+    if [ "$ebranch" = '..unverified' ]; then edge_unver="$eitem"; continue; fi
+    [ "$eitem" != "-" ] || eitem=""
+    eage="$(dispatch_age_min "$ebranch")"
+    eagetext="$(dispatch_age_text "$eage")"
+    # First item names the row; the rest ride behind it, because one branch
+    # is one slot however many items it finished.
+    efirst="${eitem%% *}"
+    # A row whose item is gone from the base branch committed nothing: the
+    # merge it was mid-way through has already happened.
+    if [ "$estate" = leftover ]; then
+      n_leftover=$((n_leftover + 1))
+      espaces="${eitem//[! ]/}"
+      emore=$(( ${#espaces} + 1 ))
+      leftover_rows="${leftover_rows}  ${efirst}  ${ebranch}  leftover  pushed ${eagetext}  its item is gone from ${HANDOVER_BASE_BRANCH:-main}, so that merge already happened, by this branch or another: it commits NOTHING and holds no slot. Never respawn on it — there is nothing to finish. The human deletes the branch."
+      [ "$emore" -le 1 ] ||
+        leftover_rows="${leftover_rows} (and $((emore - 1)) more item(s), gone too: ${eitem#* })"
+      leftover_rows="${leftover_rows}"$'\n'
+      continue
+    fi
+    # No item at all, so the question cannot be asked.
+    if [ "$estate" = unknown ] && [ -n "$eage" ] &&
+       [ "$eage" -ge $((stall * 24)) ]; then
+      n_leftover=$((n_leftover + 1))
+      n_leftover_noitem=$((n_leftover_noitem + 1))
+      leftover_rows="${leftover_rows}  ?  ${ebranch}  leftover  pushed ${eagetext}  names NO item, so nothing here says a merge is coming, and it has not pushed in ${eagetext} (>= $((stall * 24))m): nothing to look up, nothing to cross-check, so it holds no slot. REPORT it — the human deletes the branch or finishes it by hand."$'\n'
+      continue
+    fi
+    n_inflight=$((n_inflight + 1))
+    n_edge=$((n_edge + 1))
+    # Word count without splitting: the spaces left when everything else is
+    # stripped, plus one.
+    espaces="${eitem//[! ]/}"
+    if [ -z "$eitem" ]; then emore=0; else emore=$(( ${#espaces} + 1 )); fi
+    edge_rows="${edge_rows}  ${efirst:-?}  ${ebranch}  retired  pushed ${eagetext}  retired, no claim file — a pull request is expected; this reader does not read pull request state — the health pass does: step 7 retired the workstream file before the pull request opened, so this branch commits a slot and names no owner"
+    [ "$emore" -le 1 ] ||
+      edge_rows="${edge_rows} (and $((emore - 1)) more item(s) retired here: ${eitem#* })"
+    edge_rows="${edge_rows}"$'\n'
+    # A genuinely abandoned branch has already been separated out above, and
+    # the difference IS in git — the item's presence on the base branch, not
+    # push age.
+    if [ -z "$eage" ]; then
+      edge_rows="${edge_rows}    push age unknown: ref not here — fetch, then cross-check the control plane"$'\n'
+    elif [ "$eage" -ge "$stall" ]; then
+      # The SAME count the claimed rows feed.
+      n_stall=$((n_stall + 1))
+      n_edge_stall=$((n_edge_stall + 1))
+      [ -n "$stall_young" ] && [ "$stall_young" -le "$eage" ] || stall_young="$eage"
+      estem="${efirst##*/}"; estem="${estem%.md}"
+      if [ -n "$efirst" ]; then
+        edge_rows="${edge_rows}    STALL? no push for ${eagetext} (>= ${stall}m): cross-check the control plane by TITLE (manager: ${estem}) — this row carries no session line to read; the verdict is the health table's (.claude/commands/orchestrate.md, step 2), never this row's"$'\n'
+      else
+        # No item, no title to look up, so no respawn: a successor spawned
+        # blind onto a branch nobody can name is two sessions on one branch.
+        edge_rows="${edge_rows}    STALL? no push for ${eagetext} (>= ${stall}m): this row names no item, so there is no title to look up and no successor to spawn. REPORT it to the human — merging or retiring that branch is what frees the slot"$'\n'
+      fi
+    fi
+    # `<item>@<branch>`, because the hook holds this item's peers off its
+    # paths and the hold line has to name the branch they are waiting on.
+    if [ -n "$eitem" ]; then
+      for epath in $eitem; do
+        edge_items="${edge_items} ${epath}@${ebranch} "
+      done
+    fi
+  done <<<"$(dispatch_retired_edges)"
+
+  # One walk of every unmerged ref, read three times below.
+  bprows="$(dispatch_branch_plans)"
+  # A plan another branch carried to the base and retired: this branch's copy
+  # is a leftover, not a plan waiting to land (dispatch_branch_plans).
+  while IFS=$'\t' read -r _ ebranch estem _; do
+    [ -n "$ebranch" ] || continue
+    # One row per branch: a second carried plan, or a branch the edge reader
+    # already listed, is not another leftover.
+    case "$leftover_rows" in *"  ${ebranch}  leftover  "*) continue ;; esac
+    n_leftover=$((n_leftover + 1))
+    leftover_rows="${leftover_rows}  docs/plans/${estem}.md  ${ebranch}  leftover  its plan ${estem} landed and was retired by another branch: it commits NOTHING and holds no slot. Never respawn on it. The human closes its pull request and deletes the branch."$'\n'
+  done <<<"$(printf '%s\n' "$bprows" | awk -F'\t' '$1 == "leftover"')"
+
+  DISPATCH_WITHHELD="$edge_items"
+
+  hout="$(drain_hook handover-context.sh)"
+  qout="$(drain_hook queue-context.sh)"
+
+  # Every plan, research and requirement row as path|label, every row. A
+  # requirement row matters here only CLAIMED — it is the planning manager's
+  # in-flight row; unclaimed, `drain_requirement` offers it, never the free
+  # walk below.
+  rows="$(printf '%s\n' "$qout" |
+    sed -n 's#^  \(docs/\(plans\|research\|product\)/[^ ]*\.md\)  \(\[.*\]\)$#\1|\3#p')"
+  wavemap="$(printf '%s\n' "$qout" | dispatch_waves)"
+  # The hook's orchestrated-only lines: a free plan whose scope overlaps a
+  # plan a manager holds now. Stem, then the rest of the line as the reason.
+  holdmap="$(printf '%s\n' "$qout" |
+    sed -n 's/^  in flight: \([^ ]*\) overlaps \(.*\)$/\1\t\2/p' |
+    sed 's/(claimed on origin\//(claimed on /')"
+
+  while IFS='|' read -r path label; do
+    [ -n "$path" ] || continue
+    case "$label" in *'claimed on '*) ;; *) continue ;; esac
+    branch="${label##*claimed on }"; branch="${branch%%,*}"; branch="${branch%%]*}"
+    # Bare, the way a successor is spawned onto it; the hook says origin/.
+    branch="${branch#origin/}"
+    ws="$(printf '%s\n' "$hout" |
+      sed -n "s#^  origin/${branch}: \(docs/handover/[^ ]*\.md\)\$#\1#p" | head -1)"
+    status=""; session=""; next=""; doc=""; pr=""
+    if [ -n "$ws" ]; then
+      doc="$(git -C "$ROOT" show "origin/${branch}:${ws}" 2>/dev/null)"
+      { read -r status; read -r session; read -r next; read -r pr; } \
+        <<<"$(printf '%s\n' "$doc" | gr_fields status session next pr)"
+    fi
+    # Branch-controlled text, tested below: the charset cmd_janitor keeps.
+    pr="$(printf '%s' "$pr" | tr -cd 'A-Za-z0-9._#-')"
+    # A workstream file on another branch is repo-controlled input, and the
+    # orchestrator branches on the ROW this builds.
+    case "$status" in
+      in-progress | blocked | review | done | abandoned | '') ;;
+      *) status="unreadable" ;;
+    esac
+    age="$(dispatch_age_min "$branch")"
+    agetext="$(dispatch_age_text "$age")"
+    # Progress, from git: commits since the branch left the base, the most
+    # rewritten file, findings recorded.
+    work=""; churn_n=0
+    base="$(git -C "$ROOT" merge-base "refs/remotes/origin/${branch}" \
+      "origin/${HANDOVER_BASE_BRANCH:-main}" 2>/dev/null)"
+    if [ -n "$base" ]; then
+      commits="$(git -C "$ROOT" rev-list --count --no-merges \
+        "${base}..refs/remotes/origin/${branch}" 2>/dev/null)"
+      churn="$(churn_top "refs/remotes/origin/${branch}" 2>/dev/null)" || churn=""
+      churn_n="${churn%%	*}"; churn_f="${churn#*	}"
+      case "$churn_n" in '' | *[!0-9]*) churn_n=0 ;; esac
+      rounds=0
+      if [ -n "$doc" ]; then
+        marks="$(printf '%s\n' "$doc" | review_marks)"; rounds="${marks%% *}"
+      fi
+      work="    work: ${commits:-0} commit(s) since ${HANDOVER_BASE_BRANCH:-main}"
+      [ "$churn_n" -eq 0 ] || work="${work}, churn ${churn_n} on ${churn_f}"
+      [ "$churn_n" -lt "$churnt" ] || work="${work} (>= ${churnt}: past ci's warning, watch next:)"
+      work="${work}, ${rounds:-0} finding(s) recorded"
+    fi
+    flag=""
+    n_inflight=$((n_inflight + 1))
+    if [ "$status" = "blocked" ]; then
+      # Handed off to a human.
+      n_blocked=$((n_blocked + 1))
+      # The CLAIM, not the branch: one branch can carry two workstream files,
+      # and a blocked claim on one must not speak for a live claim on the
+      # other.
+      blocked_claims="${blocked_claims} $(basename "$path" .md)@${branch} "
+      flag="  BLOCKED: the human's, holds no slot"
+      block_reason_ok "$next" ||
+        flag="${flag}  INVALID BLOCK? next: opens with no reason word (manage.md §3): ask, order nothing"
+      # How long it has stood.
+      bage="$(dispatch_block_age_min "$branch" "$ws" "$base")"
+      if [ -n "$bage" ]; then
+        flag="${flag}, parked $(dispatch_age_text "$bage") ago"
+      else
+        flag="${flag}, parked for an unknown time: the commit that parked it is not in this clone's history"
+      fi
+    elif [ -z "$age" ]; then
+      flag="  push age unknown: ref not here — fetch, then cross-check"
+    elif [ "$age" -ge "$stall" ]; then
+      n_stall=$((n_stall + 1))
+      [ -n "$stall_young" ] && [ "$stall_young" -le "$age" ] || stall_young="$age"
+      flag="  STALL? no push for ${agetext} (>= ${stall}m): cross-check the control plane"
+    fi
+    # Independent of the stall mark: a loop that went quiet is still a
+    # loop, and the successor needs the record either way.
+    if [ "$status" != "blocked" ] && [ "$churnl" -gt 0 ] && [ "$churn_n" -ge "$churnl" ]; then
+      n_loop=$((n_loop + 1))
+      flag="${flag}  LOOP? ${churn_f} rewritten ${churn_n} times (>= ${churnl}): record its progress, respawn with the churn rule"
+    fi
+    if [ "$status" = "in-progress" ] && [ "$hours" -gt 0 ]; then
+      case "$pr" in
+        '' | none)
+          cage_min="$(dispatch_claim_age_min "$branch" "$base")"
+          if [ -n "$cage_min" ] && [ "$cage_min" -ge $((hours * 60)) ]; then
+            n_ceiling=$((n_ceiling + 1))
+            flag="${flag}  CEILING? $(dispatch_age_text "$cage_min") since the claim, no pr: — REPORT it with the control plane's cost (.claude/commands/orchestrate.md)"
+          fi
+          ;;
+      esac
+    fi
+    # The cost a branch's claims impose, on the branch's own row.
+    if [ "$status" != "blocked" ] && [ -n "$holdmap" ]; then
+      # Keyed on the CLAIM, not the branch: one branch can carry two workstream
+      # files, and each claim holds what ITS scope holds.
+      holds_n="$(printf '%s\n' "$holdmap" |
+        awk -F'\t' -v st="$(basename "$path" .md)" -v b="$branch" '
+          { pre = st " on "
+            suf = " (claimed on " b ")"
+            if (substr($2, 1, length(pre)) == pre &&
+                substr($2, length($2) - length(suf) + 1) == suf &&
+                !seen[$1]++) n++ }
+          END { print n + 0 }')"
+      case "$holds_n" in '' | *[!0-9]*) holds_n=0 ;; esac
+      [ "$holds_n" -eq 0 ] ||
+        flag="${flag}  holds ${holds_n} plan(s) out of the queue"
+    fi
+    # The git half of "did this land": the head read, and whether a merge-base
+    # with the base ref exists at all (a shallow clone or an unrelated branch
+    # has none, and that is its own value, never "no").
+    gh_head="$(git -C "$ROOT" rev-parse --short=12 "refs/remotes/origin/${branch}" </dev/null 2>/dev/null)"
+    if git -C "$ROOT" merge-base "refs/remotes/origin/${branch}" \
+      "refs/remotes/origin/${HANDOVER_BASE_BRANCH:-main}" </dev/null >/dev/null 2>&1; then
+      gh_base="ok"
+    else
+      gh_base="unreadable"
+    fi
+    inflight="${inflight}  ${path}  ${branch}  ${status:-?}  pushed ${agetext}  head ${gh_head:-?}  base ${gh_base}${flag}"$'\n'
+    [ -z "$work" ] || inflight="${inflight}${work}"$'\n'
+    [ -z "$session" ] || inflight="${inflight}    session: ${session}"$'\n'
+    [ -z "$next" ] || inflight="${inflight}    next: ${next}"$'\n'
+  done <<<"$rows"
+
+  # A `free <branch>` manager claims no queue item: its own row, its own slot.
+  while IFS=$'\t' read -r rb rk rstat _ rsess rnext; do
+    [ -n "$rb" ] || continue
+    case "$rstat" in
+      in-progress | blocked | review | done | abandoned) ;;
+      *) rstat="unreadable" ;;
+    esac
+    [ "$rstat" != abandoned ] || continue
+    age="$(dispatch_age_min "$rb")"
+    agetext="$(dispatch_age_text "$age")"
+    flag=""
+    # Done = past the build, mid-retire (a refused free deletes its claim,
+    # manage.md §0): no slot.
+    if [ "$rstat" = "done" ]; then
+      inflight="${inflight}  free-${rk}  ${rb}  done  pushed ${agetext}  done: holds no slot"$'\n'
+      [ -z "$rnext" ] || inflight="${inflight}    next: ${rnext}"$'\n'
+      continue
+    fi
+    n_inflight=$((n_inflight + 1))
+    if [ "$rstat" = blocked ]; then
+      n_blocked=$((n_blocked + 1))
+      flag="  BLOCKED: the human's, holds no slot"
+      block_reason_ok "$rnext" ||
+        flag="${flag}  INVALID BLOCK? next: opens with no reason word (manage.md §3): ask, order nothing"
+    elif [ -z "$age" ]; then
+      flag="  push age unknown: ref not here — fetch, then cross-check"
+    elif [ "$age" -ge "$stall" ]; then
+      n_stall=$((n_stall + 1))
+      [ -n "$stall_young" ] && [ "$stall_young" -le "$age" ] || stall_young="$age"
+      flag="  STALL? no push for ${agetext} (>= ${stall}m): cross-check the control plane"
+    fi
+    inflight="${inflight}  free-${rk}  ${rb}  ${rstat}  pushed ${agetext}${flag}"$'\n'
+    [ -z "$rsess" ] || inflight="${inflight}    session: ${rsess}"$'\n'
+    [ -z "$rnext" ] || inflight="${inflight}    next: ${rnext}"$'\n'
+  done < <(dispatch_rescope_branches free-)
+
+  printf 'managers in flight (git view; liveness is the control plane'"'"'s — read both):\n'
+  if [ -n "${inflight}${edge_rows}" ]; then
+    printf '%s%s' "$inflight" "$edge_rows"
+  else
+    printf '  none\n'
+  fi
+  [ -z "$edge_unver" ] ||
+    printf '  %s ref(s) have no merge base here (shallow clone): an edge among them cannot be seen, so this listing is a FLOOR and the slots line may over-report free.\n' \
+      "$edge_unver"
+  # AFTER the shallow caveat, which belongs to the listing above it: printed
+  # first, its two-space indent read as one more leftover row.
+  if [ -n "$leftover_rows" ]; then
+    printf 'leftovers (NOT counted, nothing committed — the human clears these):\n'
+    printf '%s' "$leftover_rows"
+  fi
+
+  # Finishing outranks starting, for an orchestrator too: an edge branch
+  # whose session is gone is a manager to respawn before any new item.
+  edge="$(printf '%s\n' "$hout" |
+    sed -n 's/^  FINISH BEFORE STARTING: \(.*\)$/\1/p' | head -1)"
+  if [ -n "$edge" ]; then
+    printf 'edge work (finish before starting; a live session'"'"'s is not yours):\n'
+    printf '  %s\n' "$edge"
+  fi
+
+  pending="${JOHARNESS_PENDING_SPAWNS:-0}"
+  case "$pending" in '' | *[!0-9]*) pending=0 ;; esac
+  # Leading zeros off.
+  pending="${pending#"${pending%%[!0]*}"}"
+  [ -n "$pending" ] || pending=0
+  # What the subtraction may safely take, kept apart from what the caller said
+  # so the line below can still report the caller's own number.
+  pending_used="$pending"
+  [ "${#pending_used}" -le "${#cap}" ] || pending_used="$cap"
+  [ "$pending_used" -le "$cap" ] || pending_used="$cap"
+  # Subtracted here and nowhere else: every verdict below reads n_slots, so the
+  # spawn count, the OVERLAP-BOUND gate and the DRAINED reading follow.
+  n_roles=$((n_curate_inflight + n_clerk))
+  n_slots=$((cap - (n_inflight - n_blocked) - pending_used - n_roles))
+  [ "$n_slots" -ge 0 ] || n_slots=0
+  if [ "$n_roles" -gt 0 ]; then
+    printf 'slots     : %s of %s free (%s role session(s) in flight count against JOHARNESS_MAX_MANAGERS)\n\n' \
+      "$n_slots" "$cap" "$n_roles"
+  elif [ "$pending" != 0 ]; then
+    # Said on the line, because a silently lowered count is indistinguishable
+    # from a busy fleet and the next reader debugs the wrong thing.
+    printf 'slots     : %s of %s free (%s spawned, not pushed yet: JOHARNESS_PENDING_SPAWNS)\n\n' \
+      "$n_slots" "$cap" "$pending"
+  else
+    printf 'slots     : %s of %s free\n\n' "$n_slots" "$cap"
+  fi
+
+  # --- what to spawn, in the queue's order --------------------------------
+  # Free = neither claimed, blocked nor CORE ONLY, every row.
+  while IFS='|' read -r path label; do
+    [ -n "$path" ] || continue
+    case "$label" in
+      *'claimed on '* | *'blocked by'* | *'CORE ONLY'*) continue ;;
+    esac
+    case "$path" in docs/product/*) continue ;; esac
+    # An item whose branch is past the retire commit is not free either.
+    case "$edge_items" in *" ${path}@"*) continue ;; esac
+    tier="$(sed -n 's/.*agent: \([a-z]*\).*/\1/p' <<<"$label")"
+    st="${path##*/}"; st="${st%.md}"
+    wave=""; note=""
+    { read -r wave; read -r note; } <<<"$(printf '%s\n' "$wavemap" |
+      awk -F'\t' -v s="$st" '$1 == s { print $2; print $3; exit }')"
+    hold="$(printf '%s\n' "$holdmap" |
+      awk -F'\t' -v s="$st" '$1 == s { print $2; exit }')"
+    # EVERY holder, not the first.
+    hold_live=0
+    while IFS= read -r hline; do
+      [ -n "$hline" ] || continue
+      hb="${hline##*(claimed on }"; hb="${hb%%)*}"
+      # The holder's own claim, out of "<stem> on <path> (claimed on <branch>)".
+      hs="${hline%% on *}"
+      [ "${blocked_claims#* "${hs}@${hb}" }" != "$blocked_claims" ] || hold_live=1
+    done <<<"$(printf '%s\n' "$holdmap" |
+      awk -F'\t' -v s="$st" '$1 == s { print $2 }')"
+    case "$path" in
+      docs/research/*)
+        n_free=$((n_free + 1))
+        questions="${questions}  ${path} (agent: ${tier:-unreadable})"$'\n' ;;
+      *)
+        free="${free}  ${path} (agent: ${tier:-unreadable})"
+        [ -z "$wave" ] || free="${free}  wave ${wave}"
+        if [ -n "$note" ]; then
+          n_wait=$((n_wait + 1))
+          free="${free}  WAIT — overlaps ${note} in this pass: spawn it only after that one"
+        elif [ -n "$hold" ] && [ "$hold_live" -eq 0 ]; then
+          n_free=$((n_free + 1))
+          free="${free}  overlaps ${hold} — that branch is BLOCKED on a human: spawn, reconcile expected at step 7"
+        elif [ -n "$hold" ]; then
+          n_hold=$((n_hold + 1))
+          free="${free}  HOLD — overlaps ${hold}: spawn once that branch merges"
+        else
+          n_free=$((n_free + 1))
+        fi
+        free="${free}"$'\n' ;;
+    esac
+  done <<<"$rows"
+
+  # FREEABLE: a doc-only branch nobody will merge, brought in by one manager.
+  while IFS=$'\t' read -r fkind fb fn fage; do
+    [ -n "$fb" ] || continue
+    n_freeable=$((n_freeable + 1))
+    if [ "$fkind" = "done" ]; then
+      freeable="${freeable}  free ${fb} (agent: sonnet)  FREEABLE — its only diff is a status: done, pr: none workstream file: merging it closes the branch. /who first: the owner's session RUNNING = not yours"$'\n'
+    else
+      freeable="${freeable}  free ${fb} (agent: sonnet)  FREEABLE — ${fn} plan(s) on a doc-only branch, last push $(dispatch_age_text "$fage") ago: merging it lands them in the queue. /who first: the owner's session RUNNING = not yours"$'\n'
+    fi
+  done <<<"$(dispatch_freeable "$bprows")"
+  n_free=$((n_free + n_freeable))
+
+  req="$(drain_requirement "$qout" "$edge_items")"
+  printf 'spawn, in this order, one manager per item, model = its agent tier:\n'
+  if [ -n "$req" ]; then
+    # Planning outranks the plan queue (step 2), so it is first and it is ONE
+    # manager: decomposition is one session's job, not a fleet's.
+    printf '  %s — UNPLANNED: one planning manager (agent: fable, effort xhigh) first\n' "${req%% *}"
+    n_free=$((n_free + 1))
+  fi
+  [ -z "$free" ] || printf '%s' "$free"
+  [ -z "$questions" ] || printf '%s' "$questions"
+  [ -z "$freeable" ] || printf '%s' "$freeable"
+  [ -n "$req$free$questions$freeable" ] || printf '  nothing free\n'
+
+  local drained=0
+  sup="$(drain_core_only "$qout")"
+  if [ -n "$sup" ]; then
+    printf '\nNOT YOURS — CORE ONLY (scope holds a core path; only a human builds\n'
+    printf 'it, by hand. Never spawn a manager on these, never re-file them):\n%s\n' "$sup"
+  fi
+
+  if [ "$n_hold" -gt 0 ] && [ "$n_slots" -gt 0 ] &&
+     [ "$n_free" -eq 0 ] && [ "$n_wait" -eq 0 ]; then
+    rescope_holders="$(printf '%s\n' "$holdmap" |
+      awk -F'\t' 'NF > 1 { h = $2; sub(/ on .*/, "", h); print h }' | sort -u)"
+    rescope_key="$(printf '%s\n' "$rescope_holders" | grep -v '^$' | paste -sd+ -)"
+    n_rescope_holders="$(printf '%s\n' "$rescope_holders" | grep -c .)"
+    # Every held path with its collision count, descending — what the rescope
+    # manager works through.
+    rescope_paths="$(printf '%s\n' "$holdmap" |
+      awk -F'\t' 'NF > 1 { p = $2; sub(/^[^ ]* on /, "", p);
+                           sub(/ \(claimed on .*/, "", p); print $1 "\t" p }' |
+      sort -u |
+      awk -F'\t' '{ c[$2]++ } END { for (p in c) print c[p] "\t" p }' |
+      sort -rn |
+      sed 's/^\([0-9][0-9]*\)\t\(.*\)/    \2  (\1 held)/')"
+    # ONE pass, fed by process substitution rather than a "$(...)" capture read
+    # back through a "<<<" here-string.
+    while IFS=$'\t' read -r rb rk rstat rpr rsess rnext; do
+      [ -n "$rb" ] || continue
+      rage="$(dispatch_age_text "$(dispatch_age_min "$rb" </dev/null)")"
+      # A FINISHED rescope: `done`, no `pr:`, a key (`plan: none` and the
+      # `rescope-` prefix are the reader's own filter) — manage.md's genuine
+      # end, which merges nothing. The hook's finished_rescope, rank 6; the
+      # orchestrator drops its ledger entry on this text (issue #492).
+      rfin=""
+      [ "$rstat" != "done" ] || [ "$rpr" != none ] || [ "$rk" = "?" ] ||
+        rfin="  done: finished rescope, holds no slot — never nudge"
+      rescope_inflight="${rescope_inflight}    ${rb}  rescope-${rk}  ${rstat}  pushed ${rage}${rfin}"$'\n'
+      [ -z "$rsess" ] || rescope_inflight="${rescope_inflight}      session: ${rsess}"$'\n'
+      [ -z "$rnext" ] || rescope_inflight="${rescope_inflight}      next: ${rnext}"$'\n'
+      case "$rstat" in
+        done | blocked)
+          dispatch_rescope_covers "$rk" "$rescope_key" && rescope_settled=1 ;;
+        *) n_rescope_inflight=$((n_rescope_inflight + 1)) ;;
+      esac
+    done < <(dispatch_rescope_branches)
+    if [ "$rescope_settled" -eq 0 ]; then
+      rescope_held="$( { printf '%s\n' "$holdmap" | awk -F'\t' 'NF > 1 { print $1 }'
+        printf '%s\n' "$rescope_holders"; } | grep -v '^$' | sort -u)"
+      while IFS=$'\t' read -r msha mkey; do
+        [ -n "$msha" ] || continue
+        dispatch_rescope_covers "$mkey" "$rescope_key" || continue
+        mchanged=""
+        while IFS= read -r mheld; do
+          [ -n "$mheld" ] || continue
+          mchanged="$(git -C "$ROOT" log --format=%H -1 \
+            "${msha}..refs/remotes/origin/${HANDOVER_BASE_BRANCH:-main}" \
+            -- "docs/plans/${mheld}.md" </dev/null 2>/dev/null)" ||
+            mchanged=unreadable  # an unread history settles nothing
+          [ -z "$mchanged" ] || break
+        done < <(printf '%s\n' "$rescope_held")
+        [ -z "$mchanged" ] || continue
+        rescope_settled=1
+        rescope_merged="            settled by merged rescope ${msha:0:7} (key ${mkey}): holds genuine"
+        break
+      done < <(dispatch_rescope_merged)
+    fi
+
+    printf 'rescope   : %s plan(s) held behind %s branch(es) — the work is decomposed,\n' \
+      "$n_hold" "$n_rescope_holders"
+    printf '            the scope: declarations are not. A surveyor marks the\n'
+    printf '            shared registries and narrows the directory claims so these\n'
+    printf '            plans wave in parallel (.claude/commands/manage.md, rescope).\n'
+    printf '            key: %s\n' "${rescope_key:-none}"
+    printf '            held on:\n'
+    printf '%s\n' "$rescope_paths"
+    if [ -n "$rescope_inflight" ]; then
+      printf '            rescope branch(es) in flight:\n%s' "$rescope_inflight"
+    else
+      printf '            rescope branch(es) in flight: none\n'
+    fi
+    [ -z "$rescope_merged" ] || printf '%s\n' "$rescope_merged"
+    printf '\n'
+  fi
+
+  # --- plans on a branch: visible, never free -------------------------------
+  # A plan an unmerged branch added has no queue row (dispatch_branch_plans).
+  # One line per (plan, kind): a stem done for one branch and live on a
+  # branch cut after the retire is two plans of one name. `held` is the
+  # oldest of its branches.
+  bplans="$(printf '%s\n' "$bprows" | awk -F'\t' '$1 == "live" || $1 == "done" {
+      k = $3 SUBSEP $1
+      if (!(k in on)) { order[++n] = k; st[k] = $3; kd[k] = $1; urg[k] = $4
+                        agt[k] = $5; on[k] = $2; held[k] = $6 }
+      else { on[k] = on[k] ", " $2; if ($6 + 0 > held[k] + 0) held[k] = $6 } }
+    END { for (i = 1; i <= n; i++) { k = order[i]
+      if (kd[k] == "done")
+        printf "  DONE ON MAIN %s (urgency: %s, agent: %s)  on %s  held %sd: retired elsewhere — drop it, never spawn on it\n",
+          st[k], urg[k], agt[k], on[k], held[k]
+      else
+        printf "  %s%s (urgency: %s, agent: %s)  on %s  held %sd\n",
+          (urg[k] == "urgent" ? "URGENT " : ""), st[k], urg[k], agt[k], on[k], held[k] } }')"
+  if [ -n "$bplans" ]; then
+    printf '\nplans on a branch, not in the queue until it merges:\n%s\n' "$bplans"
+  fi
+
+  # --- verdict --------------------------------------------------------------
+  # One line the orchestrator branches on.
+  printf '\n'
+  [ -z "$edge_unver" ] ||
+    printf 'verdict   : DEGRADED — shallow clone, %s ref(s) unreadable: an edge among them is invisible here, so an item under spawn may already be in flight and the slots above may over-report free. git fetch --unshallow, or confirm each item on the control plane BEFORE spawning it. Then, on what this pass could read:\n' \
+      "$edge_unver"
+  if [ "$cap" -eq 0 ] && [ $((n_inflight - n_blocked)) -gt 0 ]; then
+    printf 'verdict   : PAUSED — JOHARNESS_MAX_MANAGERS=0: spawn nothing; %s manager(s) in flight: keep the health pass going\n' \
+      "$((n_inflight - n_blocked))"
+  elif [ "$cap" -eq 0 ] && [ "$pending" != 0 ]; then
+    printf 'verdict   : PAUSED — JOHARNESS_MAX_MANAGERS=0: spawn nothing; %s spawned this pass has not pushed (JOHARNESS_PENDING_SPAWNS): keep the health pass going, never exit on a manager this view cannot see\n' \
+      "$pending"
+  elif [ "$cap" -eq 0 ]; then
+    printf 'verdict   : PAUSED — JOHARNESS_MAX_MANAGERS=0: spawn nothing, exit; the human unpauses\n'
+  elif [ "$n_free" -gt 0 ] && [ "$n_slots" -gt 0 ]; then
+    printf 'verdict   : NOT DRAINED — %s free item(s) now%s, %s slot(s): spawn up to %s now\n' \
+      "$n_free" "$([ "$n_wait" -eq 0 ] || printf ' (+%s waiting behind them)' "$n_wait")" \
+      "$n_slots" "$([ "$n_free" -lt "$n_slots" ] && printf '%s' "$n_free" || printf '%s' "$n_slots")"
+  elif [ "$n_free" -gt 0 ]; then
+    # No STOPPED verdict here, deliberately.
+    printf 'verdict   : NOT DRAINED — %s free item(s), 0 slots: wait for a manager to finish\n' "$n_free"
+  elif [ "$n_wait" -gt 0 ]; then
+    # Unreachable while a partner is free and earlier in the order, and
+    # said rather than left to fall through to DRAINED.
+    printf 'verdict   : NOT DRAINED — %s item(s) waiting behind others: spawn nothing this pass\n' "$n_wait"
+  elif [ "$n_hold" -gt 0 ] && [ "$n_slots" -gt 0 ]; then
+    # n_free and n_wait are both 0 here — the earlier branches caught every
+    # spawnable item.
+    if [ "$rescope_settled" -eq 1 ]; then
+      printf 'verdict   : OVERLAP-BOUND — %s slot(s) free, %s plan(s) held; a rescope for this key is done or blocked (see rescope block): the holds are genuine or a human'"'"'s — spawn nothing, keep the health pass going until the holder branches merge\n' \
+        "$n_slots" "$n_hold"
+    elif [ "$n_rescope_inflight" -gt 0 ]; then
+      printf 'verdict   : OVERLAP-BOUND — %s slot(s) free, %s plan(s) held; a surveyor is already in flight (see rescope block): spawn nothing this pass, keep the health pass going\n' \
+        "$n_slots" "$n_hold"
+    else
+      printf 'verdict   : OVERLAP-BOUND — %s slot(s) free, %s plan(s) held behind shared-registry declarations: spawn ONE surveyor (agent: sonnet) on key %s\n' \
+        "$n_slots" "$n_hold" "${rescope_key:-none}"
+    fi
+  elif [ $((n_inflight - n_blocked)) -gt 0 ]; then
+    drained=1
+    printf 'verdict   : DRAINED — nothing free; %s manager(s) in flight: keep the health pass going\n' \
+      "$((n_inflight - n_blocked))"
+  elif [ "$pending" != 0 ]; then
+    drained=1
+    # EXIT is the one irreversible verdict on this line, and a manager spawned
+    # this pass is exactly what the git view cannot see.
+    printf 'verdict   : DRAINED — nothing free, nothing in flight in the git view; %s spawned this pass has not pushed (JOHARNESS_PENDING_SPAWNS): keep the health pass going, never exit on a manager this view cannot see\n' \
+      "$pending"
+  else
+    drained=1
+    # A curate or clerk spawn line follows below when it is due AND has a slot
+    # (same arithmetic as role_slots): the verdict must not say exit then.
+    local due_slots="$n_slots" role_will_spawn=0
+    if [ "$curate_due" -eq 1 ] && [ "$due_slots" -gt 0 ]; then
+      role_will_spawn=1
+      due_slots=$((due_slots - 1))
+    fi
+    [ "$clerk_due" -eq 1 ] && [ "$fetch_failed" -eq 0 ] && [ "$due_slots" -gt 0 ] &&
+      role_will_spawn=1
+    if [ "$role_will_spawn" -eq 1 ]; then
+      printf 'verdict   : DRAINED — nothing free, nothing in flight; a role is due: spawn it, then schedule the next pass\n'
+    else
+      printf 'verdict   : DRAINED — nothing free, nothing in flight: exit, the heartbeat re-seeds\n'
+    fi
+  fi
+  if [ -n "$sup" ] && [ "$drained" -eq 1 ]; then
+    local cw_n cw_stems="" cw_oldest="" cw_unread=0 cw_p cw_t cw_base cw_d
+    cw_n="$(printf '%s\n' "$sup" | grep -c .)"
+    cw_base="refs/remotes/origin/${HANDOVER_BASE_BRANCH:-main}"
+    git -C "$ROOT" rev-parse -q --verify "$cw_base" >/dev/null 2>&1 || cw_base=HEAD
+    while IFS= read -r cw_p; do
+      cw_p="${cw_p#"${cw_p%%[! ]*}"}"
+      [ -n "$cw_p" ] || continue
+      cw_t="${cw_p##*/}"
+      cw_stems="${cw_stems:+$cw_stems }${cw_t%.md}"
+      cw_t="$(git -C "$ROOT" log --diff-filter=A --format=%ct "$cw_base" -- "$cw_p" 2>/dev/null | tail -1)"
+      case "$cw_t" in '' | *[!0-9]*) cw_unread=1; continue ;; esac
+      if [ -z "$cw_oldest" ] || [ "$cw_t" -lt "$cw_oldest" ]; then cw_oldest="$cw_t"; fi
+    done <<EOF_CW
+$sup
+EOF_CW
+    if [ -n "$cw_oldest" ] && [ "$cw_unread" -eq 0 ]; then
+      cw_d="$(( ($(date +%s) - cw_oldest) / 86400 ))"
+      [ "$cw_d" -ge 0 ] || cw_d=0
+    else
+      cw_d="?"
+    fi
+    printf '            %s plan(s) wait on a human core edit (oldest %sd): %s\n' \
+      "$cw_n" "$cw_d" "$cw_stems"
+  fi
+  # ONE number, and a sentence true of every row it counts.
+  if [ "$n_stall" -gt 0 ]; then
+    printf '            %s manager(s) past the stall window: health pass FIRST, spawn second' "$n_stall"
+    [ "$n_edge_stall" -eq 0 ] ||
+      printf ' (%s of them carry no claim file: by title, or REPORT where the row names no item)' \
+        "$n_edge_stall"
+    printf '\n'
+  fi
+  [ "$n_loop" -eq 0 ] ||
+    printf '            %s manager(s) rewriting one file past the churn threshold: health pass FIRST\n' "$n_loop"
+  [ "$n_ceiling" -eq 0 ] ||
+    printf '            %s manager(s) past the ceiling with no pr: in the claim file: report, never kill on this alone\n' "$n_ceiling"
+  [ "$n_blocked" -eq 0 ] ||
+    printf '            %s manager(s) blocked: report to the human, never respawn\n' "$n_blocked"
+  [ "$n_hold" -eq 0 ] ||
+    printf '            %s plan(s) on HOLD behind work in flight: not counted as free\n' "$n_hold"
+  role_slots=$((n_slots - (n_free < n_slots ? n_free : n_slots)))
+  if [ "$curate_due" -eq 1 ] && [ "$role_slots" -gt 0 ]; then
+    role_slots=$((role_slots - 1)); role_spawned=1
+    printf '            curate DUE: spawn ONE curator (agent: sonnet) on ./joharness.sh curate — takes one slot (roles share JOHARNESS_MAX_MANAGERS), at most one in flight (JOHARNESS_CURATE_PLANS, JOHARNESS_CURATE_HOURS)\n'
+  elif [ "$curate_due" -eq 1 ]; then
+    printf '            curate due, held — no free slot: roles share JOHARNESS_MAX_MANAGERS with managers\n'
+  elif [ "$curate_due" -eq 2 ]; then
+    printf '            curate due, nothing needs judgement: spawn no curator. Mechanical repairs: ./joharness.sh curate --apply (the next clerk pass runs it)\n'
+  fi
+  if [ "$clerk_due" -eq 1 ] && [ "$fetch_failed" -eq 1 ]; then
+    printf '            clerk due, held — no fresh view of every branch this pass (fetch failed, DISPATCH_FETCH=0, or a remote.origin.fetch that does not reach refs/heads/*), so a clerk in flight might not show: spawn none this pass\n'
+  elif [ "$clerk_due" -eq 1 ] && [ "$role_slots" -le 0 ]; then
+    printf '            clerk due, held — no free slot: roles share JOHARNESS_MAX_MANAGERS with managers\n'
+  elif [ "$clerk_due" -eq 1 ]; then
+    role_spawned=1
+    printf '            clerk DUE: spawn ONE clerk (agent: sonnet) on /clerk — takes one slot (roles share JOHARNESS_MAX_MANAGERS), at most one in flight. It turns open issues into plans and merges that plan-only pull request itself (JOHARNESS_CLERK_HOURS, JOHARNESS_CLERK_BATCH)\n'
+  fi
+  # Not gated on DRAINED: sampling merged work competes with nothing.
+  if [ "$conduct_due" -eq 1 ] && [ "$cap" -eq 0 ]; then
+    printf '            conduct due, held — JOHARNESS_MAX_MANAGERS=0 is the human'"'"'s pause: spawn none\n'
+  elif [ "$conduct_due" -eq 1 ] && [ "$fetch_failed" -eq 1 ]; then
+    printf '            conduct due, held — no fresh view of every branch this pass (fetch failed, DISPATCH_FETCH=0, or a remote.origin.fetch that does not reach refs/heads/*), so a reviewer in flight might not show: spawn none this pass\n'
+  # A curate or clerk HELD for a slot does not hold it: the reviewer needs none.
+  elif [ "$conduct_due" -eq 1 ] && { [ "$role_spawned" -eq 1 ] ||
+     [ "$n_curate_inflight" -gt 0 ] || [ "$n_clerk" -gt 0 ]; }; then
+    printf '            conduct due, suppressed — a curate or clerk goes first: spawn none this pass\n'
+  elif [ "$conduct_due" -eq 1 ]; then
+    printf '            conduct DUE: spawn ONE conduct reviewer (agent: sonnet) on /conduct — beyond the cap, holds no slot, at most one in flight. It records FINE/CONCERN/NO EVIDENCE per sampled branch in %s and merges that pull request itself (JOHARNESS_CONDUCT_HOURS, JOHARNESS_CONDUCT_SAMPLE)\n' "$CONDUCT_LEDGER"
+  fi
+  [ "$n_edge" -eq 0 ] ||
+    printf '            %s branch(es) at the edge with no claim file: each holds a slot because its item is STILL on %s, so that merge has not landed. The control plane says what to do about the session, never whether the slot is real\n' \
+      "$n_edge" "${HANDOVER_BASE_BRANCH:-main}"
+  if [ "$n_leftover" -gt 0 ]; then
+    printf '            %s leftover branch(es) listed and NOT counted' "$n_leftover"
+    [ "$n_leftover" -eq "$n_leftover_noitem" ] ||
+      printf ': %s whose item already merged' "$((n_leftover - n_leftover_noitem))"
+    [ "$n_leftover_noitem" -eq 0 ] ||
+      printf '%s %s naming no item at all' \
+        "$([ "$n_leftover" -eq "$n_leftover_noitem" ] && printf ':' || printf ', and')" \
+        "$n_leftover_noitem"
+    printf '. Nothing is committed on any of them. The human deletes them; never respawn on one\n'
+  fi
+  # On the VERDICT, not only above the slots line.
+
+  # Push age is the FLEET's before it is any manager's.
+  if [ "$stall" -gt 0 ] && [ "$n_stall" -gt 0 ] &&
+     [ "$n_stall" -eq $((n_inflight - n_blocked)) ] &&
+     [ "${stall_young:-0}" -ge $((stall * 24)) ]; then
+    fleet_age="$(dispatch_age_min "${HANDOVER_BASE_BRANCH:-main}")"
+    if [ -n "$fleet_age" ] && [ "$fleet_age" -ge $((stall * 24)) ]; then
+      printf '            every manager in flight is silent and %s has not moved in %s: suspect a stopped fleet (a suspension), not %s dead manager(s) — read the control plane for EACH before any respawn' \
+        "${HANDOVER_BASE_BRANCH:-main}" "$(dispatch_age_text "$fleet_age")" "$n_stall"
+      [ "$fetch_failed" -eq 0 ] ||
+        printf ' (or this clone is stale: fetch failed, DISPATCH_FETCH=0, or a remote.origin.fetch that does not reach refs/heads/*)'
+      printf '\n'
+    fi
+  fi
+
+  return 0
 }
 
 cmd_env() {
@@ -2006,12 +7226,8 @@ cmd_env() {
   if [ -n "$want" ]; then
     valid_name "$want" || die "invalid layer name '${want}'"
     if [ ! -d "${ENV_ROOT}/${want}" ]; then
-      # Canonical carries every layer, so a name it does not have is a
-      # typo and dies here. A consumer carries the one layer it selected
-      # — the sync ships no others — so an absent name is a REQUEST, and
-      # refusing it would leave no way to ask for a different layer: the
-      # sync reads this file to decide what to ship. Written, then
-      # fetched on the next sync.
+      # Canonical carries every layer, so a name it does not have is a typo and
+      # dies here.
       if grep -q '^JOHARNESS_CANONICAL=1' "$CONF" 2>/dev/null; then
         die "no such layer .agents/env/${want} (try: $0 env)"
       fi
@@ -2035,8 +7251,7 @@ cmd_env() {
   printf 'environment : %s\n' "${current:-none (default)}"
   # An explicit selection that does not resolve is worth saying out loud;
   # silently running 'none' is how a repo ends up wondering where its cluster
-  # went. No selection at all is not that: the default resolving to 'none' is
-  # the design, not a fallback.
+  # went.
   if [ -n "$current" ] && [ "$current" != "$effective" ]; then
     printf '              ! not usable, falls back to: %s\n' "${effective:-nothing}"
   fi
@@ -2057,49 +7272,55 @@ cmd_env() {
   [ "$found" -eq 1 ] || printf '    (none found under %s)\n' "$ENV_ROOT"
 }
 
-# ---------------------------------------------------------------------------
-# SessionStart
-#
-# Everything printed on stdout lands in the session's context, so it stays
-# short and factual. Nothing here may fail a session: exit 0 regardless.
-# ---------------------------------------------------------------------------
+# --- SessionStart
 
 cmd_session_start() {
-  local name mode raw
+  local name mode src
 
-  # Autonomy first: it governs the whole session, including the parts that
-  # run before an environment resolves. Supervised prints NOTHING — same
-  # bet as lazy env rules, a session that is not unattended does not pay
-  # context to be told so, and the rules it already loads are the
-  # supervised ones. Only the mode that widens what a session may do
-  # announces itself, and it announces the boundary in the same breath.
-  if [ "$(run_mode)" = "unsupervised" ]; then
-    printf '== Mode: unsupervised ==\n\n'
-    printf 'Queue edge is a trigger, not a stop: generate work, run the full\n'
-    printf 'Loop, merge your own pull request. NEVER commit under\n'
-    printf '.agents/harness/ — protocol edits stay supervised\n'
-    printf '(docs/product/unsupervised-mode.md, Constraints).\n'
-    # Session-local autonomy says so. A mode that came from an untracked
-    # marker looks exactly like a repo-wide opt-in otherwise, and the two
-    # want different reactions from whoever reads this.
-    if [ "$(mode_source)" = "marker" ]; then
-      printf 'Session-local (marker, not %s). Off again: ./joharness.sh mode default\n' \
-        "$(basename "$CONF")"
-    fi
-    printf '\n'
-  elif raw="$(mode_unrecognised)"; then
-    # Into session context, not stderr: the session is the reader who has
-    # to know its mode is not what the conf appears to say.
-    printf 'JOHARNESS_MODE=%s not recognised; running supervised.\n\n' "$raw"
+  # Hook input is JSON on stdin, and `source` says which kind of start this is:
+  # startup, resume, clear, compact, fork.
+  src=""
+  if [ ! -t 0 ]; then
+    IFS= read -r -d '' -t 1 src 2>/dev/null || true
   fi
+  # No `head -1`: `sed -n …p` already prints one line per match, and this file
+  # has paid a finding for a pipeline whose exit status it did not need.
+  src="$(printf '%s' "$src" |
+    sed -n 's/.*"source"[[:space:]]*:[[:space:]]*"\([a-z]*\)".*/\1/p')"
+  export JOHARNESS_SESSION_SOURCE="${src:-}"
+
+  # One mode, so one banner, printed first: it governs the whole session,
+  # including the parts that run before an environment resolves.
+  printf '== Mode: orchestrated ==\n\n'
+  printf 'Two roles, one Loop. Your prompt names /manage <item>? You are a\n'
+  printf 'MANAGER: that ONE item, the full Loop on it, merge your own pull\n'
+  printf 'request, push at every milestone, exit. No item named? You are the\n'
+  printf 'ORCHESTRATOR: run /orchestrate — it reads ./joharness.sh dispatch,\n'
+  printf 'spawns one manager per free item under the cap, checks health, and\n'
+  printf 'exits at DRAINED with nothing in flight. The command IS the rules\n'
+  printf 'for its role (.claude/commands/orchestrate.md, manage.md).\n'
+  printf 'Each role reads its own documents and no others: the queue is NOT\n'
+  printf 'printed here. Orchestrator: dispatch is the whole read — open no\n'
+  printf 'plan, requirement or other branch. Manager: your item, this\n'
+  printf 'branch'"'"'s workstream file, the item'"'"'s own anchors.\n'
+  if ! grep -q '^JOHARNESS_CANONICAL=1' "$CONF" 2>/dev/null; then
+    printf 'Harness source is read through its .md docs and command output,\n'
+    printf 'never by opening joharness.sh or the scripts.\n'
+  fi
+  printf 'Protocol text is yours to edit and merge. NEVER edit the core\n'
+  printf 'paths — money, permissions, the merge gate; a human changes them:\n'
+  # Derived, never restated. A banner naming its own list is the second
+  # copy, and the boundary is exactly what must not disagree with itself.
+  while IFS= read -r t; do
+    [ -n "$t" ] && printf '  %s\n' "$t"
+  done < <(protocol_paths)
+  printf '\n'
 
   if name="$(resolve_env)"; then
     mode="$(setup_mode)"
     [ -n "$mode" ] || mode="lazy"
 
-    # Eager provisioning is for the remote sandbox this harness builds. A local
-    # machine already has its own Docker and we should not fight it; set
-    # JOHARNESS_FORCE_SETUP=1 to provision anywhere.
+    # Eager provisioning is for the remote sandbox this harness builds.
     if has_setup "$name" && [ "$mode" = "eager" ] &&
        { [ "${CLAUDE_CODE_REMOTE:-}" = "true" ] ||
          [ "${JOHARNESS_FORCE_SETUP:-${DEVENV_FORCE:-0}}" = "1" ]; }; then
@@ -2109,8 +7330,6 @@ cmd_session_start() {
     printf '== Environment: %s (.agents/env/%s) ==\n\n' "$name" "$name"
     if [ -r "${ENV_ROOT}/${name}/AGENTS.md" ]; then
       # Default md=lazy: context stays cheap, a pointer replaces the rules.
-      # Same bet as lazy setup — a session that never touches the environment
-      # never pays for its rules either. eager injects the file whole.
       if [ "$(md_mode)" != "eager" ]; then
         printf 'Rules NOT loaded (md=lazy). Touching this environment — setup,\n'
         printf 'its scripts, anything it provisions? Read .agents/env/%s/AGENTS.md\n' "$name"
@@ -2126,34 +7345,35 @@ cmd_session_start() {
       printf 'Need it? Run: ./joharness.sh setup\n'
       printf 'Never need it? It cost nothing.\n'
       # Says "at session start" because that is the only claim it can make.
-      # A RESUMED session reads this as "nothing is running" and is right —
-      # but a session that provisioned earlier reads it as "still as I left
-      # it" and is wrong: the files survive, the daemons do not. Cost of not
-      # saying so, measured in one consumer run: two separate stalls, each
-      # found by a command failing rather than by the banner.
       printf 'Resumed session? Files survive, daemons do not — setup again.\n\n'
     fi
   fi
 
-  # Armed gates get announced. A session that learns about the review gate
-  # from a red ci has already written the commit it should have reviewed;
-  # off, this costs the context nothing, like every other knob here.
+  # Armed gates get announced.
   if review_on; then
     printf '== Review gate: ON (JOHARNESS_REVIEW=on) ==\n\n'
     printf 'Edge to main needs recorded review. Findings to workstream file\n'
     printf '## Review, one line each, BEFORE fix, same commit as fix. Clean\n'
-    printf 'pass records that, one line. ci checks record, not count.\n'
+    printf 'pass records that, one line. ci checks record, not count — and\n'
+    printf 'that ONE finding carries (verifier): step 5 spawns the reader at\n'
+    printf 'every depth, so a section holding only your own findings reds.\n'
     printf 'Depth for this branch: ./joharness.sh review\n\n'
   fi
 
+  # Same bet, one knob over: a session that learns at step 7 that it did not
+  # have to wait for Actions has already waited once.
+  if checks_local; then
+    printf '== Checks: LOCAL (JOHARNESS_CHECKS=local) ==\n\n'
+    printf 'Step 7 does NOT wait for GitHub Actions here. ./joharness.sh finish\n'
+    printf 'runs this head'"'"'s checks itself — ci, and verify when the diff touches\n'
+    printf 'non-*.md harness code — and is red on what they say. It refuses a head\n'
+    printf 'that is not what merges: uncommitted or untracked paths, unpushed tip,\n'
+    printf 'or behind the base branch. Every other step 7 condition unchanged.\n\n'
+  fi
+
+  # This branch's own files, nothing fleet-wide, no queue.
   [ -x "${HARNESS_ROOT}/handover-context.sh" ] &&
-    "${HARNESS_ROOT}/handover-context.sh"
-
-  # After handover state, so a resumed branch reads its own work first and a
-  # fresh session reads what to pick up and which model tier it wants.
-  [ -x "${HARNESS_ROOT}/queue-context.sh" ] &&
-    "${HARNESS_ROOT}/queue-context.sh"
-
+    HANDOVER_SCOPE=branch "${HARNESS_ROOT}/handover-context.sh"
   return 0
 }
 
@@ -2167,21 +7387,31 @@ main() {
     session-start)  cmd_session_start ;;
     env)            cmd_env "${1:-}" ;;
     setup)          cmd_setup ;;
-    ci)             cmd_ci ;;
+    ci)             cmd_ci "$@" ;;
     upgrade)        cmd_upgrade "$@" ;;
     verify)         cmd_verify ;;
     review)         cmd_review ;;
-    feedback)       cmd_feedback "${1:-}" ;;
+    feedback)       cmd_feedback "$@" ;;
+    upstream)       cmd_upstream "$@" ;;
+    analysis)       cmd_analysis "$@" ;;
+    janitor)        cmd_janitor "$@" ;;
+    free)           cmd_free "$@" ;;
+    guard)          cmd_guard "$@" ;;
+    scout)          cmd_scout "$@" ;;
+    conduct)        cmd_conduct "$@" ;;
+    clerk)          cmd_clerk "$@" ;;
+    role)           cmd_role "$@" ;;
     cleanup)        cmd_cleanup "$@" ;;
-    finish)         cmd_finish ;;
-    graph)          cmd_graph ;;
-    # Warning on stderr, value on stdout: the guard captures stdout and must
-    # keep getting one clean word, while a human running this against a
-    # typo'd conf needs to hear about it. Same lesson the review knob
-    # already paid for (PR47 r4) — a knob that reads as off in silence
-    # leaves a repo believing it opted in.
-    mode)           if [ -n "${1:-}" ]; then cmd_mode_set "$1"
-                    else mode_warn_unrecognised; run_mode; printf '\n'; fi ;;
+    curate)         cmd_curate "$@" ;;
+    finish)         cmd_finish "$@" ;;
+    dispatch)       cmd_dispatch ;;
+    start)          [ -z "${1:-}" ] ||
+                      die "start takes no argument; the commands that take one are /manage <item> and /plan"
+                    cmd_start ;;
+    # Read by .agents/harness/handover-guard.sh, which cannot source this file.
+    protocol-paths) protocol_paths ;;
+    authority)      cmd_authority ;;
+    conf)           cmd_conf "$@" ;;
     -h|--help|help) usage ;;
     *) die "unknown subcommand '$cmd' (try: $0 help)" ;;
   esac
