@@ -2,9 +2,8 @@
 
 @.agents/harness/AGENTS.md
 
-Environment rules are NOT in this file. `joharness.sh session-start` injects
-a read-first pointer to them — or, `JOHARNESS_ENV_MD=eager`, the rules
-whole — from the layer named in `joharness.conf`. See
+Environment rules: `joharness.sh session-start` injects a pointer to the layer
+named in `joharness.conf` (`JOHARNESS_ENV_MD=eager`: the rules whole). See
 [`.agents/env/README.md`](.agents/env/README.md); switch with
 `./joharness.sh env <name>`.
 

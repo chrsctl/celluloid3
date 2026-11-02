@@ -4,6 +4,7 @@ status: in-progress
 branch: claude/short-kebab-name-abc123
 pr: none
 plan: none
+issue: none                  # GitHub issue this work claims, or: none
 session: https://claude.ai/code/session_...
 agent: sonnet
 updated: YYYY-MM-DD
@@ -11,14 +12,22 @@ next: One concrete action, phrased as an instruction
 ---
 
 <!--
-Copy to docs/handover/<workstream>.md. Protocol: .agents/docs/handover/README.md.
+Copy to docs/handover/<workstream>.md. Protocol: .agents/docs/handover.md.
 
 Only what git cannot tell next session. No file counts, no "tests passing",
 no diff summaries — derivable, goes stale. Hook reads frontmatter without
 opening file: keep `next` one line. `agent` = tier this work wants
 (.agents/docs/agent-selection.md); hook shows it, so resuming user picks right
 model. `plan` = plan this workstream implements — THE claim; queue marks
-that plan taken. Not plan work? Leave `none`.
+that plan taken. A research file under `docs/research/` is claimed through
+this same field, by its stem (`.agents/docs/research.md`), and so is
+a requirement under `docs/product/` a planning pass decomposes
+(`.agents/docs/product.md`, Claiming a requirement). Not plan work?
+Leave `none`.
+`issue` = GitHub issue this work claims. The hook lists it so another
+session sees the issue is taken. Write it when the work STARTS. `#114` and
+`114` both work; rules and the seam it does not cover: handover.md, "Claiming an
+issue".
 
 Push as soon as file exists. Claim does not exist until pushed.
 -->
@@ -33,15 +42,14 @@ Why work exists, in requester's words. One paragraph.
 
 ## Rejected
 
-- Approach, and what exactly broke. Highest-value section: only thing stopping
-  next session walking same dead end.
+- Approach, and what exactly broke.
 
 ## Review
 
-One `- r1: ...` bullet per finding, written BEFORE its fix and committed
-WITH it. Mark (fixed) / (open) / (wontfix + why). The review conversation
-evaporates; this is the only record of what each round found. The hook
-counts the bullets under this heading, so leave none here unfilled.
+One bullet per finding, written BEFORE its fix, committed WITH it, in exactly
+the form `- rN: text (fixed|wontfix: why|no change)` — `ci` checks it. Tag the
+verifier's findings `(verifier)`. Clean pass = one bullet saying so. Remove
+this paragraph when you add the first bullet.
 
 ## Blockers
 
